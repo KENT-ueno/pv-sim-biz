@@ -100,12 +100,14 @@ def process_and_plot(
         tz = "Asia/Tokyo"
         site = pvlib.location.Location(lat, lon, tz=tz)
 
-        # datetime インデックス作成
-        times, idx_map = [], []
+        # datetime インデックス作成（1時→0, … 24時→23にマッピング）
+        times = []
+        idx_map = []  # (df_solar行番号, hour_label)
         for idx, row in df_solar.iterrows():
             y, m, d = int(row["年"]), int(row["月"]), int(row["日"])
             for h in range(1, 25):
-                dt = pd.Timestamp(year=y, month=m, day=d, hour=h, tz=tz)
+                hour = h - 1
+                dt = pd.Timestamp(year=y, month=m, day=d, hour=hour, tz=tz)
                 times.append(dt)
                 idx_map.append((idx, h))
         times = pd.DatetimeIndex(times)
@@ -132,7 +134,7 @@ def process_and_plot(
         )
         poa_kwh = poa['poa_global'] / 1000
 
-        # df_solar 値置換
+        # df_solar の値をPOAで置換
         flat_idx = 0
         for idx, row in df_solar.iterrows():
             for h in range(1, 25):
@@ -150,9 +152,6 @@ def process_and_plot(
         df_hourly["日発電量 [kWh]"] = df_hourly[time_labels].sum(axis=1)
 
         # --- 月別積分 & PCSクリップ ---
-        eph_monthly = df_hourly.groupby("月")[time_labels].sum().reset_index().melt(
-            id_vars=["月"], value_name="発電量 [kWh]"
-        )
         for h in time_labels:
             df_hourly[h] = df_hourly[h].clip(upper=PCS_output_kw)
         eph_monthly = df_hourly.groupby("月")[time_labels].sum().reset_index().melt(
@@ -177,7 +176,6 @@ def process_and_plot(
         return fig_bar, fig_line, annual_str, ""
 
     except Exception as e:
-        # 例外時はエラー文字列のみ返す
         return None, None, None, f"内部エラー: {e}"
 
 # ─────────────── Gradio UI 定義 ───────────────
