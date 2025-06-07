@@ -4,6 +4,8 @@ import plotly.express as px
 
 # 定数: STC条件下の基準照度 (kW/m²)
 G_STC = 1.0
+# PCS出力のデフォルト値 (kW)
+DEFAULT_PCS_OUTPUT = 99.0
 
 def process_and_plot(
     uploaded_file,
@@ -22,15 +24,11 @@ def process_and_plot(
     """
     Gradio のコールバック関数。
     - uploaded_file: gr.File でアップロードされた NEDO 形式 CSV
-    - K, PAS, Ppeak, GS, alpha_percentage, delta_T: 数値パラメータ
+    - K, PAS, Ppeak, GS, α, ΔT: 数値パラメータ
     - orientation: 方位（北/東/西/南東/南西/南）
     - tilt: 傾斜角 (0–90°, 10度刻み)
     - month_str, day_str: 月・日（文字列）
-    - PCS_output_kw: PCS出力上限（kW）、クリップに使用
-
-    PAS または Ppeak のいずれかで受光面積を決定し、
-    CSVを読み込んで単位変換後に「方位・傾斜補正」をかけ、
-    以降の計算・PCSクリップ・グラフ描画を行う。
+    - PCS_output_kw: PCS出力上限（kW）、クリップに使用。未入力時はデフォルト値を適用。
     """
     # --- 入力チェック ---
     if uploaded_file is None:
@@ -43,14 +41,20 @@ def process_and_plot(
     except:
         return None, None, None, "エラー：月は1～12、日は1～31の整数で入力してください。"
 
+    # αを割合に変換
     alpha = alpha_percentage / 100.0
 
+    # PAS/Ppeak で有効受光面積を決定
     if Ppeak not in (None, 0):
         effective_PAS = Ppeak / (K * G_STC)
     elif PAS not in (None, 0):
         effective_PAS = PAS
     else:
         return None, None, None, "エラー：PAS または Ppeak のいずれかを入力してください。"
+
+    # PCS出力のデフォルト適用
+    if PCS_output_kw in (None, 0):
+        PCS_output_kw = DEFAULT_PCS_OUTPUT
 
     # --- CSV読み込み＆単位補正 ---
     time_labels = [f"{h}時" for h in range(1, 25)]
@@ -74,24 +78,19 @@ def process_and_plot(
         df_solar[h] = pd.to_numeric(df_solar[h], errors="coerce") * 0.01 / 3.6
         df_temp[h]  = pd.to_numeric(df_temp[h], errors="coerce")  * 0.1
 
-    # --- 方位・傾斜角の簡易補正（JPEA資料より） ---
+    # --- 方位・傾斜角の簡易補正 ---
     orientation_factors = {
-        "北": 0.62,
-        "東": 0.83,
-        "西": 0.83,
-        "南東": 0.96,
-        "南西": 0.96,
-        "南": 1.00
+        "北": 0.62, "東": 0.83, "西": 0.83,
+        "南東": 0.96, "南西": 0.96, "南": 1.00
     }
     tilt_factors = {
-         0: 0.90,  10: 1.00, 20: 1.02, 30: 1.00, 40: 0.95,
-        50: 0.90,  60: 0.85, 70: 0.80, 80: 0.75, 90: 0.65
+         0: 0.90, 10: 1.00, 20: 1.02, 30: 1.00, 40: 0.95,
+        50: 0.90, 60: 0.85, 70: 0.80, 80: 0.75, 90: 0.65
     }
     ori_factor  = orientation_factors.get(orientation, 1.0)
     tilt_factor = tilt_factors.get(int(tilt), 1.0)
     corr_factor = ori_factor * tilt_factor
 
-    # 補正を反映
     for h in time_labels:
         df_solar[h] = df_solar[h] * corr_factor
 
@@ -107,23 +106,23 @@ def process_and_plot(
         )
     df_hourly["日発電量 [kWh]"] = df_hourly[time_labels].sum(axis=1)
 
-    # --- 月別積分値 ---
+    # --- 月別積分値（PCS制限前）---
     eph_monthly = (
         df_hourly.groupby("月")["日発電量 [kWh]"]
         .sum().reset_index()
         .rename(columns={"日発電量 [kWh]": "発電量 [kWh]"})
     )
 
-    # --- PCS出力制限（1時間ごとにクリップ） ---
-    if PCS_output_kw not in (None, 0):
-        for h in time_labels:
-            df_hourly[h] = df_hourly[h].clip(upper=PCS_output_kw)
-        # 月別再計算
-        eph_monthly = (
-            df_hourly.groupby("月")[time_labels]
-            .sum(axis=1).reset_index()
-            .melt(id_vars=["月"], value_name="発電量 [kWh]")
-        )
+    # --- PCS出力制限（1時間ごとにクリップ）---
+    for h in time_labels:
+        df_hourly[h] = df_hourly[h].clip(upper=PCS_output_kw)
+
+    # 月別再計算（クリップ後）
+    eph_monthly = (
+        df_hourly.groupby("月")[time_labels]
+        .sum().reset_index()
+        .melt(id_vars=["月"], value_name="発電量 [kWh]")
+    )
 
     # --- グラフ描画 ---
     fig_bar = px.bar(
@@ -183,7 +182,7 @@ with gr.Blocks() as demo:
                                    label="傾斜角 (°)",
                                    choices=[str(i) for i in range(0,91,10)],
                                    value="30")
-            PCS_input        = gr.Number(label="PCS出力（kW）", value=None)
+            PCS_input        = gr.Number(label="PCS出力（kW）", value=99)  # デフォルトを99kWに設定
             month_input      = gr.Textbox(label="月 (1–12)", placeholder="例:1")
             day_input        = gr.Textbox(label="日 (1–31)", placeholder="例:15")
             run_button       = gr.Button("▶️ 計算")
