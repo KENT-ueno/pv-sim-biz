@@ -5,7 +5,6 @@ import plotly.express as px
 # 定数: STC条件下の基準照度 (kW/m²)
 G_STC = 1.0
 
-
 def process_and_plot(
     uploaded_file,
     K,
@@ -49,12 +48,9 @@ def process_and_plot(
     alpha = alpha_percentage / 100.0
 
     # PAS or Ppeak いずれか入力判定
-    if Ppeak and PAS:
-        # 両方入力されている場合、Ppeakを優先
+    if Ppeak is not None and Ppeak != 0:
         effective_PAS = Ppeak / (K * G_STC)
-    elif Ppeak:
-        effective_PAS = Ppeak / (K * G_STC)
-    elif PAS:
+    elif PAS is not None and PAS != 0:
         effective_PAS = PAS
     else:
         return None, None, "エラー：PAS または Ppeak のいずれかを入力してください。"
@@ -152,7 +148,6 @@ def process_and_plot(
 
     return fig_bar, fig_line, ""
 
-
 # ─────────────── Gradio UI 定義 ───────────────
 with gr.Blocks() as demo:
     gr.Markdown("# NEDO 日射量シミュレーション（Gradio 版）")
@@ -168,8 +163,8 @@ with gr.Blocks() as demo:
         with gr.Column(scale=2):
             file_input = gr.File(label="NEDO 形式 CSV ファイル", file_types=[".csv"])
             K_input = gr.Number(label="K（係数）", value=0.95)
-            PAS_input = gr.Number(label="PAS（受光面積 m²）", value=None, placeholder="例: 10.0")
-            Ppeak_input = gr.Number(label="Ppeak（定格出力 kWₚ）", value=None, placeholder="例: 5.0")
+            PAS_input = gr.Number(label="PAS（受光面積 m²）", value=None)
+            Ppeak_input = gr.Number(label="Ppeak（定格出力 kWₚ）", value=None)
             GS_input = gr.Number(label="GS（基準日射量 kWh/m²）", value=1.0)
             alpha_input = gr.Number(label="αpmax（[%/℃]）", value=-0.35)
             deltaT_input = gr.Number(label="ΔT (℃)", value=25.0)
@@ -190,4 +185,3 @@ with gr.Blocks() as demo:
 
 if __name__ == "__main__":
     demo.launch()
-
