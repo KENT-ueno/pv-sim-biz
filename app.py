@@ -67,12 +67,13 @@ def process_and_plot(
     if PCS_output_kw in (None, 0):
         PCS_output_kw = DEFAULT_PCS_OUTPUT
 
-    # --- CSVから緯度経度取得 ---
+    # --- CSVから緯度経度取得（NEDO形式: 1行目の3,4列目が緯度、5,6列目が経度） ---
     try:
         with open(uploaded_file.name, "r", encoding="shift_jis") as f:
             first_line = f.readline().strip()
-        lat_str, lon_str = first_line.split(",")
-        lat, lon = float(lat_str), float(lon_str)
+        parts = first_line.split(",")
+        lat = float(parts[2]) + float(parts[3]) / 60    # 緯度
+        lon = float(parts[4]) + float(parts[5]) / 60    # 経度
     except Exception as e:
         return None, None, None, f"緯度経度の取得エラー: {e}"
 
@@ -121,7 +122,7 @@ def process_and_plot(
     for idx, h in idx_map:
         ghi_flat.append(df_solar.iloc[idx][f"{h}時"])  # [kWh/m²]
     # pvlibはW/m²を想定なので、kWh/m²→W/m²へ変換（1hあたり）
-    ghi_flat = [v * 1000 for v in ghi_flat]  # 1時間=3600秒だが、1hあたりなら×1000で十分
+    ghi_flat = [v * 1000 for v in ghi_flat]
 
     # 4. 太陽位置・Clearskyなど計算
     solpos = site.get_solarposition(times)
@@ -139,10 +140,10 @@ def process_and_plot(
         dhi=dhi,
         solar_zenith=solpos["zenith"].values,
         solar_azimuth=solpos["azimuth"].values,
-        model='isotropic'  # シンプルな拡散モデル
+        model='isotropic'
     )
     # 得られた poa_global [W/m²] → kWh/m² へ（1h単位あたり）
-    poa_kwh = poa['poa_global'] / 1000  # 1hあたりなら1/1000でOK
+    poa_kwh = poa['poa_global'] / 1000
 
     # --- df_solarの時刻ごと値を置換（これで傾斜・方位補正も物理的に） ---
     flat_idx = 0
