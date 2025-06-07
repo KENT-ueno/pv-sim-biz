@@ -59,13 +59,13 @@ def process_and_plot(
         if PCS_output_kw in (None, 0):
             PCS_output_kw = DEFAULT_PCS_OUTPUT
 
-        # --- CSVから緯度経度取得（NEDO形式: 1行目の3,4列目が緯度、5,6列目が経度） ---
+        # --- CSVから緯度経度取得（NEDO形式の1行目） ---
         try:
             with open(uploaded_file.name, "r", encoding="shift_jis") as f:
                 first_line = f.readline().strip()
             parts = first_line.split(",")
-            lat = float(parts[2]) + float(parts[3]) / 60    # 緯度
-            lon = float(parts[4]) + float(parts[5]) / 60    # 経度
+            lat = float(parts[2]) + float(parts[3]) / 60.0    # 緯度
+            lon = float(parts[4]) + float(parts[5]) / 60.0    # 経度
         except Exception as e:
             return None, None, None, f"緯度経度の取得エラー: {e}"
 
@@ -91,58 +91,52 @@ def process_and_plot(
             df_solar[h] = pd.to_numeric(df_solar[h], errors="coerce") * 0.01 / 3.6
             df_temp[h]  = pd.to_numeric(df_temp[h], errors="coerce")  * 0.1
 
-        # --- pvlibでPOA（傾斜・方位補正後）日射量を計算 ---
+        # DataFrame全体を数値化して配列化（文字列混入防止）
+        df_solar[time_labels] = df_solar[time_labels].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+        df_temp[time_labels]   = df_temp[time_labels].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+
+        # --- pvlibでPOA（物理ベースの傾斜・方位補正）日射量を計算 ---
         surface_tilt    = float(tilt)
         surface_azimuth = ORIENTATION_TO_AZIMUTH.get(orientation, 180)
         tz = "Asia/Tokyo"
         site = pvlib.location.Location(lat, lon, tz=tz)
 
-        # 1) 各行ごと・各時間ごとの datetime を作成 (hour=h-1)
+        # (1) DatetimeIndex作成 (hour=0..23)
         times  = []
-        idx_map= []  # (df_solar行番号, hour)
         for idx, row in df_solar.iterrows():
             y, m, d = int(row["年"]), int(row["月"]), int(row["日"])
             for h in range(1, 25):
-                dt = pd.Timestamp(year=y, month=m, day=d, hour=h-1, tz=tz)
-                times.append(dt)
-                idx_map.append((idx, h))
+                times.append(pd.Timestamp(year=y, month=m, day=d, hour=h-1, tz=tz))
         times = pd.DatetimeIndex(times)
 
-        # 2) GHI配列を作成しつつ W/m² に変換
-        ghi_flat = []
-        for idx, h in idx_map:
-            raw = df_solar.iloc[idx][f"{h}時"]
-            # 明示的に float() キャストしてから1000倍
-            v = float(raw) if raw is not None and raw != "" else 0.0
-            ghi_flat.append(v * 1000.0)
+        # (2) GHIをkWh/m²→W/m²に変換しつつ1次元化
+        ghi_matrix = df_solar[time_labels].to_numpy()      # 形状: (日数, 24)
+        ghi_flat   = ghi_matrix.flatten() * 1000.0         # W/m²
 
-        # 3) 太陽位置・Clearsky計算
+        # (3) 太陽位置・Clearsky取得
         solpos   = site.get_solarposition(times)
         clearsky = site.get_clearsky(times, model="simplified_solis")
-        dhi      = clearsky["dhi"].values
-        dni      = clearsky["dni"].values
+        dhi      = clearsky["dhi"].to_numpy()
+        dni      = clearsky["dni"].to_numpy()
 
-        # 4) POA面照度 計算 (W/m²) → kWh/m² に変換
-        poa = pvlib.irradiance.get_total_irradiance(
+        # (4) POA面照度 計算 → kWh/m²へ
+        poa    = pvlib.irradiance.get_total_irradiance(
             surface_tilt=surface_tilt,
             surface_azimuth=surface_azimuth,
             dni=dni,
             ghi=ghi_flat,
             dhi=dhi,
-            solar_zenith=solpos["zenith"].values,
-            solar_azimuth=solpos["azimuth"].values,
+            solar_zenith=solpos["zenith"].to_numpy(),
+            solar_azimuth=solpos["azimuth"].to_numpy(),
             model='isotropic'
         )
-        poa_kwh = poa["poa_global"] / 1000.0
+        poa_kwh = poa["poa_global"].to_numpy() / 1000.0
 
-        # 5) df_solarに値を上書き
-        flat_idx = 0
-        for idx, row in df_solar.iterrows():
-            for h in range(1, 25):
-                df_solar.at[idx, f"{h}時"] = poa_kwh.iloc[flat_idx]
-                flat_idx += 1
+        # (5) df_solarへ置換
+        poa_matrix = poa_kwh.reshape(len(df_solar), 24)
+        df_solar[time_labels] = pd.DataFrame(poa_matrix, index=df_solar.index)
 
-        # --- 発電量計算（JIS式＋PCS制限） ---
+        # --- 発電量計算（JIS式＋PSC制限） ---
         df_hourly = df_solar[["月", "日"] + time_labels].copy()
         for h in time_labels:
             df_hourly[h] = (
@@ -154,25 +148,29 @@ def process_and_plot(
             )
         df_hourly["日発電量 [kWh]"] = df_hourly[time_labels].sum(axis=1)
 
+        # 月別積分（PCS制限前）
         eph_monthly = (
             df_hourly.groupby("月")["日発電量 [kWh]"]
             .sum().reset_index()
             .rename(columns={"日発電量 [kWh]": "発電量 [kWh]"})
         )
 
-        # PCSクリップ
+        # PCSクリップ（1時間毎）
         for h in time_labels:
             df_hourly[h] = df_hourly[h].clip(upper=PCS_output_kw)
 
+        # 月別再計算
         eph_monthly = (
             df_hourly.groupby("月")[time_labels]
             .sum().reset_index()
             .melt(id_vars=["月"], value_name="発電量 [kWh]")
         )
 
-        # グラフ作成
+        # --- グラフ描画 ---
         fig_bar = px.bar(
-            eph_monthly, x="月", y="発電量 [kWh]",
+            eph_monthly,
+            x="月",
+            y="発電量 [kWh]",
             title="月別発電量（物理ベース補正＋PCS制限後）"
         )
 
@@ -189,7 +187,9 @@ def process_and_plot(
                 "発電量 [kWh]": hourly.values
             })
             fig_line = px.line(
-                df_plot, x="時刻", y="発電量 [kWh]",
+                df_plot,
+                x="時刻",
+                y="発電量 [kWh]",
                 markers=True,
                 title=f"{month_selected}月{day_selected}日の24h発電量"
             ).update_layout(xaxis=dict(dtick=1))
@@ -200,7 +200,7 @@ def process_and_plot(
         return fig_bar, fig_line, annual_str, ""
 
     except Exception as e:
-        # ここで全エラーをキャッチしてメッセージ返却
+        # 全エラーをキャッチしてメッセージ返却
         return None, None, None, f"内部エラー: {e}"
 
 
