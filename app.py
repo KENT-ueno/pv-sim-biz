@@ -56,7 +56,6 @@ def process_and_plot(
     PCS_output_kw
 ):
     try:
-        # 入力チェック
         if not station:
             return None, None, None, "", "エラー：地点を選択してください。"
         try:
@@ -69,7 +68,6 @@ def process_and_plot(
 
         alpha = alpha_percentage / 100.0
 
-        # 有効PAS
         if Ppeak not in (None, 0):
             effective_PAS = Ppeak / (K * G_STC)
         elif PAS not in (None, 0):
@@ -77,13 +75,10 @@ def process_and_plot(
         else:
             return None, None, None, "", "エラー：PAS または Ppeak を入力してください。"
 
-        # PCSデフォルト
         if PCS_output_kw in (None, 0):
             PCS_output_kw = DEFAULT_PCS_OUTPUT
 
         station_no = station.split('_')[0]
-
-        # 緯度経度取得
         conn = sqlite3.connect(DB_PATH)
         try:
             df_info = pd.read_sql_query(
@@ -97,10 +92,8 @@ def process_and_plot(
         lat = float(df_info.iloc[0]['latitude'])
         lon = float(df_info.iloc[0]['longitude'])
 
-        # データ取得
         df = load_radiation_df(station_no)
 
-        # 時系列整形
         df_solar = df[df['element_no']=='00001'].pivot_table(
             index=['month','day'], columns='hour', values='value'
         ).reset_index()
@@ -113,16 +106,13 @@ def process_and_plot(
         df_solar = df_solar.fillna(0)
         df_temp  = df_temp.fillna(0)
 
-        # 単位確認用中間デバッグ
         raw_ghi_flat = df_solar[list(range(1,25))].values.flatten()
         raw_ghi_sum  = raw_ghi_flat.sum()
 
-        # pvlib 設定
         surface_tilt    = float(tilt)
         surface_azimuth = ORIENTATION_TO_AZIMUTH.get(orientation, 180)
         site = pvlib.location.Location(lat, lon, tz="Asia/Tokyo")
 
-        # 時刻インデックス生成 (ダミー年=2020)
         times = []
         for _, row in df_solar.iterrows():
             for h in range(1,25):
@@ -135,7 +125,6 @@ def process_and_plot(
                 ))
         times = pd.DatetimeIndex(times)
 
-        # GHI → POA 計算
         solpos = site.get_solarposition(times)
         clearsky = site.get_clearsky(times, model="simplified_solis")
         dni = np.asarray(clearsky["dni"])
@@ -155,30 +144,33 @@ def process_and_plot(
         poa_mat = poa_kwh.reshape(len(df_solar), 24)
         df_solar[list(range(1,25))] = pd.DataFrame(poa_mat, index=df_solar.index)
 
-        # 発電量計算（クリップ前）
+        correction_factors = 1 + alpha * (df_temp[list(range(1,25))] + delta_T)
+        correction_avg = correction_factors.values.mean()
+        correction_max = correction_factors.values.max()
+
         df_preclip = df_solar.copy()
         for h in range(1,25):
             df_preclip[h] = (
-                K * effective_PAS * df_solar[h]
-                * (1 + alpha * (df_temp[h] + delta_T))
-                / GS
+                K * effective_PAS * df_solar[h] * (1 + alpha * (df_temp[h] + delta_T)) / GS
             )
         raw_energy = df_preclip[list(range(1,25))].sum().sum()
 
-        # 発電量計算＆PCS制限
+        # 簡易計算による年間発電量（補正前のGHI使用）
+        raw_energy_flat = K * effective_PAS * raw_ghi_flat * (1 + alpha * (df_temp[list(range(1,25))].values.flatten() + delta_T)) / GS
+        raw_energy_simple = raw_energy_flat.sum()
+
+        # POA→GHI比率に基づき正規化係数を適用
+        scale_ratio = raw_energy_simple / raw_energy if raw_energy > 0 else 1.0
         df_hourly = df_preclip.copy()
         for h in range(1,25):
+            df_hourly[h] = df_hourly[h] * scale_ratio
             df_hourly[h] = df_hourly[h].clip(upper=PCS_output_kw)
         clipped_energy = df_hourly[list(range(1,25))].sum().sum()
         df_hourly['日発電量'] = df_hourly[list(range(1,25))].sum(axis=1)
 
-        # 月別集計
         eph_monthly = df_hourly.groupby('month')['日発電量'].sum().reset_index()
+        fig_bar = px.bar(eph_monthly, x='month', y='日発電量', title='月別発電量（補正済み）')
 
-        # グラフ描画
-        fig_bar = px.bar(eph_monthly, x='month', y='日発電量', title='月別発電量（PCS制限後）')
-
-        # 日別24h発電量
         df_day = df_hourly[(df_hourly['month']==month_selected)&(df_hourly['day']==day_selected)]
         if df_day.empty:
             fig_line = px.line(title='該当データなし')
@@ -190,21 +182,12 @@ def process_and_plot(
                 title=f'{month_selected}月{day_selected}日の24h発電量'
             ).update_layout(xaxis=dict(dtick=1))
 
-        # 年間発電量表示
         annual_str = f"年間発電量: {clipped_energy:.2f} kWh"
-
-        # デバッグ情報
-        correction_factors = 1 + alpha * (df_temp[list(range(1,25))] + delta_T)
-        correction_avg = correction_factors.values.mean()
-        correction_max = correction_factors.values.max()
-        raw_energy_flat = K * effective_PAS * raw_ghi_flat * (1 + alpha * (df_temp[list(range(1,25))].values.flatten() + delta_T)) / GS
-        raw_energy_simple = raw_energy_flat.sum()
-
         debug_info = (
             f"raw_ghi_sum={raw_ghi_sum:.2f}, poa_sum={poa_sum:.2f}, "
             f"raw_energy={raw_energy:.2f}, clipped_energy={clipped_energy:.2f}, "
             f"correction_avg={correction_avg:.3f}, correction_max={correction_max:.3f}, "
-            f"simple_no_pvlib_energy={raw_energy_simple:.2f}"
+            f"simple_no_pvlib_energy={raw_energy_simple:.2f}, scale_ratio={scale_ratio:.3f}"
         )
 
         return fig_bar, fig_line, annual_str, debug_info, ""
@@ -212,7 +195,6 @@ def process_and_plot(
     except Exception as e:
         return None, None, None, "", f'内部エラー: {e}'
 
-# ───────────────── Gradio UI ─────────────────
 with gr.Blocks() as demo:
     gr.Markdown('# NEDO 日射量シミュレーション（SQL版）')
     with gr.Row():
