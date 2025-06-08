@@ -1,157 +1,240 @@
-import os
-import sqlite3
 import pandas as pd
 import gradio as gr
 import plotly.express as px
-import pvlib
-import numpy as np
+import pvlib  # 必要ライブラリ
 
 # 定数
 G_STC = 1.0
 DEFAULT_PCS_OUTPUT = 99.0
 
-# DBパス
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH  = os.path.join(BASE_DIR, "radiation.db")
-
-# 方位マッピング
 ORIENTATION_TO_AZIMUTH = {
-    "北": 0, "東": 90, "西":270,
+    "北":   0, "東":  90, "西": 270,
     "南東":135, "南西":225, "南":180
 }
 
-# 地点一覧取得
-def get_station_options():
-    if not os.path.exists(DB_PATH):
-        raise FileNotFoundError(f"DBが見つかりません: {DB_PATH}")
-    conn = sqlite3.connect(DB_PATH)
-    df = pd.read_sql_query(
-        "SELECT DISTINCT point_no AS station_no, point_name AS station_name FROM radiation_data",
-        conn
-    )
-    conn.close()
-    return [f"{r.station_no}_{r.station_name}" for r in df.itertuples()]
-
-# データ読み込み
-def load_data(no):
-    conn = sqlite3.connect(DB_PATH)
-    df = pd.read_sql_query(
-        "SELECT element_no, month, day, hour, value FROM radiation_data WHERE point_no=?",
-        conn, params=(no,)
-    )
-    conn.close()
-    return df
-
-# メイン
-
 def process_and_plot(
-    station, K, PAS, Ppeak, GS,
-    alpha_pct, delta_T, orientation, tilt,
-    month_str, day_str, PCS_kw
+    uploaded_file,
+    K, PAS, Ppeak, GS,
+    alpha_percentage, delta_T,
+    orientation, tilt,
+    month_str, day_str,
+    PCS_output_kw
 ):
-    # 入力チェック
-    if not station:
-        return None, None, None, "", "地点選択してください"
     try:
-        m = int(month_str); d = int(day_str)
-        assert 1<=m<=12 and 1<=d<=31
-    except:
-        return None, None, None, "", "月1-12 日1-31の整数を"
+        # 入力チェック
+        if uploaded_file is None:
+            return None, None, "", "", "", "エラー：CSVがアップロードされていません。"
+        try:
+            month_selected = int(month_str)
+            day_selected   = int(day_str)
+            if not (1 <= month_selected <= 12 and 1 <= day_selected <= 31):
+                raise ValueError
+        except:
+            return None, None, "", "", "", "エラー：月は1～12、日は1～31の整数で入力してください。"
 
-    alpha = alpha_pct/100.0
-    # PAS設定
-    if Ppeak not in (None,0): PAS_eff = Ppeak/(K*G_STC)
-    elif PAS not in (None,0): PAS_eff = PAS
-    else: return None,None,None,"","PAS or Ppeak を"
-    # PCS
-    if PCS_kw in (None,0): PCS_kw = DEFAULT_PCS_OUTPUT
+        alpha = alpha_percentage / 100.0
 
-    no = station.split('_')[0]
-    # 緯度経度
-    conn = sqlite3.connect(DB_PATH)
-    df_info = pd.read_sql_query(
-        "SELECT point_lat AS lat, point_lon AS lon FROM radiation_data WHERE point_no=? LIMIT 1",
-        conn, params=(no,)
-    )
-    conn.close()
-    if df_info.empty:
-        return None,None,None,"",f"地点情報なし {no}"
-    lat, lon = df_info.iloc[0][['lat','lon']]
+        # 有効PAS
+        if Ppeak is not None and Ppeak > 0:
+            effective_PAS = Ppeak / (K * G_STC)
+        elif PAS is not None and PAS > 0:
+            effective_PAS = PAS
+        else:
+            return None, None, "", "", "", "エラー：PAS または Ppeak を入力してください。"
 
-    df = load_data(no)
-    # pivot
-    df_s = df[df.element_no=='00001'].pivot_table(index=['month','day'], columns='hour', values='value').reset_index()
-    df_t = df[df.element_no=='00005'].pivot_table(index=['month','day'], columns='hour', values='value').reset_index()
-    # 単位変換
-    for h in range(1,25):
-        df_s[h] = pd.to_numeric(df_s[h],errors='coerce')*0.01*277.778
-        df_t[h] = pd.to_numeric(df_t[h],errors='coerce')*0.1
-    df_s.fillna(0,inplace=True); df_t.fillna(0,inplace=True)
+        # PCSデフォルト
+        if PCS_output_kw is None or PCS_output_kw <= 0:
+            PCS_output_kw = DEFAULT_PCS_OUTPUT
 
-    # GHI flat
-    ghi_flat = df_s[list(range(1,25))].values.flatten()
-    ghi_sum  = ghi_flat.sum()
+        # 緯度経度取得（1行目: NEDO形式）
+        with open(uploaded_file.name, "r", encoding="shift_jis") as f:
+            parts = f.readline().strip().split(",")
+        lat = float(parts[2]) + float(parts[3]) / 60.0
+        lon = float(parts[4]) + float(parts[5]) / 60.0
 
-    # 日別POA計算
-    times=[]
-    for _,r in df_s.iterrows():
-        for h in range(1,25):
-            times.append(pd.Timestamp(year=2020,month=int(r.month),day=int(r.day),hour=h-1,tz='Asia/Tokyo'))
-    times = pd.DatetimeIndex(times)
-    site = pvlib.location.Location(lat,lon,tz='Asia/Tokyo')
-    sol = site.get_solarposition(times)
-    cs  = site.get_clearsky(times,model='simplified_solis')
-    poa = pvlib.irradiance.get_total_irradiance(
-        surface_tilt=tilt, surface_azimuth=ORIENTATION_TO_AZIMUTH[orientation],
-        dni=np.asarray(cs.dni), ghi=ghi_flat, dhi=np.asarray(cs.dhi),
-        solar_zenith=np.asarray(sol.zenith), solar_azimuth=np.asarray(sol.azimuth),
-        model='isotropic'
-    )
-    poa_flat = np.asarray(poa.poa_global).reshape(len(df_s),24)
+        # CSV読み込み
+        time_labels = [f"{h}時" for h in range(1,25)]
+        col_names = ["要素番号","年","月","日"] + time_labels + ["最大","最小","積算","平均","通算日"]
+        df = pd.read_csv(
+            uploaded_file.name,
+            header=None, skiprows=1,
+            names=col_names, encoding="shift_jis"
+        )
+        df_solar = df[df["要素番号"]==1].reset_index(drop=True)
+        df_temp  = df[df["要素番号"]==5].reset_index(drop=True)
 
-    # 温度補正係数
-    corr = 1+alpha*(df_t[list(range(1,25))]+delta_T)
-    c_avg = corr.values.mean(); c_max = corr.values.max()
-    # 年間発電量簡易
-    energy_simple = (K*PAS_eff*ghi_flat*(1+alpha*(df_t[list(range(1,25))].values.flatten()+delta_T))/GS).sum()/1000.0
+        # 単位補正
+        for h in time_labels:
+            df_solar[h] = pd.to_numeric(df_solar[h], errors="coerce") * 0.01 / 3.6
+            df_temp[h]  = pd.to_numeric(df_temp[h],  errors="coerce") * 0.1
+        df_solar[time_labels] = df_solar[time_labels].fillna(0.0)
+        df_temp[time_labels]  = df_temp[time_labels].fillna(0.0)
 
-    # 形状のみ用いる
-    df_h = pd.DataFrame(poa_flat,columns=list(range(1,25)))
-    for h in range(1,25):
-        df_h[h] = (K*PAS_eff*df_h[h]*corr[h]/GS)
-    df_h['month']=df_s['month']; df_h['day']=df_s['day']
-    df_h['daily']=df_h[list(range(1,25))].sum(axis=1)
+        # pvlib 設定
+        surface_tilt    = float(tilt)
+        surface_azimuth = ORIENTATION_TO_AZIMUTH.get(orientation, 180)
+        site = pvlib.location.Location(lat, lon, tz="Asia/Tokyo")
 
-    # 月別
-    eph = df_h.groupby('month')['daily'].sum().reset_index()
-    fig_bar = px.bar(eph,x='month',y='daily',labels={'month':'月','daily':'月別発電量 [kWh]'},title='月別発電量')
+        # 時刻インデックス生成 (hour=0..23)
+        times = []
+        for _, row in df_solar.iterrows():
+            y,m,d = int(row["年"]), int(row["月"]), int(row["日"])
+            for h in range(1,25):
+                times.append(pd.Timestamp(y, m, d, h-1, tz="Asia/Tokyo"))
+        times = pd.DatetimeIndex(times)
 
-    # 日別
-    df_d = df_h[(df_h.month==m)&(df_h.day==d)]
-    if df_d.empty:
-        fig_line=px.line(title='該当データなし')
-    else:
-        df_pl = pd.DataFrame({'時刻':list(range(1,25)),'発電量 [kWh]':df_d[list(range(1,25))].iloc[0]})
-        fig_line=px.line(df_pl,x='時刻',y='発電量 [kWh]',markers=True,labels={'時刻':'時刻'},title=f'{m}月{d}日24h発電量')
-        fig_line.update_yaxes(title_text='発電量 [kWh]')
+        # GHI flatten (kWh/m²→W/m²)
+        ghi_flat = df_solar[time_labels].to_numpy().flatten() * 1000.0
 
-    return fig_bar,fig_line,f'年間発電量: {energy_simple:.2f} kWh',f'ghi_sum={ghi_sum:.2f}, simple={energy_simple:.2f}, c_avg={c_avg:.3f}, c_max={c_max:.3f}',""
+        # 太陽位置・Clearsky
+        solpos   = site.get_solarposition(times)
+        clearsky = site.get_clearsky(times, model="simplified_solis")
+        dhi      = clearsky["dhi"].values
+        dni      = clearsky["dni"].values
+        solar_zenith  = solpos["zenith"].values
+        solar_azimuth = solpos["azimuth"].values
 
-# UI
+        # POA 計算 → kWh/m²
+        poa = pvlib.irradiance.get_total_irradiance(
+            surface_tilt=surface_tilt,
+            surface_azimuth=surface_azimuth,
+            dni=dni, ghi=ghi_flat, dhi=dhi,
+            solar_zenith=solar_zenith,
+            solar_azimuth=solar_azimuth,
+            model='isotropic'
+        )
+        poa_kwh = poa["poa_global"] / 1000.0
+        poa_mat = poa_kwh.reshape(len(df_solar), 24)
+        df_solar[time_labels] = pd.DataFrame(poa_mat, index=df_solar.index)
+
+        # 発電量計算 (JIS 式)
+        df_hourly = df_solar[["年","月","日"] + time_labels].copy()
+        for h in time_labels:
+            df_hourly[h] = (
+                K * effective_PAS * df_solar[h]
+                * (1 + alpha * (df_temp[h] - delta_T))
+                / GS
+            )
+        # 計算途中の年間発電量（PCS クリップ前）
+        annual_pre = df_hourly[time_labels].sum().sum()
+
+        # PCS クリップ適用
+        for h in time_labels:
+            df_hourly[h] = df_hourly[h].clip(upper=PCS_output_kw)
+
+        # 月別集計
+        eph_monthly = (
+            df_hourly.groupby("月")[time_labels]
+            .sum()
+            .sum(axis=1)
+            .reset_index(name="発電量 [kWh]")
+        )
+
+        # グラフ描画
+        fig_bar = px.bar(
+            eph_monthly, x="月", y="発電量 [kWh]",
+            title="月別発電量（PCS制限後）"
+        ).update_layout(xaxis_title="月", yaxis_title="発電量 [kWh]")
+
+        # 指定日の24h発電量折れ線
+        df_day = df_hourly[
+            (df_hourly["月"]==month_selected)&(df_hourly["日"]==day_selected)
+        ]
+        if df_day.empty:
+            fig_line = px.line(title="該当データなし")
+        else:
+            hourly = df_day[time_labels].iloc[0]
+            df_plot = pd.DataFrame({
+                "時刻": list(range(1,25)),
+                "発電量 [kWh]": hourly.values
+            })
+            fig_line = px.line(
+                df_plot, x="時刻", y="発電量 [kWh]",
+                markers=True,
+                title=f"{month_selected}月{day_selected}日の24h発電量"
+            ).update_layout(
+                xaxis_title="時刻", yaxis_title="発電量 [kWh]",
+                xaxis=dict(dtick=1)
+            )
+
+        # デバッグ用：指定日の全天日射量テーブル
+        if df_solar[
+            (df_solar["月"]==month_selected)&(df_solar["日"]==day_selected)
+        ].empty:
+            ghi_day_df = pd.DataFrame(columns=time_labels)
+        else:
+            ghi_row = df_solar[
+                (df_solar["月"]==month_selected)&(df_solar["日"]==day_selected)
+            ][time_labels].iloc[0]
+            ghi_day_df = pd.DataFrame({
+                "時間": list(range(1,25)),
+                "全天日射量 [kWh/m²]": ghi_row.values
+            })
+
+        # UI へ返却
+        annual_str        = f"年間発電量 (クリップ後): {df_hourly[time_labels].sum().sum():.2f} kWh"
+        debug_annual_str  = f"中間年間発電量 (クリップ前): {annual_pre:.2f} kWh"
+        return fig_bar, fig_line, annual_str, ghi_day_df, debug_annual_str, ""
+
+    except Exception as e:
+        return None, None, "", pd.DataFrame(), "", f"内部エラー: {e}"
+
+
+# ───────────────── Gradio UI ─────────────────
 with gr.Blocks() as demo:
-    gr.Markdown('## NEDO 日射量シミュレーション (SQL版)')
+    gr.Markdown("# NEDO 日射量シミュレーション（デバッグモード）")
+    gr.Markdown("CSV→パラメータ→計算 → グラフ下にデバッグ情報表示")
+
     with gr.Row():
-        c1,c2=gr.Column(scale=2),gr.Column(scale=3)
-        with c1:
-            st=gr.Dropdown(label='地点',choices=get_station_options())
-            Kf,PASf,Pp=gr.Number(value=0.95,label='K'),gr.Number(value=None,label='PAS'),gr.Number(value=None,label='Ppeak')
-            GSf,aT,dT=gr.Number(value=1.0,label='GS'),gr.Number(value=-0.35,label='α[%/℃]'),gr.Number(value=25.0,label='ΔT[℃]')
-            ori,til=gr.Dropdown(label='方位',choices=list(ORIENTATION_TO_AZIMUTH.keys()),value='南'),gr.Dropdown(label='傾斜',choices=[str(i) for i in range(0,91,10)],value='0')
-            mm,dd=gr.Textbox(label='月'),gr.Textbox(label='日')
-            pcs=gr.Number(value=99,label='PCS[kW]')
-            btn=gr.Button('▶ 計算')
-            out1=gr.Textbox(label='年間発電量',interactive=False); out2=gr.Textbox(label='DEBUG',interactive=False)
-        with c2:
-            pbar=gr.Plot(label='月別発電量'); pline=gr.Plot(label='24h発電量')
-    btn.click(process_and_plot,inputs=[st,Kf,PASf,Pp,GSf,aT,dT,ori,til,mm,dd,pcs],outputs=[pbar,pline,out1,out2])
+        with gr.Column(scale=2):
+            file_input        = gr.File(label="NEDO形式CSV", file_types=[".csv"])
+            K_input           = gr.Number(label="K", value=0.95)
+            PAS_input         = gr.Number(label="PAS", value=None)
+            Ppeak_input       = gr.Number(label="Ppeak", value=None)
+            GS_input          = gr.Number(label="GS", value=1.0)
+            alpha_input       = gr.Number(label="α[%/℃]", value=-0.35)
+            deltaT_input      = gr.Number(label="ΔT[℃]", value=25.0)
+            orientation_input = gr.Dropdown(
+                label="方位", choices=list(ORIENTATION_TO_AZIMUTH.keys()),
+                value="南"
+            )
+            tilt_input        = gr.Dropdown(
+                label="傾斜角(°)", choices=[str(i) for i in range(0,91,10)],
+                value="30"
+            )
+            PCS_input         = gr.Number(label="PCS出力[kW]", value=99)
+            month_input       = gr.Textbox(label="月(1–12)", placeholder="例:6")
+            day_input         = gr.Textbox(label="日(1–31)", placeholder="例:15")
+            run_button        = gr.Button("▶️ 計算")
+            annual_box        = gr.Textbox(label="年間発電量 (PCS制限後)", interactive=False)
+            ghi_table         = gr.Dataframe(
+                label="指定日の全天日射量 [kWh/m²]", interactive=False
+            )
+            debug_annual_box  = gr.Textbox(
+                label="中間年間発電量 (クリップ前)", interactive=False
+            )
+            error_box         = gr.Textbox(label="エラー", interactive=False)
+
+        with gr.Column(scale=3):
+            bar_plot  = gr.Plot(label="月別発電量")
+            line_plot = gr.Plot(label="24h発電量")
+
+    run_button.click(
+        fn=process_and_plot,
+        inputs=[
+            file_input, K_input, PAS_input, Ppeak_input,
+            GS_input, alpha_input, deltaT_input,
+            orientation_input, tilt_input,
+            month_input, day_input, PCS_input
+        ],
+        outputs=[
+            bar_plot, line_plot,
+            annual_box,
+            ghi_table,
+            debug_annual_box,
+            error_box
+        ]
+    )
+
+if __name__ == "__main__":
     demo.launch()
