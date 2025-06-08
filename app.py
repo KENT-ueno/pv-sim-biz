@@ -24,7 +24,8 @@ def get_station_options():
         raise FileNotFoundError(f"データベースファイルが見つかりません: {DB_PATH}")
     conn = sqlite3.connect(DB_PATH)
     try:
-        df = pd.read_sql_query("SELECT station_no, station_name FROM radiation_data", conn)
+        # 実際の列名に合わせてpoint_no, point_nameを取得（例：radiation_dataテーブル）
+        df = pd.read_sql_query("SELECT DISTINCT point_no AS station_no, point_name AS station_name FROM radiation_data", conn)
     finally:
         conn.close()
     options = [f"{row['station_no']}_{row['station_name']}" for _, row in df.iterrows()]
@@ -34,6 +35,7 @@ def get_station_options():
 def load_radiation_df(station_no):
     conn = sqlite3.connect(DB_PATH)
     try:
+        # 実際のテーブル名、列名に合わせてpoint_noを使用
         df = pd.read_sql_query(
             "SELECT element_no, month, day, hour, value FROM radiation WHERE station_no = ?",
             conn, params=(station_no,)
@@ -83,7 +85,7 @@ def process_and_plot(
         conn = sqlite3.connect(DB_PATH)
         try:
             df_info = pd.read_sql_query(
-                "SELECT latitude, longitude FROM radiation_data WHERE station_no = ?",
+                "SELECT point_lat AS latitude, point_lon AS longitude FROM radiation_data WHERE point_no = ?",
                 conn, params=(station_no,)
             )
         finally:
@@ -98,9 +100,10 @@ def process_and_plot(
         # 時系列整形
         df_solar = df[df['element_no']==1].pivot_table(index=['month','day'], columns='hour', values='value').reset_index()
         df_temp  = df[df['element_no']==5].pivot_table(index=['month','day'], columns='hour', values='value').reset_index()
+        # 単位補正
         for h in range(1,25):
-            df_solar[h] = df_solar[h] * 0.01 / 3.6
-            df_temp[h]  = df_temp[h]  * 0.1
+            df_solar[h] = pd.to_numeric(df_solar[h], errors='coerce') * 0.01 / 3.6
+            df_temp[h]  = pd.to_numeric(df_temp[h],  errors='coerce') * 0.1
         df_solar = df_solar.fillna(0)
         df_temp  = df_temp.fillna(0)
 
@@ -117,7 +120,7 @@ def process_and_plot(
         times = pd.DatetimeIndex(times)
 
         # GHI flatten → W/m²
-        ghi_flat = (df_solar[list(range(1,25))].values.flatten()) * 1000.0
+        ghi_flat = df_solar[list(range(1,25))].values.flatten() * 1000.0
 
         solpos   = site.get_solarposition(times)
         clearsky = site.get_clearsky(times, model="simplified_solis")
@@ -130,9 +133,9 @@ def process_and_plot(
         )
         poa_kwh = poa['poa_global'] / 1000.0
         poa_mat = poa_kwh.reshape(len(df_solar), 24)
-        df_solar[list(range(1,25))] = pd.DataFrame(poa_mat, index=df_solar.Index)
+        df_solar[list(range(1,25))] = pd.DataFrame(poa_mat, index=df_solar.index)
 
-        # 発電量計算
+        # 発電量計算＆PCS制限
         df_hourly = df_solar.copy()
         for h in range(1,25):
             df_hourly[h] = (
@@ -148,6 +151,7 @@ def process_and_plot(
         # グラフ描画
         fig_bar = px.bar(eph_monthly, x='month', y='日発電量', title='月別発電量（PCS制限後）')
 
+        # 日別24hグラフ
         df_day = df_hourly[(df_hourly['month']==month_selected)&(df_hourly['day']==day_selected)]
         if df_day.empty:
             fig_line = px.line(title='該当データなし')
@@ -155,8 +159,8 @@ def process_and_plot(
             hourly = df_day[list(range(1,25))].iloc[0]
             df_plot = pd.DataFrame({'時刻':list(range(1,25)),'発電量':hourly.values})
             fig_line = px.line(df_plot, x='時刻', y='発電量', markers=True,
-                               title=f'{month_selected}月{day_selected}日の24h発電量')  \
-                .update_layout(xaxis=dict(dtick=1))
+                               title=f'{month_selected}月{day_selected}日の24h発電量')\
+                      .update_layout(xaxis=dict(dtick=1))
 
         annual_total = df_hourly[list(range(1,25))].sum().sum()
         annual_str   = f'年間発電量: {annual_total:.2f} kWh'
