@@ -98,17 +98,25 @@ def process_and_plot(
         ghi_series = pd.Series(ghi_flat, index=times)
         solpos = site.get_solarposition(times)
 
-        # 傾斜面日射量計算: 清天モデルを用いず、水平GHIから直接幾何補正のみ実施
+                # 傾斜面日射量計算: GHIからDNI/DHIを推定（Erbsモデル）し、POAを算出
+        sep = pvlib.irradiance.erbs(
+            ghi_series,
+            solpos['zenith'],
+            times
+        )
+        dni = sep['dni']
+        dhi = sep['dhi']
         poa = pvlib.irradiance.get_total_irradiance(
             surface_tilt=surface_tilt,
             surface_azimuth=surface_azimuth,
-            dni=None,
+            dni=dni,
             ghi=ghi_series,
-            dhi=None,
+            dhi=dhi,
             solar_zenith=solpos['zenith'],
             solar_azimuth=solpos['azimuth'],
             model='isotropic'
         )
+        # kWhに変換してDataFrameに戻す
         poa_kwh = poa['poa_global'] / 1000.0
         poa_mat = poa_kwh.to_numpy().reshape(len(df_solar), 24)
         df_solar[list(range(1, 25))] = pd.DataFrame(poa_mat, index=df_solar.index)
