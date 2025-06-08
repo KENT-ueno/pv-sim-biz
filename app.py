@@ -10,13 +10,13 @@ import numpy as np
 G_STC = 1.0
 DEFAULT_PCS_OUTPUT = 99.0
 
-# DBパス設定（スクリプトと同じディレクトリ内に radiation.db を配置）
+# DBパス設定
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "radiation.db")
 
 ORIENTATION_TO_AZIMUTH = {
-    "北":   0, "東":  90, "西": 270,
-    "南東":135, "南西":225, "南":180
+    "北": 0, "東": 90, "西": 270,
+    "南東": 135, "南西": 225, "南": 180
 }
 
 # 地点リスト取得
@@ -109,23 +109,23 @@ def process_and_plot(
         raw_ghi_flat = df_solar[list(range(1,25))].values.flatten()
         raw_ghi_sum  = raw_ghi_flat.sum()
 
-        # pvlibによるPOA分布は保持して日別形状に使用
+        # POA分布（時別Shape用）
         surface_tilt    = float(tilt)
-        surface_azimuth = ORIENTATION_TO_AZIMUTH.get(orientation,180)
+        surface_azimuth = ORIENTATION_TO_AZIMUTH.get(orientation, 180)
         site = pvlib.location.Location(lat, lon, tz="Asia/Tokyo")
         times = [pd.Timestamp(year=2020, month=int(r.month), day=int(r.day), hour=h-1, tz="Asia/Tokyo")
-                 for _,r in df_solar.iterrows() for h in range(1,25)]
-        times = pd.DatetimeIndex(times)
+                 for _, r in df_solar.iterrows() for h in range(1,25)]
         solpos   = site.get_solarposition(times)
         clearsky = site.get_clearsky(times, model="simplified_solis")
         poa = pvlib.irradiance.get_total_irradiance(
-            surface_tilt, surface_azimuth,
+            surface_tilt=surface_tilt,
+            surface_azimuth=surface_azimuth,
             dni=np.asarray(clearsky['dni']), ghi=raw_ghi_flat, dhi=np.asarray(clearsky['dhi']),
             solar_zenith=np.asarray(solpos['zenith']), solar_azimuth=np.asarray(solpos['azimuth']),
             model='isotropic'
         )
         poa_vals = np.asarray(poa['poa_global'])
-        poa_flat = poa_vals.reshape(len(df_solar),24)
+        poa_flat = poa_vals.reshape(len(df_solar), 24)
 
         # 温度補正
         corr = 1 + alpha * (df_temp[list(range(1,25))] + delta_T)
@@ -136,7 +136,7 @@ def process_and_plot(
         raw_energy_simple = (K * effective_PAS * raw_ghi_flat * (1 + alpha * (df_temp[list(range(1,25))].values.flatten() + delta_T)) / GS).sum() / 1000.0
         clipped_energy    = raw_energy_simple
 
-        # 日別形状計算（月日フィルタは使用せず、傾向形状のみ活用）
+        # 日別形状計算
         df_hourly = pd.DataFrame(poa_flat, columns=list(range(1,25)))
         for h in range(1,25):
             df_hourly[h] = (K * effective_PAS * df_hourly[h] * corr[h] / GS).clip(upper=PCS_output_kw)
@@ -146,21 +146,37 @@ def process_and_plot(
 
         # 月別集計
         eph_monthly = df_hourly.groupby('month')['日発電量'].sum().reset_index()
-        fig_bar = px.bar(eph_monthly, x='month', y='日発電量', title='月別発電量（補正済み）')
+        fig_bar = px.bar(
+            eph_monthly, x='month', y='日発電量',
+            title='月別発電量（補正済み）',
+            labels={'month':'月', '日発電量':'月別発電量 [kWh]'}
+        )
+        fig_bar.update_yaxes(title_text='月別発電量 [kWh]')
 
-        # 24hカーブ（月・日絞り込み）
+        # 24h発電量カーブ
         df_day = df_hourly[(df_hourly['month']==month_selected)&(df_hourly['day']==day_selected)]
         if df_day.empty:
-            fig_line = px.line(title='該当データなし')
+            fig_line = px.line(
+                title='該当データなし'
+            )
         else:
-            df_plot = pd.DataFrame({'時刻':list(range(1,25)),'発電量':df_day[list(range(1,25))].iloc[0]})
-            fig_line = px.line(df_plot, x='時刻', y='発電量', markers=True,
-                               title=f'{month_selected}月{day_selected}日の24h発電量').update_layout(xaxis=dict(dtick=1))
+            df_plot = pd.DataFrame({
+                '時刻': list(range(1,25)),
+                '発電量 [kWh]': df_day[list(range(1,25))].iloc[0]
+            })
+            fig_line = px.line(
+                df_plot, x='時刻', y='発電量 [kWh]',
+                markers=True,
+                title=f'{month_selected}月{day_selected}日の24h発電量',
+                labels={'時刻':'時刻', '発電量 [kWh]':'発電量 [kWh]'}
+            ).update_layout(xaxis=dict(dtick=1))
 
         annual_str = f"年間発電量: {clipped_energy:.2f} kWh"
-        debug_info = (f"raw_ghi_sum={raw_ghi_sum:.2f}, poa_sum={poa_vals.sum():.2f}, "
-                      f"correction_avg={corr_avg:.3f}, correction_max={corr_max:.3f}, "
-                      f"simple_no_pvlib_energy={raw_energy_simple:.2f}")
+        debug_info = (
+            f"raw_ghi_sum={raw_ghi_sum:.2f}, poa_sum={poa_vals.sum():.2f}, "
+            f"correction_avg={corr_avg:.3f}, correction_max={corr_max:.3f}, "
+            f"simple_no_pvlib_energy={raw_energy_simple:.2f}"
+        )
 
         return fig_bar, fig_line, annual_str, debug_info, ""
     except Exception as e:
