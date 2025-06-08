@@ -55,12 +55,12 @@ def process_and_plot(
         day_selected = int(day_str)
         alpha = alpha_pct / 100.0
 
-        # PASまたはPpeak
+        # Ppeakを優先する（PAS無視）
         if Ppeak not in (None, 0):
             effective_PAS = Ppeak / (K * G_STC)
-        else:
+        elif PAS not in (None, 0):
             effective_PAS = PAS
-        if not effective_PAS:
+        else:
             return None, None, "", "", "エラー：PAS または Ppeak を入力してください。"
 
         # PCS出力デフォルト
@@ -85,7 +85,6 @@ def process_and_plot(
         df_temp = df[df['element_no'] == '00005'].pivot_table(
             index=['month', 'day'], columns='hour', values='value'
         ).reset_index()
-        # 単位変換: 全天日射量→kWh/m2, 気温→℃
         for h in range(1, 25):
             df_solar[h] = pd.to_numeric(df_solar[h], errors='coerce') * 0.01 / 3.6
             df_temp[h] = pd.to_numeric(df_temp[h], errors='coerce') * 0.1
@@ -97,21 +96,14 @@ def process_and_plot(
         surface_tilt = float(tilt)
         surface_azimuth = ORIENTATION_TO_AZIMUTH.get(orientation, 180)
         site = pvlib.location.Location(lat, lon, tz="Asia/Tokyo")
-
-        # 時刻インデックス (ダミー年=2020)
         times = pd.date_range(
             start="2020-01-01", periods=len(df_solar) * 24,
             freq="H", tz="Asia/Tokyo"
         )
-        # 水平GHI配列 (W/m2)
         ghi_flat = df_solar_raw[list(range(1, 25))].values.flatten() * 1000.0
         ghi_series = pd.Series(ghi_flat, index=times)
-
-        # 太陽位置・クリアスカイ
         solpos = site.get_solarposition(times)
         clearsky = site.get_clearsky(times, model="simplified_solis")
-
-        # 傾斜面日射量 (POA)
         poa = pvlib.irradiance.get_total_irradiance(
             surface_tilt=surface_tilt,
             surface_azimuth=surface_azimuth,
@@ -122,8 +114,6 @@ def process_and_plot(
             solar_azimuth=solpos['azimuth'],
             model='isotropic'
         )
-
-        # POA→kWh
         poa_kwh = poa['poa_global'] / 1000.0
         poa_mat = poa_kwh.to_numpy().reshape(len(df_solar), 24)
         df_solar[list(range(1, 25))] = pd.DataFrame(poa_mat, index=df_solar.index)
@@ -146,7 +136,6 @@ def process_and_plot(
         A_pre = df_hourly_pvlib['日発電量'].sum()
         r = X / A_pre if A_pre > 0 else 1.0
 
-        # 補正係数適用→PCS制限
         df_hourly_corrected = df_solar.copy()
         for h in range(1, 25):
             raw_output = (
@@ -158,11 +147,9 @@ def process_and_plot(
         df_hourly_corrected['日発電量'] = df_hourly_corrected[list(range(1, 25))].sum(axis=1)
         annual_corrected = df_hourly_corrected['日発電量'].sum()
 
-        # 月別棒グラフ
         eph_monthly = df_hourly_corrected.groupby('month')['日発電量'].sum().reset_index()
         fig_bar = px.bar(eph_monthly, x='month', y='日発電量', title='月別発電量（補正後・PCS制限あり）')
 
-        # 日別24hグラフ
         df_day = df_hourly_corrected[
             (df_hourly_corrected['month'] == month_selected) &
             (df_hourly_corrected['day'] == day_selected)
