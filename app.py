@@ -48,14 +48,12 @@ def process_and_plot(
     orientation, tilt, month_str, day_str, PCS_output_kw
 ):
     try:
-        # 入力チェック
         if not station:
             return None, None, "", "", "エラー：地点を選択してください。"
         month_selected = int(month_str)
         day_selected = int(day_str)
         alpha = alpha_pct / 100.0
 
-        # Ppeakを優先する（PAS無視）
         if Ppeak not in (None, 0):
             effective_PAS = Ppeak / (K * G_STC)
         elif PAS not in (None, 0):
@@ -63,10 +61,8 @@ def process_and_plot(
         else:
             return None, None, "", "", "エラー：PAS または Ppeak を入力してください。"
 
-        # PCS出力デフォルト
         PCS_output_kw = PCS_output_kw or DEFAULT_PCS_OUTPUT
 
-        # 緯度経度取得
         station_no = station.split('_')[0]
         conn = sqlite3.connect(DB_PATH)
         df_info = pd.read_sql_query(
@@ -77,7 +73,6 @@ def process_and_plot(
         lat = float(df_info.iloc[0]['latitude'])
         lon = float(df_info.iloc[0]['longitude'])
 
-        # 日射量・気温データ
         df = load_radiation_df(station_no)
         df_solar = df[df['element_no'] == '00001'].pivot_table(
             index=['month', 'day'], columns='hour', values='value'
@@ -92,7 +87,6 @@ def process_and_plot(
         df_temp = df_temp.fillna(0)
         df_solar_raw = df_solar.copy()
 
-        # PVLIB: 傾斜面日射量計算
         surface_tilt = float(tilt)
         surface_azimuth = ORIENTATION_TO_AZIMUTH.get(orientation, 180)
         site = pvlib.location.Location(lat, lon, tz="Asia/Tokyo")
@@ -103,13 +97,11 @@ def process_and_plot(
         ghi_flat = df_solar_raw[list(range(1, 25))].values.flatten() * 1000.0
         ghi_series = pd.Series(ghi_flat, index=times)
         solpos = site.get_solarposition(times)
-        clearsky = site.get_clearsky(times, model="simplified_solis")
+
         poa = pvlib.irradiance.get_total_irradiance(
             surface_tilt=surface_tilt,
             surface_azimuth=surface_azimuth,
-            dni=clearsky['dni'],
             ghi=ghi_series,
-            dhi=clearsky['dhi'],
             solar_zenith=solpos['zenith'],
             solar_azimuth=solpos['azimuth'],
             model='isotropic'
@@ -118,7 +110,6 @@ def process_and_plot(
         poa_mat = poa_kwh.to_numpy().reshape(len(df_solar), 24)
         df_solar[list(range(1, 25))] = pd.DataFrame(poa_mat, index=df_solar.index)
 
-        # 年間発電量算出 (PCS制限なし)
         df_hourly_nopv = df_solar_raw.copy()
         df_hourly_pvlib = df_solar.copy()
         for h in range(1, 25):
@@ -176,7 +167,6 @@ def process_and_plot(
     except Exception as e:
         return None, None, "", "", f"内部エラー: {e}"
 
-# Gradio UI定義
 with gr.Blocks() as demo:
     gr.Markdown('# NEDO 日射量シミュレーション（PCS補正付き）')
     with gr.Row():
