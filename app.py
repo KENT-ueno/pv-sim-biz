@@ -100,10 +100,10 @@ def process_and_plot(
         df = load_radiation_df(station_no)
 
         # 時系列整形
-        df_solar = df[df['element_no']==1].pivot_table(
+        df_solar = df[df['element_no']=='00001'].pivot_table(
             index=['month','day'], columns='hour', values='value'
         ).reset_index()
-        df_temp  = df[df['element_no']==5].pivot_table(
+        df_temp  = df[df['element_no']=='00005'].pivot_table(
             index=['month','day'], columns='hour', values='value'
         ).reset_index()
         for h in range(1,25):
