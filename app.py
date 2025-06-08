@@ -98,10 +98,13 @@ def process_and_plot(
         ghi_series = pd.Series(ghi_flat, index=times)
         solpos = site.get_solarposition(times)
 
+        # 傾斜面日射量計算: 清天モデルを用いず、水平GHIから直接幾何補正のみ実施
         poa = pvlib.irradiance.get_total_irradiance(
             surface_tilt=surface_tilt,
             surface_azimuth=surface_azimuth,
+            dni=None,
             ghi=ghi_series,
+            dhi=None,
             solar_zenith=solpos['zenith'],
             solar_azimuth=solpos['azimuth'],
             model='isotropic'
@@ -110,6 +113,7 @@ def process_and_plot(
         poa_mat = poa_kwh.to_numpy().reshape(len(df_solar), 24)
         df_solar[list(range(1, 25))] = pd.DataFrame(poa_mat, index=df_solar.index)
 
+        # 年間発電量算出 (PCS制限なし)
         df_hourly_nopv = df_solar_raw.copy()
         df_hourly_pvlib = df_solar.copy()
         for h in range(1, 25):
