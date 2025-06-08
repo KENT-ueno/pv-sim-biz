@@ -56,6 +56,7 @@ def process_and_plot(
     PCS_output_kw
 ):
     try:
+        # 入力チェック
         if not station:
             return None, None, None, "", "エラー：地点を選択してください。"
         try:
@@ -68,6 +69,7 @@ def process_and_plot(
 
         alpha = alpha_percentage / 100.0
 
+        # 有効PASの算出
         if Ppeak not in (None, 0):
             effective_PAS = Ppeak / (K * G_STC)
         elif PAS not in (None, 0):
@@ -75,6 +77,7 @@ def process_and_plot(
         else:
             return None, None, None, "", "エラー：PAS または Ppeak を入力してください。"
 
+        # PCSデフォルト
         if PCS_output_kw in (None, 0):
             PCS_output_kw = DEFAULT_PCS_OUTPUT
 
@@ -94,6 +97,7 @@ def process_and_plot(
 
         df = load_radiation_df(station_no)
 
+        # 時系列整形
         df_solar = df[df['element_no']=='00001'].pivot_table(
             index=['month','day'], columns='hour', values='value'
         ).reset_index()
@@ -106,9 +110,11 @@ def process_and_plot(
         df_solar = df_solar.fillna(0)
         df_temp  = df_temp.fillna(0)
 
+        # NEDO GHI合計
         raw_ghi_flat = df_solar[list(range(1,25))].values.flatten()
         raw_ghi_sum  = raw_ghi_flat.sum()
 
+        # pvlib POA計算
         surface_tilt    = float(tilt)
         surface_azimuth = ORIENTATION_TO_AZIMUTH.get(orientation, 180)
         site = pvlib.location.Location(lat, lon, tz="Asia/Tokyo")
@@ -125,11 +131,11 @@ def process_and_plot(
                 ))
         times = pd.DatetimeIndex(times)
 
-        solpos = site.get_solarposition(times)
+        solpos   = site.get_solarposition(times)
         clearsky = site.get_clearsky(times, model="simplified_solis")
-        dni = np.asarray(clearsky["dni"])
-        dhi = np.asarray(clearsky["dhi"])
-        solar_zenith = np.asarray(solpos["zenith"])
+        dni      = np.asarray(clearsky["dni"])
+        dhi      = np.asarray(clearsky["dhi"])
+        solar_zenith  = np.asarray(solpos["zenith"])
         solar_azimuth = np.asarray(solpos["azimuth"])
         poa = pvlib.irradiance.get_total_irradiance(
             surface_tilt=surface_tilt,
@@ -139,41 +145,36 @@ def process_and_plot(
             model='isotropic'
         )
         poa_vals = np.asarray(poa["poa_global"])
-        poa_sum = poa_vals.sum()
-        poa_kwh = poa_vals / 1000.0
-        poa_mat = poa_kwh.reshape(len(df_solar), 24)
-        df_solar[list(range(1,25))] = pd.DataFrame(poa_mat, index=df_solar.index)
+        poa_sum  = poa_vals.sum()
 
+        # 温度補正係数計算
         correction_factors = 1 + alpha * (df_temp[list(range(1,25))] + delta_T)
-        correction_avg = correction_factors.values.mean()
-        correction_max = correction_factors.values.max()
+        correction_avg     = correction_factors.values.mean()
+        correction_max     = correction_factors.values.max()
 
-        df_hourly = df_solar.copy()
+        # 月日別発電量（POAベース）
+        df_hourly = pd.DataFrame(poa_vals.reshape(len(df_solar),24), columns=list(range(1,25)))
         for h in range(1,25):
-            df_hourly[h] = (
-                K * effective_PAS * df_solar[h] * (1 + alpha * (df_temp[h] + delta_T)) / GS
-            )
-            df_hourly[h] = df_hourly[h].clip(upper=PCS_OUTPUT_kw)
+            df_hourly[h] = (K * effective_PAS * df_hourly[h] * correction_factors[h] / GS)
+            df_hourly[h] = df_hourly[h].clip(upper=PCS_output_kw)
         df_hourly['日発電量'] = df_hourly[list(range(1,25))].sum(axis=1)
 
-        # 年間発電量の簡易推定値（NEDO GHIベース、kWhに変換）
-        raw_energy_flat = K * effective_PAS * raw_ghi_flat * (1 + alpha * (df_temp[list(range(1,25))].values.flatten() + delta_T)) / GS
-        raw_energy_simple = raw_energy_flat.sum() / 1000.0
-        clipped_energy = raw_energy_simple
+        # 年間簡易推定発電量（kWh）
+        raw_energy_simple = (K * effective_PAS * raw_ghi_flat * (1 + alpha * (df_temp[list(range(1,25))].values.flatten() + delta_T)) / GS).sum() / 1000.0
+        clipped_energy    = raw_energy_simple
 
+        # 月別集計とグラフ
         eph_monthly = df_hourly.groupby('month')['日発電量'].sum().reset_index()
         fig_bar = px.bar(eph_monthly, x='month', y='日発電量', title='月別発電量（補正済み）')
 
+        # 日別計算とグラフ
         df_day = df_hourly[(df_hourly['month']==month_selected)&(df_hourly['day']==day_selected)]
         if df_day.empty:
             fig_line = px.line(title='該当データなし')
         else:
-            hourly  = df_day[list(range(1,25))].iloc[0]
-            df_plot = pd.DataFrame({'時刻': list(range(1,25)), '発電量': hourly.values})
-            fig_line = px.line(
-                df_plot, x='時刻', y='発電量', markers=True,
-                title=f'{month_selected}月{day_selected}日の24h発電量'
-            ).update_layout(xaxis=dict(dtick=1))
+            df_plot = pd.DataFrame({'時刻':list(range(1,25)),'発電量':df_day[list(range(1,25))].iloc[0].values})
+            fig_line = px.line(df_plot, x='時刻', y='発電量', markers=True,
+                               title=f'{month_selected}月{day_selected}日の24h発電量').update_layout(xaxis=dict(dtick=1))
 
         annual_str = f"年間発電量: {clipped_energy:.2f} kWh"
         debug_info = (
@@ -199,25 +200,3 @@ with gr.Blocks() as demo:
             alpha_input      = gr.Number(label='α[%/℃]', value=-0.35)
             deltaT_input     = gr.Number(label='ΔT[℃]', value=25.0)
             orientation_input= gr.Dropdown(label='方位', choices=list(ORIENTATION_TO_AZIMUTH.keys()), value='南')
-            tilt_input       = gr.Dropdown(label='傾斜角(°)', choices=[str(i) for i in range(0,91,10)], value='30')
-            month_input      = gr.Textbox(label='月(1–12)', placeholder='例:6')
-            day_input        = gr.Textbox(label='日(1–31)', placeholder='例:15')
-            PCS_input        = gr.Number(label='PCS出力[kW]', value=99)
-            run_button       = gr.Button('▶️ 計算')
-            annual_box       = gr.Textbox(label='年間発電量', interactive=False)
-            debug_box        = gr.Textbox(label='DEBUG', interactive=False)
-            error_box        = gr.Textbox(label='エラー', interactive=False)
-        with gr.Column(scale=3):
-            bar_plot = gr.Plot(label='月別発電量')
-            line_plot= gr.Plot(label='24h発電量')
-
-    run_button.click(
-        fn=process_and_plot,
-        inputs=[station_input, K_input, PAS_input, Ppeak_input, GS_input,
-                alpha_input, deltaT_input, orientation_input, tilt_input,
-                month_input, day_input, PCS_input],
-        outputs=[bar_plot, line_plot, annual_box, debug_box, error_box]
-    )
-
-if __name__ == '__main__':
-    demo.launch()
