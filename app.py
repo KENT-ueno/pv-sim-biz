@@ -57,14 +57,14 @@ def process_and_plot(
     try:
         # 入力チェック
         if not station:
-            return None, None, None, "エラー：地点を選択してください。"
+            return None, None, None, "", "エラー：地点を選択してください。"
         try:
             month_selected = int(month_str)
             day_selected   = int(day_str)
             if not (1 <= month_selected <= 12 and 1 <= day_selected <= 31):
                 raise ValueError
         except:
-            return None, None, None, "エラー：月は1～12、日は1～31の整数で入力してください。"
+            return None, None, None, "", "エラー：月は1～12、日は1～31の整数で入力してください。"
 
         alpha = alpha_percentage / 100.0
 
@@ -74,7 +74,7 @@ def process_and_plot(
         elif PAS not in (None, 0):
             effective_PAS = PAS
         else:
-            return None, None, None, "エラー：PAS または Ppeak を入力してください。"
+            return None, None, None, "", "エラー：PAS または Ppeak を入力してください。"
 
         # PCSデフォルト
         if PCS_output_kw in (None, 0):
@@ -92,7 +92,7 @@ def process_and_plot(
         finally:
             conn.close()
         if df_info.empty:
-            return None, None, None, f"エラー：地点情報が見つかりません ({station_no})。"
+            return None, None, None, "", f"エラー：地点情報が見つかりません ({station_no})。"
         lat = float(df_info.iloc[0]['latitude'])
         lon = float(df_info.iloc[0]['longitude'])
 
@@ -112,6 +112,10 @@ def process_and_plot(
         df_solar = df_solar.fillna(0)
         df_temp  = df_temp.fillna(0)
 
+        # 単位確認用中間デバッグ
+        raw_ghi_flat = df_solar[list(range(1,25))].values.flatten()
+        raw_ghi_sum  = raw_ghi_flat.sum()
+
         # pvlib 設定
         surface_tilt    = float(tilt)
         surface_azimuth = ORIENTATION_TO_AZIMUTH.get(orientation, 180)
@@ -130,40 +134,47 @@ def process_and_plot(
                 ))
         times = pd.DatetimeIndex(times)
 
-        # GHI flatten → W/m²
-        ghi_flat = df_solar[list(range(1,25))].values.flatten()
-
+        # GHI → POA 計算
         solpos   = site.get_solarposition(times)
         clearsky = site.get_clearsky(times, model="simplified_solis")
         poa = pvlib.irradiance.get_total_irradiance(
             surface_tilt=surface_tilt,
             surface_azimuth=surface_azimuth,
             dni=clearsky['dni'].values,
-            ghi=ghi_flat,
+            ghi=raw_ghi_flat,
             dhi=clearsky['dhi'].values,
             solar_zenith=solpos['zenith'].values,
             solar_azimuth=solpos['azimuth'].values,
             model='isotropic'
         )
-        poa_kwh = poa['poa_global'] / 1000.0
-        poa_mat = poa_kwh.reshape(len(df_solar), 24)
+        poa_flat = poa['poa_global'].values
+        poa_sum  = poa_flat.sum()
+        poa_kwh  = poa_flat / 1000.0
+        poa_mat  = poa_kwh.reshape(len(df_solar), 24)
         df_solar[list(range(1,25))] = pd.DataFrame(poa_mat, index=df_solar.index)
 
-        # 発電量計算＆PCS制限
-        df_hourly = df_solar.copy()
+        # 発電量計算（クリップ前）
+        df_preclip = df_solar.copy()
         for h in range(1,25):
-            df_hourly[h] = (
+            df_preclip[h] = (
                 K * effective_PAS * df_solar[h]
                 * (1 + alpha * (df_temp[h] + delta_T))
                 / GS
-            ).clip(upper=PCS_output_kw)
+            )
+        raw_energy = df_preclip[list(range(1,25))].sum().sum()
+
+        # 発電量計算＆PCS制限
+        df_hourly = df_preclip.copy()
+        for h in range(1,25):
+            df_hourly[h] = df_hourly[h].clip(upper=PCS_output_kw)
+        clipped_energy = df_hourly[list(range(1,25))].sum().sum()
         df_hourly['日発電量'] = df_hourly[list(range(1,25))].sum(axis=1)
 
         # 月別集計
         eph_monthly = df_hourly.groupby('month')['日発電量'].sum().reset_index()
 
         # グラフ描画
-        fig_bar  = px.bar(eph_monthly, x='month', y='日発電量', title='月別発電量（PCS制限後）')
+        fig_bar = px.bar(eph_monthly, x='month', y='日発電量', title='月別発電量（PCS制限後）')
 
         # 日別24h発電量
         df_day = df_hourly[(df_hourly['month']==month_selected)&(df_hourly['day']==day_selected)]
@@ -178,13 +189,18 @@ def process_and_plot(
             ).update_layout(xaxis=dict(dtick=1))
 
         # 年間発電量表示
-        annual_total = df_hourly[list(range(1,25))].sum().sum()
-        annual_str   = f"年間発電量: {annual_total:.2f} kWh"
+        annual_str = f"年間発電量: {clipped_energy:.2f} kWh"
 
-        return fig_bar, fig_line, annual_str, ''
+        # デバッグ情報
+        debug_info = (
+            f"raw_ghi_sum={raw_ghi_sum:.2f}, poa_sum={poa_sum:.2f}, "
+            f"raw_energy={raw_energy:.2f}, clipped_energy={clipped_energy:.2f}"
+        )
+
+        return fig_bar, fig_line, annual_str, debug_info, ""
 
     except Exception as e:
-        return None, None, None, f'内部エラー: {e}'
+        return None, None, None, "", f'内部エラー: {e}'
 
 # ───────────────── Gradio UI ─────────────────
 with gr.Blocks() as demo:
@@ -205,6 +221,7 @@ with gr.Blocks() as demo:
             PCS_input        = gr.Number(label='PCS出力[kW]', value=99)
             run_button       = gr.Button('▶️ 計算')
             annual_box       = gr.Textbox(label='年間発電量', interactive=False)
+            debug_box        = gr.Textbox(label='DEBUG', interactive=False)
             error_box        = gr.Textbox(label='エラー', interactive=False)
         with gr.Column(scale=3):
             bar_plot = gr.Plot(label='月別発電量')
@@ -212,10 +229,10 @@ with gr.Blocks() as demo:
 
     run_button.click(
         fn=process_and_plot,
-        inputs=[station_input,K_input,PAS_input,Ppeak_input,GS_input,
-                alpha_input,deltaT_input,orientation_input,tilt_input,
-                month_input,day_input,PCS_input],
-        outputs=[bar_plot,line_plot,annual_box,error_box]
+        inputs=[station_input, K_input, PAS_input, Ppeak_input, GS_input,
+                alpha_input, deltaT_input, orientation_input, tilt_input,
+                month_input, day_input, PCS_input],
+        outputs=[bar_plot, line_plot, annual_box, debug_box, error_box]
     )
 
 if __name__ == '__main__':
