@@ -40,14 +40,13 @@ def load_radiation_df(station_no):
 
 # メイン処理関数（4パターン合計PCS制限）
 def process_and_plot(
-    station, K, PAS, GS, alpha_pct, delta_T,
+    station, K, GS, alpha_pct, delta_T,
     Ppeak1, ori1, tilt1,
     Ppeak2, ori2, tilt2,
     Ppeak3, ori3, tilt3,
     Ppeak4, ori4, tilt4,
     month_str, day_str, PCS_capacity_kw
 ):
-    # 入力検証
     if not station:
         return None, None, "エラー：地点を選択してください。", ""
     month_selected = int(month_str)
@@ -55,7 +54,6 @@ def process_and_plot(
     alpha = alpha_pct / 100.0
     PCS_capacity = PCS_capacity_kw or 0
 
-    # 地点情報取得
     station_no = station.split('_')[0]
     conn = sqlite3.connect(DB_PATH)
     df_info = pd.read_sql_query(
@@ -65,7 +63,6 @@ def process_and_plot(
     conn.close()
     lat, lon = float(df_info.iloc[0]['latitude']), float(df_info.iloc[0]['longitude'])
 
-    # データ整形
     df = load_radiation_df(station_no)
     df_solar = df[df['element_no']=='00001'].pivot_table(index=['month','day'], columns='hour', values='value').fillna(0)
     df_temp  = df[df['element_no']=='00005'].pivot_table(index=['month','day'], columns='hour', values='value').fillna(0)
@@ -73,13 +70,11 @@ def process_and_plot(
         df_solar[h] = pd.to_numeric(df_solar[h], errors='coerce') * 0.01 / 3.6
         df_temp[h]  = pd.to_numeric(df_temp[h], errors='coerce') * 0.1
 
-    # 時系列化とポジション計算
     site = pvlib.location.Location(lat, lon, tz='Asia/Tokyo')
     times = pd.date_range(start='2020-01-01', periods=len(df_solar)*24, freq='H', tz='Asia/Tokyo')
     ghi = pd.Series(df_solar[list(range(1,25))].values.flatten() * 1000.0, index=times)
     solpos = site.get_solarposition(times)
 
-    # 各パターン出力計算
     pattern_outs = []
     for Ppeak, ori, tilt in [(Ppeak1,ori1,int(tilt1)),(Ppeak2,ori2,int(tilt2)),(Ppeak3,ori3,int(tilt3)),(Ppeak4,ori4,int(tilt4))]:
         sep = pvlib.irradiance.erbs(ghi, solpos['zenith'], times)
@@ -93,13 +88,11 @@ def process_and_plot(
         df_pv = df_solar.copy(); df_pv[list(range(1,25))] = pd.DataFrame(mat, index=df_solar.index)
         df_out = df_pv.copy()
         for h in range(1,25):
-            df_out[h] = K * PAS * df_pv[h] * (1 + alpha * (df_temp[h]+delta_T)) / GS
+            df_out[h] = K * Ppeak * df_pv[h] * (1 + alpha * (df_temp[h]+delta_T)) / GS
         df_out['日発電量'] = df_out[list(range(1,25))].sum(axis=1)
         pattern_outs.append(df_out)
 
-    # 各パターン年間合計（PCS前）
     annual_pre = [df['日発電量'].sum() for df in pattern_outs]
-    # 合計合成とグローバルPCS制限
     df_sum = pattern_outs[0].copy()
     for df in pattern_outs[1:]:
         for h in range(1,25): df_sum[h] += df[h]
@@ -107,7 +100,6 @@ def process_and_plot(
     df_sum['日発電量'] = df_sum[list(range(1,25))].sum(axis=1)
     annual_post = df_sum['日発電量'].sum()
 
-    # プロット
     monthly = df_sum.groupby('month')['日発電量'].sum().reset_index()
     fig_bar = px.bar(monthly, x='month', y='日発電量', title='月別発電量（PCS容量制限付き）')
     df_day = df_sum.reset_index()[
@@ -121,26 +113,22 @@ def process_and_plot(
         fig_line = px.line(pd.DataFrame({'時刻':range(1,25),'発電量':series.values}), x='時刻', y='発電量', markers=True,
                            title=f'{month_selected}月{day_selected}日の発電量（制限後）')
 
-    # デバッグ文字列
     debug_lines = [f"年間合計発電量(PCS後): {annual_post:.2f} kWh"]
     for i,v in enumerate(annual_pre, start=1): debug_lines.append(f"パターン{i}年間合計(PCS前): {v:.2f} kWh")
     debug_text = "\n".join(debug_lines)
 
     return fig_bar, fig_line, debug_text
 
-# Gradio UI定義
 with gr.Blocks() as demo:
     gr.Markdown('# NEDO 日射量シミュレーション（4パターン＋PCS制限）')
     with gr.Row():
         with gr.Column(scale=2):
             station_input = gr.Dropdown(label='地点選択', choices=get_station_options())
             K_input       = gr.Number(label='K', value=0.95)
-            PAS_input     = gr.Number(label='PAS', value=1)
             GS_input      = gr.Number(label='GS', value=1)
             alpha_input   = gr.Number(label='α[%/℃]', value=-0.35)
             deltaT_input  = gr.Number(label='ΔT[℃]', value=25)
 
-            # 横並びで4パターン入力
             with gr.Row():
                 for i in range(1,5):
                     with gr.Column():
@@ -152,7 +140,6 @@ with gr.Blocks() as demo:
             day_input    = gr.Textbox(label='日(1–31)', placeholder='例:3')
             PCS_input    = gr.Number(label='総PCS容量[kW]', value=99)
             run_button   = gr.Button('▶️ 計算')
-            # デバッグ表示
             debug_box    = gr.Textbox(label='デバッグ情報', interactive=False)
         with gr.Column(scale=3):
             bar_plot  = gr.Plot(label='月別発電量')
@@ -161,7 +148,7 @@ with gr.Blocks() as demo:
     run_button.click(
         fn=process_and_plot,
         inputs=[
-            station_input, K_input, PAS_input, GS_input, alpha_input, deltaT_input,
+            station_input, K_input, GS_input, alpha_input, deltaT_input,
             Ppeak1, ori1, tilt1, Ppeak2, ori2, tilt2,
             Ppeak3, ori3, tilt3, Ppeak4, ori4, tilt4,
             month_input, day_input, PCS_input
