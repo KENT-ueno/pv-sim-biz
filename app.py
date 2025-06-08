@@ -153,12 +153,12 @@ def process_and_plot(
             df_hourly[h] = (
                 K * effective_PAS * df_solar[h] * (1 + alpha * (df_temp[h] + delta_T)) / GS
             )
-            df_hourly[h] = df_hourly[h].clip(upper=PCS_output_kw)
+            df_hourly[h] = df_hourly[h].clip(upper=PCS_OUTPUT_kw)
         df_hourly['日発電量'] = df_hourly[list(range(1,25))].sum(axis=1)
 
-        # 年間発電量の簡易推定値（NEDO GHIベース）
+        # 年間発電量の簡易推定値（NEDO GHIベース、kWhに変換）
         raw_energy_flat = K * effective_PAS * raw_ghi_flat * (1 + alpha * (df_temp[list(range(1,25))].values.flatten() + delta_T)) / GS
-        raw_energy_simple = raw_energy_flat.sum()
+        raw_energy_simple = raw_energy_flat.sum() / 1000.0
         clipped_energy = raw_energy_simple
 
         eph_monthly = df_hourly.groupby('month')['日発電量'].sum().reset_index()
