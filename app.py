@@ -131,7 +131,7 @@ def process_and_plot(
         times = pd.DatetimeIndex(times)
 
         # GHI flatten → W/m²
-        ghi_flat = df_solar[list(range(1,25))].values.flatten() * 1000.0/1000
+        ghi_flat = df_solar[list(range(1,25))].values.flatten() * 1000.0
 
         solpos   = site.get_solarposition(times)
         clearsky = site.get_clearsky(times, model="simplified_solis")
