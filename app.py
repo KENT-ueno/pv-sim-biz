@@ -148,25 +148,18 @@ def process_and_plot(
         correction_avg = correction_factors.values.mean()
         correction_max = correction_factors.values.max()
 
-        df_preclip = df_solar.copy()
+        df_hourly = df_solar.copy()
         for h in range(1,25):
-            df_preclip[h] = (
+            df_hourly[h] = (
                 K * effective_PAS * df_solar[h] * (1 + alpha * (df_temp[h] + delta_T)) / GS
             )
-        raw_energy = df_preclip[list(range(1,25))].sum().sum()
+            df_hourly[h] = df_hourly[h].clip(upper=PCS_output_kw)
+        df_hourly['日発電量'] = df_hourly[list(range(1,25))].sum(axis=1)
 
-        # 簡易計算による年間発電量（補正前のGHI使用）
+        # 年間発電量の簡易推定値（NEDO GHIベース）
         raw_energy_flat = K * effective_PAS * raw_ghi_flat * (1 + alpha * (df_temp[list(range(1,25))].values.flatten() + delta_T)) / GS
         raw_energy_simple = raw_energy_flat.sum()
-
-        # POA→GHI比率に基づき正規化係数を適用
-        scale_ratio = raw_energy_simple / raw_energy if raw_energy > 0 else 1.0
-        df_hourly = df_preclip.copy()
-        for h in range(1,25):
-            df_hourly[h] = df_hourly[h] * scale_ratio
-            df_hourly[h] = df_hourly[h].clip(upper=PCS_output_kw)
-        clipped_energy = df_hourly[list(range(1,25))].sum().sum()
-        df_hourly['日発電量'] = df_hourly[list(range(1,25))].sum(axis=1)
+        clipped_energy = raw_energy_simple
 
         eph_monthly = df_hourly.groupby('month')['日発電量'].sum().reset_index()
         fig_bar = px.bar(eph_monthly, x='month', y='日発電量', title='月別発電量（補正済み）')
@@ -185,9 +178,8 @@ def process_and_plot(
         annual_str = f"年間発電量: {clipped_energy:.2f} kWh"
         debug_info = (
             f"raw_ghi_sum={raw_ghi_sum:.2f}, poa_sum={poa_sum:.2f}, "
-            f"raw_energy={raw_energy:.2f}, clipped_energy={clipped_energy:.2f}, "
             f"correction_avg={correction_avg:.3f}, correction_max={correction_max:.3f}, "
-            f"simple_no_pvlib_energy={raw_energy_simple:.2f}, scale_ratio={scale_ratio:.3f}"
+            f"simple_no_pvlib_energy={raw_energy_simple:.2f}"
         )
 
         return fig_bar, fig_line, annual_str, debug_info, ""
