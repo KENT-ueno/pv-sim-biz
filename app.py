@@ -14,7 +14,7 @@ def get_station_list():
     """DBから利用可能な地点名リストを取得"""
     conn = sqlite3.connect(DB_PATH)
     df = pd.read_sql_query(
-        "SELECT DISTINCT station_name FROM radiation",
+        "SELECT DISTINCT station_name FROM radiation_data",
         conn
     )
     conn.close()
@@ -26,11 +26,10 @@ def load_data_from_db(station_name):
     リマークに関わらずすべて読み込み、pivotして返す
     """
     conn = sqlite3.connect(DB_PATH)
-    # remark 列は無視。element_no のみで絞り込む
     df = pd.read_sql_query(
         """
         SELECT element_no, month, day, hour, value
-        FROM radiation
+        FROM radiation_data
         WHERE station_name = ?
           AND element_no IN (1, 5)
         """,
