@@ -9,7 +9,6 @@ import pvlib  # 必要ライブラリ
 G_STC = 1.0
 DEFAULT_PCS_OUTPUT = 99.0
 
-# DBパス設定（スクリプトと同じディレクトリ内のファイルを参照）
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "radiation.db")
 
@@ -18,7 +17,6 @@ ORIENTATION_TO_AZIMUTH = {
     "南東":135, "南西":225, "南":180
 }
 
-# 地点リスト取得
 def get_station_options():
     if not os.path.exists(DB_PATH):
         raise FileNotFoundError(f"データベースファイルが見つかりません: {DB_PATH}")
@@ -33,7 +31,6 @@ def get_station_options():
     options = [f"{row['station_no']}_{row['station_name']}" for _, row in df.iterrows()]
     return options
 
-# 放射量データ読み込み
 def load_radiation_df(station_no):
     conn = sqlite3.connect(DB_PATH)
     try:
@@ -45,7 +42,6 @@ def load_radiation_df(station_no):
         conn.close()
     return df
 
-# メイン処理
 def process_and_plot(
     station,
     K, PAS, Ppeak, GS,
@@ -68,7 +64,6 @@ def process_and_plot(
 
         alpha = alpha_percentage / 100.0
 
-        # 有効PAS
         if Ppeak not in (None, 0):
             effective_PAS = Ppeak / (K * G_STC)
         elif PAS not in (None, 0):
@@ -76,13 +71,11 @@ def process_and_plot(
         else:
             return None, None, "", "", "エラー：PAS または Ppeak を入力してください。"
 
-        # PCSデフォルト
         if PCS_output_kw in (None, 0):
             PCS_output_kw = DEFAULT_PCS_OUTPUT
 
         station_no = station.split('_')[0]
 
-        # 緯度経度取得
         conn = sqlite3.connect(DB_PATH)
         try:
             df_info = pd.read_sql_query(
@@ -96,10 +89,8 @@ def process_and_plot(
         lat = float(df_info.iloc[0]['latitude'])
         lon = float(df_info.iloc[0]['longitude'])
 
-        # データ取得
         df = load_radiation_df(station_no)
 
-        # --- 時系列整形 ---
         df_solar = df[df['element_no']=='00001'].pivot_table(
             index=['month','day'], columns='hour', values='value'
         ).reset_index()
@@ -107,21 +98,19 @@ def process_and_plot(
             index=['month','day'], columns='hour', values='value'
         ).reset_index()
         for h in range(1,25):
-            # 全天日射量：0.01→kJ→kWh、気温：0.1→℃
             df_solar[h] = pd.to_numeric(df_solar[h], errors='coerce') * 0.01 / 3.6
             df_temp[h]  = pd.to_numeric(df_temp[h],  errors='coerce') * 0.1
         df_solar = df_solar.fillna(0)
         df_temp  = df_temp.fillna(0)
 
-        # デバッグ用にPVLIB前の水平全天日射量データを保存
+        # デバッグ用：水平GHI（POA補正なし）
         df_solar_raw = df_solar.copy()
 
-        # --- PVLIBによる傾斜面日射量算出 ---
+        # --- PVLIB傾斜面日射量 ---
         surface_tilt    = float(tilt)
         surface_azimuth = ORIENTATION_TO_AZIMUTH.get(orientation, 180)
         site = pvlib.location.Location(lat, lon, tz="Asia/Tokyo")
 
-        # ダミー年=2020 で時刻インデックス作成
         times = []
         for _, row in df_solar.iterrows():
             for h in range(1,25):
@@ -133,8 +122,6 @@ def process_and_plot(
                     tz="Asia/Tokyo"
                 ))
         times = pd.DatetimeIndex(times)
-
-        # 水平GHIをW/m²へ
         ghi_flat = df_solar_raw[list(range(1,25))].values.flatten() * 1000.0
 
         solpos   = site.get_solarposition(times)
@@ -153,75 +140,83 @@ def process_and_plot(
         poa_mat = poa_kwh.reshape(len(df_solar), 24)
         df_solar[list(range(1,25))] = pd.DataFrame(poa_mat, index=df_solar.index)
 
-        # --- 発電量計算（PVLIBあり） & PCS制限 ---
-        df_hourly = df_solar.copy()
+        # --- 1. PVLIBなし・PCS制限なし（毎時積算）---
+        df_hourly_nopv_nopcs = df_solar_raw.copy()
         for h in range(1,25):
-            df_hourly[h] = (
-                K * effective_PAS * df_solar[h]
-                * (1 + alpha * (df_temp[h] + delta_T))
-                / GS
-            ).clip(upper=PCS_output_kw)
-        df_hourly['日発電量(制限後)'] = df_hourly[list(range(1,25))].sum(axis=1)
-
-        # PCS制限前の年間発電量
-        df_hourly_np = df_solar_raw.copy()
-        for h in range(1,25):
-            df_hourly_np[h] = (
+            df_hourly_nopv_nopcs[h] = (
                 K * effective_PAS * df_solar_raw[h]
                 * (1 + alpha * (df_temp[h] + delta_T))
                 / GS
             )
-        df_hourly_np['日発電量(制限前)'] = df_hourly_np[list(range(1,25))].sum(axis=1)
+        df_hourly_nopv_nopcs['日発電量'] = df_hourly_nopv_nopcs[list(range(1,25))].sum(axis=1)
+        annual_no_pvlib_nopcs = df_hourly_nopv_nopcs['日発電量'].sum()
 
-        # 年間合計
-        annual_with_pvlib   = df_hourly['日発電量(制限後)'].sum()
-        annual_no_pvlib     = df_hourly_np['日発電量(制限前)'].sum()
+        # --- 2. PVLIBあり・PCS制限なし（毎時積算）---
+        df_hourly_pvlib_nopcs = df_solar.copy()
+        for h in range(1,25):
+            df_hourly_pvlib_nopcs[h] = (
+                K * effective_PAS * df_solar[h]
+                * (1 + alpha * (df_temp[h] + delta_T))
+                / GS
+            )
+        df_hourly_pvlib_nopcs['日発電量'] = df_hourly_pvlib_nopcs[list(range(1,25))].sum(axis=1)
+        annual_pvlib_nopcs = df_hourly_pvlib_nopcs['日発電量'].sum()
 
-        # --- 月別集計 & グラフ描画 ---
-        eph_monthly = df_hourly.groupby('month')['日発電量(制限後)'].sum().reset_index()
-        fig_bar  = px.bar(eph_monthly, x='month', y='日発電量(制限後)', title='月別発電量（PVLIBあり・PCS制限後）')
+        # --- 3. PVLIBあり・PCS制限あり（毎時積算）---
+        df_hourly_pvlib_pcs = df_solar.copy()
+        for h in range(1,25):
+            df_hourly_pvlib_pcs[h] = (
+                K * effective_PAS * df_solar[h]
+                * (1 + alpha * (df_temp[h] + delta_T))
+                / GS
+            ).clip(upper=PCS_output_kw)
+        df_hourly_pvlib_pcs['日発電量'] = df_hourly_pvlib_pcs[list(range(1,25))].sum(axis=1)
+        annual_pvlib_pcs = df_hourly_pvlib_pcs['日発電量'].sum()
 
-        # 日別24h発電量
-        df_day = df_hourly[(df_hourly['month']==month_selected)&(df_hourly['day']==day_selected)]
+        # --- 補正係数 ---
+        if annual_pvlib_nopcs > 0:
+            scale_ratio = annual_no_pvlib_nopcs / annual_pvlib_nopcs
+        else:
+            scale_ratio = 1.0  # 回避策
+
+        # --- 棒グラフ（補正後） ---
+        eph_monthly = df_hourly_pvlib_pcs.groupby('month')['日発電量'].sum().reset_index()
+        eph_monthly['補正後発電量'] = eph_monthly['日発電量'] * scale_ratio
+        fig_bar  = px.bar(eph_monthly, x='month', y='補正後発電量', title='月別発電量（補正後：PCS制限あり）')
+
+        # 日別24h発電量（補正後）
+        df_day = df_hourly_pvlib_pcs[(df_hourly_pvlib_pcs['month']==month_selected)&(df_hourly_pvlib_pcs['day']==day_selected)]
         if df_day.empty:
             fig_line = px.line(title='該当データなし')
         else:
-            hourly  = df_day[list(range(1,25))].iloc[0]
+            hourly  = df_day[list(range(1,25))].iloc[0] * scale_ratio
             df_plot = pd.DataFrame({'時刻': list(range(1,25)), '発電量': hourly.values})
             fig_line = px.line(
                 df_plot, x='時刻', y='発電量', markers=True,
-                title=f'{month_selected}月{day_selected}日の24h発電量'
+                title=f'{month_selected}月{day_selected}日の24h発電量（補正後）'
             ).update_layout(xaxis=dict(dtick=1))
 
-        # --- デバッグ情報作成 ---
-        # 選択日の全天日射量（PVLIB前）
-        df_sel = df_solar_raw[
-            (df_solar_raw['month']==month_selected)&
-            (df_solar_raw['day']==day_selected)
+        # 年間発電量（補正後）
+        annual_total_corrected = annual_pvlib_pcs * scale_ratio
+        annual_str   = f"{annual_total_corrected:.2f} kWh"
+
+        # --- デバッグ欄 ---
+        debug_lines = [
+            f"年間発電量(PVLIBなし・PCS制限なし・毎時積算): {annual_no_pvlib_nopcs:.2f} kWh",
+            f"年間発電量(PVLIBあり・PCS制限なし・毎時積算): {annual_pvlib_nopcs:.2f} kWh",
+            f"年間発電量(PVLIBあり・PCS制限あり・毎時積算): {annual_pvlib_pcs:.2f} kWh",
+            f"補正係数: {scale_ratio:.4f}",
+            f"年間発電量(補正後): {annual_total_corrected:.2f} kWh"
         ]
-        if not df_sel.empty:
-            ghi_list = df_sel[list(range(1,25))].iloc[0].tolist()
-            ghi_text = ",".join(f"{v:.3f}" for v in ghi_list)
-            debug_ghi = f"選択日の全天日射量(1-24h): {ghi_text}"
-        else:
-            debug_ghi = "選択日の全天日射量データなし"
-
-        debug_annual_pvlib = f"年間発電量(PVLIBあり・PCS制限後): {annual_with_pvlib:.2f} kWh"
-        debug_annual_nopv = f"年間発電量(PVLIBなし・PCS制限前): {annual_no_pvlib:.2f} kWh"
-
-        debug_text = "\n".join([debug_ghi, debug_annual_nopv, debug_annual_pvlib])
-
-        # 年間発電量表示（制限後）
-        annual_str   = f"{annual_with_pvlib:.2f} kWh"
+        debug_text = "\n".join(debug_lines)
 
         return fig_bar, fig_line, annual_str, debug_text, ""
 
     except Exception as e:
         return None, None, "", "", f'内部エラー: {e}'
 
-# ───────────────── Gradio UI ─────────────────
 with gr.Blocks() as demo:
-    gr.Markdown('# NEDO 日射量シミュレーション（SQL版・デバッグ付き）')
+    gr.Markdown('# NEDO 日射量シミュレーション（PCS補正付き）')
     with gr.Row():
         with gr.Column(scale=2):
             station_input     = gr.Dropdown(label='地点選択', choices=get_station_options())
@@ -238,7 +233,7 @@ with gr.Blocks() as demo:
             PCS_input         = gr.Number(label='PCS出力[kW]', value=99)
             run_button        = gr.Button('▶️ 計算')
 
-            annual_box        = gr.Textbox(label='年間発電量(PVLIBあり・PCS制限後)', interactive=False)
+            annual_box        = gr.Textbox(label='年間発電量（補正後）', interactive=False)
             debug_box         = gr.Textbox(label='デバッグ情報', interactive=False)
             error_box         = gr.Textbox(label='エラー', interactive=False)
 
