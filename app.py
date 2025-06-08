@@ -4,6 +4,7 @@ import pandas as pd
 import gradio as gr
 import plotly.express as px
 import pvlib  # 必要ライブラリ
+import numpy as np
 
 # 定数
 G_STC = 1.0
@@ -135,22 +136,24 @@ def process_and_plot(
         times = pd.DatetimeIndex(times)
 
         # GHI → POA 計算
-        solpos   = site.get_solarposition(times)
+        solpos = site.get_solarposition(times)
         clearsky = site.get_clearsky(times, model="simplified_solis")
+        # numpy array inputs for irradiance calculation
+        dni = np.asarray(clearsky["dni"])
+        dhi = np.asarray(clearsky["dhi"])
+        solar_zenith = np.asarray(solpos["zenith"])
+        solar_azimuth = np.asarray(solpos["azimuth"])
         poa = pvlib.irradiance.get_total_irradiance(
             surface_tilt=surface_tilt,
             surface_azimuth=surface_azimuth,
-            dni=clearsky['dni'].values,
-            ghi=raw_ghi_flat,
-            dhi=clearsky['dhi'].values,
-            solar_zenith=solpos['zenith'].values,
-            solar_azimuth=solpos['azimuth'].values,
+            dni=dni, ghi=raw_ghi_flat, dhi=dhi,
+            solar_zenith=solar_zenith, solar_azimuth=solar_azimuth,
             model='isotropic'
         )
-        poa_flat = poa['poa_global'].values
-        poa_sum  = poa_flat.sum()
-        poa_kwh  = poa_flat / 1000.0
-        poa_mat  = poa_kwh.reshape(len(df_solar), 24)
+        poa_vals = np.asarray(poa["poa_global"])
+        poa_sum = poa_vals.sum()
+        poa_kwh = poa_vals / 1000.0
+        poa_mat = poa_kwh.reshape(len(df_solar), 24)
         df_solar[list(range(1,25))] = pd.DataFrame(poa_mat, index=df_solar.index)
 
         # 発電量計算（クリップ前）
