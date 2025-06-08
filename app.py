@@ -24,8 +24,11 @@ def get_station_options():
         raise FileNotFoundError(f"データベースファイルが見つかりません: {DB_PATH}")
     conn = sqlite3.connect(DB_PATH)
     try:
-        # 実際の列名に合わせてpoint_no, point_nameを取得（例：radiation_dataテーブル）
-        df = pd.read_sql_query("SELECT DISTINCT point_no AS station_no, point_name AS station_name FROM radiation_data", conn)
+        # メタ情報テーブルから地点コードと名称を取得
+        df = pd.read_sql_query(
+            "SELECT DISTINCT point_no AS station_no, point_name AS station_name FROM radiation_data",
+            conn
+        )
     finally:
         conn.close()
     options = [f"{row['station_no']}_{row['station_name']}" for _, row in df.iterrows()]
@@ -35,9 +38,10 @@ def get_station_options():
 def load_radiation_df(station_no):
     conn = sqlite3.connect(DB_PATH)
     try:
-        # 実際のテーブル名、列名に合わせてpoint_noを使用
+        # radiation_data テーブルから element_no, month, day, hour, value を取得
         df = pd.read_sql_query(
-            "SELECT element_no, month, day, hour, value FROM radiation WHERE station_no = ?",
+            "SELECT element_no, month, day, hour, value"
+            " FROM radiation_data WHERE point_no = ?",
             conn, params=(station_no,)
         )
     finally:
@@ -79,13 +83,15 @@ def process_and_plot(
         if PCS_output_kw in (None, 0):
             PCS_output_kw = DEFAULT_PCS_OUTPUT
 
+        # 選択した station_no を切り出し
         station_no = station.split('_')[0]
 
         # 緯度経度取得
         conn = sqlite3.connect(DB_PATH)
         try:
             df_info = pd.read_sql_query(
-                "SELECT point_lat AS latitude, point_lon AS longitude FROM radiation_data WHERE point_no = ?",
+                "SELECT point_lat AS latitude, point_lon AS longitude"
+                " FROM radiation_data WHERE point_no = ?",
                 conn, params=(station_no,)
             )
         finally:
@@ -98,8 +104,12 @@ def process_and_plot(
         df = load_radiation_df(station_no)
 
         # 時系列整形
-        df_solar = df[df['element_no']==1].pivot_table(index=['month','day'], columns='hour', values='value').reset_index()
-        df_temp  = df[df['element_no']==5].pivot_table(index=['month','day'], columns='hour', values='value').reset_index()
+        df_solar = df[df['element_no']==1].pivot_table(
+            index=['month','day'], columns='hour', values='value'
+        ).reset_index()
+        df_temp  = df[df['element_no']==5].pivot_table(
+            index=['month','day'], columns='hour', values='value'
+        ).reset_index()
         # 単位補正
         for h in range(1,25):
             df_solar[h] = pd.to_numeric(df_solar[h], errors='coerce') * 0.01 / 3.6
@@ -112,11 +122,17 @@ def process_and_plot(
         surface_azimuth = ORIENTATION_TO_AZIMUTH.get(orientation, 180)
         site = pvlib.location.Location(lat, lon, tz="Asia/Tokyo")
 
-        # 時刻インデックス生成
+        # 時刻インデックス生成 (year=2020 dummy)
         times = []
         for _, row in df_solar.iterrows():
             for h in range(1,25):
-                times.append(pd.Timestamp(year=2020, month=int(row['month']), day=int(row['day']), hour=h-1, tz="Asia/Tokyo"))
+                times.append(pd.Timestamp(
+                    year=2020,
+                    month=int(row['month']),
+                    day=int(row['day']),
+                    hour=h-1,
+                    tz="Asia/Tokyo"
+                ))
         times = pd.DatetimeIndex(times)
 
         # GHI flatten → W/m²
@@ -127,8 +143,11 @@ def process_and_plot(
         poa = pvlib.irradiance.get_total_irradiance(
             surface_tilt=surface_tilt,
             surface_azimuth=surface_azimuth,
-            dni=clearsky['dni'].values, ghi=ghi_flat, dhi=clearsky['dhi'].values,
-            solar_zenith=solpos['zenith'].values, solar_azimuth=solpos['azimuth'].values,
+            dni=clearsky['dni'].values,
+            ghi=ghi_flat,
+            dhi=clearsky['dhi'].values,
+            solar_zenith=solpos['zenith'].values,
+            solar_azimuth=solpos['azimuth'].values,
             model='isotropic'
         )
         poa_kwh = poa['poa_global'] / 1000.0
@@ -152,19 +171,28 @@ def process_and_plot(
         fig_bar = px.bar(eph_monthly, x='month', y='日発電量', title='月別発電量（PCS制限後）')
 
         # 日別24hグラフ
-        df_day = df_hourly[(df_hourly['month']==month_selected)&(df_hourly['day']==day_selected)]
+        df_day = df_hourly[(
+            df_hourly['month']==month_selected) & (df_hourly['day']==day_selected)
+        ]
         if df_day.empty:
             fig_line = px.line(title='該当データなし')
         else:
             hourly = df_day[list(range(1,25))].iloc[0]
-            df_plot = pd.DataFrame({'時刻':list(range(1,25)),'発電量':hourly.values})
-            fig_line = px.line(df_plot, x='時刻', y='発電量', markers=True,
-                               title=f'{month_selected}月{day_selected}日の24h発電量')\
-                      .update_layout(xaxis=dict(dtick=1))
+            df_plot = pd.DataFrame({
+                '時刻': list(range(1,25)),
+                '発電量': hourly.values
+            })
+            fig_line = px.line(
+                df_plot, x='時刻', y='発電量', markers=True,
+                title=f'{month_selected}月{day_selected}日の24h発電量'
+            ).update_layout(xaxis=dict(dtick=1))
 
+        # 年間発電量
         annual_total = df_hourly[list(range(1,25))].sum().sum()
         annual_str   = f'年間発電量: {annual_total:.2f} kWh'
+
         return fig_bar, fig_line, annual_str, ''
+
     except Exception as e:
         return None, None, None, f'内部エラー: {e}'
 
@@ -173,15 +201,21 @@ with gr.Blocks() as demo:
     gr.Markdown('# NEDO 日射量シミュレーション（SQL版）')
     with gr.Row():
         with gr.Column(scale=2):
-            station_input = gr.Dropdown(label='地点選択', choices=get_station_options())
+            station_input = gr.Dropdown(
+                label='地点選択', choices=get_station_options()
+            )
             K_input           = gr.Number(label='K', value=0.95)
             PAS_input         = gr.Number(label='PAS', value=None)
             Ppeak_input       = gr.Number(label='Ppeak', value=None)
             GS_input          = gr.Number(label='GS', value=1.0)
             alpha_input       = gr.Number(label='α[%/℃]', value=-0.35)
             deltaT_input      = gr.Number(label='ΔT[℃]', value=25.0)
-            orientation_input = gr.Dropdown(label='方位', choices=list(ORIENTATION_TO_AZIMUTH.keys()), value='南')
-            tilt_input        = gr.Dropdown(label='傾斜角(°)', choices=[str(i) for i in range(0,91,10)], value='30')
+            orientation_input = gr.Dropdown(
+                label='方位', choices=list(ORIENTATION_TO_AZIMUTH.keys()), value='南'
+            )
+            tilt_input        = gr.Dropdown(
+                label='傾斜角(°)', choices=[str(i) for i in range(0,91,10)], value='30'
+            )
             month_input       = gr.Textbox(label='月(1–12)', placeholder='例:6')
             day_input         = gr.Textbox(label='日(1–31)', placeholder='例:15')
             PCS_input         = gr.Number(label='PCS出力[kW]', value=99)
@@ -194,9 +228,11 @@ with gr.Blocks() as demo:
 
     run_button.click(
         fn=process_and_plot,
-        inputs=[station_input, K_input, PAS_input, Ppeak_input, GS_input,
-                alpha_input, deltaT_input, orientation_input, tilt_input,
-                month_input, day_input, PCS_input],
+        inputs=[
+            station_input, K_input, PAS_input, Ppeak_input, GS_input,
+            alpha_input, deltaT_input, orientation_input, tilt_input,
+            month_input, day_input, PCS_input
+        ],
         outputs=[bar_plot, line_plot, annual_box, error_box]
     )
 
