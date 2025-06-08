@@ -138,7 +138,6 @@ def process_and_plot(
         # GHI → POA 計算
         solpos = site.get_solarposition(times)
         clearsky = site.get_clearsky(times, model="simplified_solis")
-        # numpy array inputs for irradiance calculation
         dni = np.asarray(clearsky["dni"])
         dhi = np.asarray(clearsky["dhi"])
         solar_zenith = np.asarray(solpos["zenith"])
@@ -195,9 +194,17 @@ def process_and_plot(
         annual_str = f"年間発電量: {clipped_energy:.2f} kWh"
 
         # デバッグ情報
+        correction_factors = 1 + alpha * (df_temp[list(range(1,25))] + delta_T)
+        correction_avg = correction_factors.values.mean()
+        correction_max = correction_factors.values.max()
+        raw_energy_flat = K * effective_PAS * raw_ghi_flat * (1 + alpha * (df_temp[list(range(1,25))].values.flatten() + delta_T)) / GS
+        raw_energy_simple = raw_energy_flat.sum()
+
         debug_info = (
             f"raw_ghi_sum={raw_ghi_sum:.2f}, poa_sum={poa_sum:.2f}, "
-            f"raw_energy={raw_energy:.2f}, clipped_energy={clipped_energy:.2f}"
+            f"raw_energy={raw_energy:.2f}, clipped_energy={clipped_energy:.2f}, "
+            f"correction_avg={correction_avg:.3f}, correction_max={correction_max:.3f}, "
+            f"simple_no_pvlib_energy={raw_energy_simple:.2f}"
         )
 
         return fig_bar, fig_line, annual_str, debug_info, ""
