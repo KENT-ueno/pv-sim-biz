@@ -1,7 +1,7 @@
 ---
 title: 産業用太陽光需給シミュレーター
 emoji: ☀️
-colorFrom: orange
+colorFrom: yellow
 colorTo: yellow
 sdk: gradio
 sdk_version: 6.6.0
