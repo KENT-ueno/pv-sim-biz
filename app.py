@@ -180,6 +180,11 @@ def load_from_db(point_no):
     ghi_df = pd.DataFrame(ghi_rows, columns=cols)
     temp_df = pd.DataFrame(temp_rows, columns=cols)
 
+    # DB内の欠測値(8888)をNaNに変換（CSV読込と同等の処理）
+    h_cols = [f"h{i:02d}" for i in range(1, 25)]
+    ghi_df[h_cols] = ghi_df[h_cols].replace(8888, np.nan)
+    temp_df[h_cols] = temp_df[h_cols].replace(8888, np.nan)
+
     return lat, lon, ghi_df, temp_df
 
 
@@ -389,7 +394,7 @@ def compute_poa_30min(ghi_30min, lat, lon, surface_tilt, surface_azimuth):
     total_slots = n_days * 48
 
     times = pd.date_range(
-        start="2020-01-01 00:00", periods=total_slots, freq="30min", tz="Asia/Tokyo"
+        start="2023-01-01 00:00", periods=total_slots, freq="30min", tz="Asia/Tokyo"
     )
 
     ghi_flat = ghi_30min.flatten() * 2.0 * 1000.0
@@ -738,6 +743,10 @@ def optimize_battery(generation_30min, demand_30min, month_day,
         else:
             prob += soc_var[t] == soc_var[t - 1] + charge[t] * eff - discharge[t] / eff
 
+    # 終端SOC制約: 年末SOCを初期SOCに戻す（年次比較の公平性）
+    # ※現在の初期SOC = soc_min（固定）。初期SOCを可変にする場合は要見直し
+    prob += soc_var[T - 1] == soc_min
+
     # === ソルバー実行 ===
     solver = pulp.PULP_CBC_CMD(msg=0, timeLimit=120)
     prob.solve(solver)
@@ -896,6 +905,10 @@ def optimize_battery_capacity(generation_30min, demand_30min, month_day,
             prob += soc_var[t] == capacity_var * soc_min_ratio + charge[t] * eff - discharge[t] / eff
         else:
             prob += soc_var[t] == soc_var[t - 1] + charge[t] * eff - discharge[t] / eff
+
+    # 終端SOC制約: 年末SOCを初期SOCに戻す（年次比較の公平性）
+    # ※現在の初期SOC = capacity * soc_min_ratio（固定）。初期SOCを可変にする場合は要見直し
+    prob += soc_var[T - 1] == capacity_var * soc_min_ratio
 
     solver = pulp.PULP_CBC_CMD(msg=0, timeLimit=120)
     prob.solve(solver)
@@ -1357,7 +1370,7 @@ def run_simulation(
     elec_pf, elec_fuel, elec_renewable,
     contract_type,
     sell_mode, sell_price,
-    pv_cost_per_kw, bat_cost_per_kwh,
+    pv_cost_per_kw, bat_cost_per_kwh, substation_cost_per_kva,
     subsidy_enabled, subsidy_pv_pct, subsidy_bat_pct,
     co2_factor,
     business_model, contract_years, target_irr,
@@ -1584,6 +1597,14 @@ def run_simulation(
             bat_investment = bat_capacity * bat_unit
         total_investment = pv_investment + bat_investment
 
+        # 特別高圧受電設備工事費（高圧→特高変更時のみ）
+        # 条件: ユーザーが特別高圧を選択 かつ 導入前契約電力が2000kW以下（元は高圧）
+        substation_cost = 0
+        sub_unit = substation_cost_per_kva if substation_cost_per_kva else SUBSTATION_COST_PER_KVA
+        if is_ehv and cost_before is not None and cost_before['contract_power_kw'] <= 2000:
+            substation_cost = cost_before['contract_power_kw'] * sub_unit
+            total_investment += substation_cost
+
         # 補助金計算
         subsidy_pv = 0
         subsidy_bat = 0
@@ -1600,6 +1621,8 @@ def run_simulation(
         result_text += f"  PV: {total_ppeak:.1f} kW × {pv_unit:,.0f} 円/kW = {pv_investment:,.0f} 円\n"
         if bat_investment > 0:
             result_text += f"  蓄電池: {bat_capacity:.1f} kWh × {bat_unit:,.0f} 円/kWh = {bat_investment:,.0f} 円\n"
+        if substation_cost > 0:
+            result_text += f"  特別高圧工事費: {cost_before['contract_power_kw']:.0f} kVA × {sub_unit:,.0f} 円/kVA = {substation_cost:,.0f} 円\n"
         result_text += f"  設備投資合計: {total_investment:,.0f} 円\n"
         if total_subsidy > 0:
             result_text += f"【補助金】\n"
@@ -1629,11 +1652,6 @@ def run_simulation(
         elif net_investment > 0:
             result_text += f"【投資回収】\n"
             result_text += f"  年間経済メリットが算出できないため回収年数は計算不可\n"
-
-        # 特別高圧の受電設備工事費を別途表示
-        if is_ehv and cost_before is not None:
-            substation_cost = cost_before['contract_power_kw'] * SUBSTATION_COST_PER_KVA
-            result_text += f"  ※ 別途受電設備工事費: {substation_cost:,.0f} 円（一時費用）\n"
 
         # --- CO2削減量 ---
         if sc_result is not None:
@@ -2046,6 +2064,10 @@ def build_ui():
                             label="蓄電池単価 [円/kWh]",
                             value=BATTERY_COST_PER_KWH, precision=0,
                         )
+                    substation_cost_input = gr.Number(
+                        label="特別高圧工事費 [円/kVA]（高圧→特高変更時のみ適用）",
+                        value=SUBSTATION_COST_PER_KVA, precision=0,
+                    )
                     subsidy_enabled_input = gr.Checkbox(label="補助金を適用", value=False)
                     with gr.Column(visible=False) as subsidy_settings_group:
                         with gr.Row():
@@ -2338,7 +2360,7 @@ def build_ui():
             elec_pf_input, elec_fuel_input, elec_renewable_input,
             contract_type_input,
             sell_mode_input, sell_price_input,
-            pv_cost_input, bat_cost_input,
+            pv_cost_input, bat_cost_input, substation_cost_input,
             subsidy_enabled_input, subsidy_pv_input, subsidy_bat_input,
             co2_factor_input,
             business_model_input, contract_years_input, target_irr_input,
@@ -2347,7 +2369,7 @@ def build_ui():
         ] + facility_components + face_components
 
         def on_click(*args):
-            n_base = 41
+            n_base = 42
             n_fac = MAX_FACILITIES * 3   # 18
             n_face = MAX_FACES * 5       # 40
 
