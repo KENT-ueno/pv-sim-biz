@@ -65,7 +65,7 @@ BATTERY_DEFAULTS = {
     "soc_min_pct": 20,          # SOC下限 [%]
     "soc_max_pct": 95,          # SOC上限 [%]
 }
-BATTERY_MODES = ["ルールベース", "最適充放電（LP）", "最適容量探索（未実装）"]
+BATTERY_MODES = ["ルールベース", "最適充放電（LP）", "最適容量探索"]
 
 # 方位 → pvlib用アジマス角（北=0, 時計回り）
 ORIENTATION_TO_AZIMUTH = {
@@ -818,6 +818,253 @@ def optimize_battery(generation_30min, demand_30min, month_day,
 
 
 # ============================================================
+# 蓄電池最適容量探索（LP一体化 + グリッドサーチ）
+# ============================================================
+
+def optimize_battery_capacity(generation_30min, demand_30min, month_day,
+                              efficiency_pct, max_charge_kw, max_discharge_kw,
+                              soc_min_pct, soc_max_pct,
+                              basic_charge_per_kw, energy_charge_summer,
+                              energy_charge_other, power_factor_pct,
+                              fuel_adjustment, renewable_surcharge,
+                              sell_price, battery_cost_per_kwh, payback_years,
+                              no_export=False, capacity_upper=2000):
+    """段階1: LP一体化で蓄電池の最適容量を求める。
+
+    蓄電池容量を決定変数に含め、年間運用コスト＋蓄電池投資年額換算の
+    合計を最小化する。これはP-IRR最大化と等価。
+    """
+    if not HAS_PULP:
+        raise RuntimeError("PuLPがインストールされていません。")
+
+    n_days, n_slots = generation_30min.shape
+    T = n_days * n_slots
+    dt = 0.5
+
+    eff = efficiency_pct / 100.0
+    max_charge_per_slot = max_charge_kw * dt
+    max_discharge_per_slot = max_discharge_kw * dt
+
+    gen_flat = generation_30min.flatten()
+    dem_flat = demand_30min.flatten()
+    month_flat = np.array([month_day[d][0] for d in range(n_days) for _ in range(n_slots)])
+
+    unit_price = np.where(
+        (month_flat >= 7) & (month_flat <= 9),
+        energy_charge_summer + fuel_adjustment + renewable_surcharge,
+        energy_charge_other + fuel_adjustment + renewable_surcharge,
+    )
+
+    prob = pulp.LpProblem("OptimalCapacity", pulp.LpMinimize)
+
+    # 決定変数（容量も変数）
+    capacity_var = pulp.LpVariable("cap", lowBound=0, upBound=capacity_upper)
+    charge = [pulp.LpVariable(f"ch_{t}", lowBound=0, upBound=max_charge_per_slot) for t in range(T)]
+    discharge = [pulp.LpVariable(f"dc_{t}", lowBound=0, upBound=max_discharge_per_slot) for t in range(T)]
+    grid_import = [pulp.LpVariable(f"gi_{t}", lowBound=0) for t in range(T)]
+    if no_export:
+        grid_export = [pulp.LpVariable(f"ge_{t}", lowBound=0, upBound=0) for t in range(T)]
+    else:
+        grid_export = [pulp.LpVariable(f"ge_{t}", lowBound=0) for t in range(T)]
+    soc_var = [pulp.LpVariable(f"soc_{t}", lowBound=0) for t in range(T)]
+    peak_demand = pulp.LpVariable("peak_kw", lowBound=0)
+
+    # SOC下限 = capacity * soc_min_pct/100 → 非線形なので固定値0とする（容量が変数のため）
+    # SOC上限 = capacity * soc_max_pct/100 → capacity_var * soc_max_pct/100 で線形
+    soc_max_ratio = soc_max_pct / 100.0
+    soc_min_ratio = soc_min_pct / 100.0
+
+    # 目的関数: 年間運用コスト + 蓄電池投資年額換算
+    pf_factor = (185 - power_factor_pct) / 100.0
+    annual_basic = basic_charge_per_kw * peak_demand * 12 * pf_factor
+    annual_energy = pulp.lpSum([grid_import[t] * unit_price[t] for t in range(T)])
+    sell_price_val = sell_price if sell_price else 0
+    annual_sell = pulp.lpSum([grid_export[t] * sell_price_val for t in range(T)])
+    # 蓄電池投資の年額換算（容量が変数）
+    annual_battery_cost = capacity_var * battery_cost_per_kwh / payback_years
+    prob += annual_basic + annual_energy - annual_sell + annual_battery_cost
+
+    # 制約条件
+    for t in range(T):
+        prob += grid_import[t] + gen_flat[t] + discharge[t] == dem_flat[t] + charge[t] + grid_export[t]
+        prob += peak_demand >= grid_import[t] / dt
+        # SOC上下限（容量に連動）
+        prob += soc_var[t] <= capacity_var * soc_max_ratio
+        prob += soc_var[t] >= capacity_var * soc_min_ratio
+        # SOC遷移
+        if t == 0:
+            prob += soc_var[t] == capacity_var * soc_min_ratio + charge[t] * eff - discharge[t] / eff
+        else:
+            prob += soc_var[t] == soc_var[t - 1] + charge[t] * eff - discharge[t] / eff
+
+    solver = pulp.PULP_CBC_CMD(msg=0, timeLimit=120)
+    prob.solve(solver)
+
+    if prob.status != pulp.constants.LpStatusOptimal:
+        raise RuntimeError(f"最適容量探索に失敗（ステータス: {pulp.LpStatus[prob.status]}）")
+
+    optimal_capacity = capacity_var.varValue
+    opt_peak_kw = peak_demand.varValue
+
+    return {
+        "optimal_capacity_kwh": optimal_capacity,
+        "opt_peak_kw": opt_peak_kw,
+        "opt_annual_cost": pulp.value(prob.objective),
+    }
+
+
+def grid_search_battery_capacity(generation_30min, demand_30min, month_day,
+                                 efficiency_pct, max_charge_kw, max_discharge_kw,
+                                 soc_min_pct, soc_max_pct,
+                                 sell_price, pv_cost, battery_cost_per_kwh,
+                                 total_ppeak, co2_factor,
+                                 cost_before_total, payback_years,
+                                 no_export=False,
+                                 optimal_capacity=None, n_steps=10,
+                                 **rate_kwargs):
+    """段階2: グリッドサーチで容量ごとの指標を計算。
+
+    段階1の最適容量を基準に探索範囲を決め、各容量でLP最適化を実行。
+    rate_kwargs: basic_charge_per_kw, energy_charge_summer, etc.
+    """
+    # 探索範囲を決定
+    if optimal_capacity and optimal_capacity > 0:
+        cap_max = optimal_capacity * 3
+    else:
+        cap_max = 1000
+    cap_min = 0
+    capacities = np.linspace(cap_min, cap_max, n_steps + 1)
+    # 0は蓄電池なし（LP不要）なので最初のステップだけ特別扱い
+    if capacities[0] == 0:
+        capacities[0] = 0.1  # ゼロ割り回避
+
+    results = []
+    pv_investment = total_ppeak * pv_cost
+
+    for cap in capacities:
+        try:
+            sc = optimize_battery(
+                generation_30min, demand_30min, month_day,
+                capacity_kwh=cap,
+                efficiency_pct=efficiency_pct,
+                max_charge_kw=max_charge_kw,
+                max_discharge_kw=max_discharge_kw,
+                soc_min_pct=soc_min_pct,
+                soc_max_pct=soc_max_pct,
+                sell_price=sell_price,
+                no_export=no_export,
+                **rate_kwargs,
+            )
+            # 導入後の電気料金
+            cost_after = calc_electricity_cost(
+                sc["import_"], month_day,
+                **rate_kwargs,
+            )
+            # 年間コスト削減
+            saving = cost_before_total - cost_after["annual_total"]
+            sell_rev = sc["annual_export"] * (sell_price if sell_price else 0)
+            annual_merit = saving + sell_rev if not no_export else saving
+
+            # 投資額
+            bat_inv = cap * battery_cost_per_kwh
+            total_inv = pv_investment + bat_inv
+
+            # 回収年数
+            payback = total_inv / annual_merit if annual_merit > 0 else 999
+
+            # P-IRR
+            cf = [-total_inv] + [annual_merit] * int(payback_years)
+            irr = _calc_irr(cf)
+
+            # CO2
+            grid_reduction = sc["annual_demand"] - sc["annual_import"]
+            co2 = grid_reduction * co2_factor
+
+            results.append({
+                "capacity": cap,
+                "annual_merit": annual_merit,
+                "total_investment": total_inv,
+                "payback_years": payback,
+                "irr": irr if irr is not None else 0,
+                "contract_power_kw": cost_after["contract_power_kw"],
+                "co2_reduction": co2,
+            })
+        except Exception:
+            continue
+
+    return results
+
+
+def make_capacity_search_chart(search_results, optimal_capacity=None):
+    """最適容量探索の結果をPlotlyグラフで可視化。"""
+    if not search_results:
+        fig = go.Figure()
+        fig.update_layout(title="最適容量探索: データなし")
+        return fig
+
+    caps = [r["capacity"] for r in search_results]
+    merits = [r["annual_merit"] / 10000 for r in search_results]  # 万円
+    investments = [r["total_investment"] / 10000 for r in search_results]  # 万円
+    irrs = [r["irr"] * 100 for r in search_results]  # %
+    paybacks = [min(r["payback_years"], 50) for r in search_results]  # 上限50年
+
+    fig = make_subplots(
+        rows=2, cols=2,
+        subplot_titles=(
+            "年間コスト削減額（万円/年）",
+            "投資額（万円）",
+            "P-IRR（%）",
+            "投資回収年数（年）",
+        ),
+        vertical_spacing=0.15,
+        horizontal_spacing=0.12,
+    )
+
+    # 年間コスト削減額
+    fig.add_trace(go.Scatter(
+        x=caps, y=merits, mode="lines+markers", name="コスト削減",
+        line=dict(color="green"),
+    ), row=1, col=1)
+
+    # 投資額
+    fig.add_trace(go.Scatter(
+        x=caps, y=investments, mode="lines+markers", name="投資額",
+        line=dict(color="blue"),
+    ), row=1, col=2)
+
+    # P-IRR
+    fig.add_trace(go.Scatter(
+        x=caps, y=irrs, mode="lines+markers", name="P-IRR",
+        line=dict(color="red"),
+    ), row=2, col=1)
+
+    # 投資回収年数
+    fig.add_trace(go.Scatter(
+        x=caps, y=paybacks, mode="lines+markers", name="回収年数",
+        line=dict(color="orange"),
+    ), row=2, col=2)
+
+    # 最適容量の縦線
+    if optimal_capacity is not None and optimal_capacity > 0:
+        for row, col in [(1, 1), (1, 2), (2, 1), (2, 2)]:
+            fig.add_vline(
+                x=optimal_capacity, line_dash="dash", line_color="red",
+                annotation_text=f"最適 {optimal_capacity:.0f}kWh",
+                row=row, col=col,
+            )
+
+    fig.update_layout(
+        height=700, template="plotly_white",
+        showlegend=False,
+        title_text="蓄電池容量 最適化探索",
+    )
+    for row, col in [(1, 1), (1, 2), (2, 1), (2, 2)]:
+        fig.update_xaxes(title_text="蓄電池容量 [kWh]", row=row, col=col)
+
+    return fig
+
+
+# ============================================================
 # 高圧電気料金計算
 # ============================================================
 
@@ -1130,7 +1377,7 @@ def run_simulation(
             lat, lon, ghi_df, temp_df = load_from_db(point_no)
             source_text = f"DB: {station_choice}"
         else:
-            return None, None, None, "エラー: 地点を選択するかCSVをアップロードしてください", "", None
+            return None, None, None, None, "エラー: 地点を選択するかCSVをアップロードしてください", "", None
 
         # --- 需要データ読み込み（複数施設合算） ---
         demand_30min = load_combined_demand(
@@ -1162,7 +1409,7 @@ def run_simulation(
                 })
 
         if not faces:
-            return None, None, None, "エラー: 有効な面設定がありません（Ppeak > 0の面が必要です）", "", None
+            return None, None, None, None, "エラー: 有効な面設定がありません（Ppeak > 0の面が必要です）", "", None
 
         # --- 計算実行 ---
         result = calculate_generation(
@@ -1176,7 +1423,7 @@ def run_simulation(
         sc_result = None
         battery_mode_label = bat_mode if bat_mode else "ルールベース"
         if demand_30min is not None:
-            if bat_enabled and bat_capacity and bat_capacity > 0:
+            if bat_enabled and bat_capacity and bat_capacity > 0 and battery_mode_label != "最適容量探索":
                 if battery_mode_label == "最適充放電（LP）":
                     # LP最適化: 電気料金パラメータが必要
                     is_ehv_tmp = (contract_type == "特別高圧")
@@ -1550,15 +1797,103 @@ def run_simulation(
         if cost_before is not None:
             fig_demand = make_demand_chart(cost_before, cost_after, contract_label)
 
+        # --- 最適容量探索 ---
+        fig_capacity = None
+        if battery_mode_label == "最適容量探索" and demand_30min is not None and cost_before is not None:
+            defaults_cap = ELECTRICITY_RATE_EHV if is_ehv else ELECTRICITY_RATE_HV
+            rate_p = dict(
+                basic_charge_per_kw=elec_basic if elec_basic else defaults_cap["basic_charge_per_kw"],
+                energy_charge_summer=elec_summer if elec_summer else defaults_cap["energy_charge_summer"],
+                energy_charge_other=elec_other if elec_other else defaults_cap["energy_charge_other"],
+                power_factor_pct=elec_pf if elec_pf else defaults_cap["power_factor_pct"],
+                fuel_adjustment=elec_fuel if elec_fuel is not None else defaults_cap["fuel_adjustment"],
+                renewable_surcharge=elec_renewable if elec_renewable else defaults_cap["renewable_surcharge"],
+            )
+            bat_eff = bat_efficiency if bat_efficiency else 95
+            bat_mc = bat_max_charge if bat_max_charge else 2.5
+            bat_md = bat_max_discharge if bat_max_discharge else 2.5
+            bat_smin = bat_soc_min if bat_soc_min is not None else 20
+            bat_smax = bat_soc_max if bat_soc_max else 95
+            sp = sell_price if sell_price else DEFAULT_SELL_PRICE
+            n_yrs = int(contract_years) if contract_years else DEFAULT_CONTRACT_YEARS
+
+            # 段階1: LP一体化
+            try:
+                cap_result = optimize_battery_capacity(
+                    result["total_gen_clipped"], demand_30min, result["month_day"],
+                    efficiency_pct=bat_eff,
+                    max_charge_kw=bat_mc, max_discharge_kw=bat_md,
+                    soc_min_pct=bat_smin, soc_max_pct=bat_smax,
+                    sell_price=sp, battery_cost_per_kwh=bat_unit, payback_years=n_yrs,
+                    no_export=no_export, **rate_p,
+                )
+                opt_cap = cap_result["optimal_capacity_kwh"]
+
+                result_text += f"\n══ 最適蓄電池容量探索 ══\n"
+                result_text += f"【段階1: LP一体化】\n"
+                result_text += f"  最適蓄電池容量: {opt_cap:.1f} kWh\n"
+
+                # 最適容量でLP最適化を実行して詳細指標を取得
+                sc_opt = optimize_battery(
+                    result["total_gen_clipped"], demand_30min, result["month_day"],
+                    capacity_kwh=opt_cap,
+                    efficiency_pct=bat_eff,
+                    max_charge_kw=bat_mc, max_discharge_kw=bat_md,
+                    soc_min_pct=bat_smin, soc_max_pct=bat_smax,
+                    sell_price=sp, no_export=no_export, **rate_p,
+                )
+                cost_opt = calc_electricity_cost(
+                    sc_opt["import_"], result["month_day"], **rate_p,
+                )
+                saving_opt = cost_before['annual_total'] - cost_opt['annual_total']
+                sell_rev_opt = sc_opt['annual_export'] * sp if not no_export else 0
+                merit_opt = saving_opt + sell_rev_opt
+                bat_inv_opt = opt_cap * bat_unit
+                total_inv_opt = total_ppeak * pv_unit + bat_inv_opt
+                payback_opt = total_inv_opt / merit_opt if merit_opt > 0 else 999
+                cf_opt = [-total_inv_opt] + [merit_opt] * n_yrs
+                irr_opt = _calc_irr(cf_opt)
+                ef = co2_factor if co2_factor else CO2_EMISSION_FACTOR
+                co2_opt = (sc_opt['annual_demand'] - sc_opt['annual_import']) * ef
+
+                result_text += f"  P-IRR: {irr_opt*100:.1f}%\n" if irr_opt else ""
+                result_text += f"  契約電力: {cost_before['contract_power_kw']:.1f} kW → {cost_opt['contract_power_kw']:.1f} kW（{cost_before['contract_power_kw'] - cost_opt['contract_power_kw']:.1f} kW 削減）\n"
+                result_text += f"  年間コスト削減: {merit_opt:,.0f} 円/年\n"
+                result_text += f"  CO2削減量: {co2_opt:.3f} t-CO2/年\n"
+                result_text += f"  投資回収見込み: {payback_opt:.1f} 年\n"
+
+                # 段階2: グリッドサーチ
+                search_results = grid_search_battery_capacity(
+                    result["total_gen_clipped"], demand_30min, result["month_day"],
+                    efficiency_pct=bat_eff,
+                    max_charge_kw=bat_mc, max_discharge_kw=bat_md,
+                    soc_min_pct=bat_smin, soc_max_pct=bat_smax,
+                    sell_price=sp, pv_cost=pv_unit,
+                    battery_cost_per_kwh=bat_unit,
+                    total_ppeak=total_ppeak,
+                    co2_factor=ef,
+                    cost_before_total=cost_before['annual_total'],
+                    payback_years=n_yrs,
+                    no_export=no_export,
+                    optimal_capacity=opt_cap,
+                    n_steps=10,
+                    **rate_p,
+                )
+                fig_capacity = make_capacity_search_chart(search_results, opt_cap)
+                result_text += f"【段階2: グリッドサーチ】探索完了（{len(search_results)}ステップ）\n"
+
+            except Exception as e:
+                result_text += f"\n最適容量探索エラー: {e}\n"
+
         # result_stateに需要関連も含める
         result["sc_result"] = sc_result
         result["demand_30min"] = demand_30min
 
-        return fig_monthly, fig_daily, fig_demand, result_text, debug_text, result
+        return fig_monthly, fig_daily, fig_demand, fig_capacity, result_text, debug_text, result
 
     except Exception as e:
         import traceback
-        return None, None, None, f"エラー: {e}", traceback.format_exc(), None
+        return None, None, None, None, f"エラー: {e}", traceback.format_exc(), None
 
 
 def build_ui():
@@ -1814,14 +2149,15 @@ def build_ui():
                 with gr.Column(visible=False) as battery_settings_group:
                     battery_mode_input = gr.Dropdown(
                         label="充放電モード",
-                        choices=BATTERY_MODES[:2],  # 最適容量探索は未実装のため除外
+                        choices=BATTERY_MODES,
                         value="ルールベース",
                     )
-                    with gr.Row():
+                    with gr.Row(visible=True) as battery_cap_row:
                         battery_capacity_input = gr.Number(
                             label="蓄電池容量 [kWh]",
                             value=BATTERY_DEFAULTS["capacity_kwh"], precision=1,
                         )
+                    with gr.Row():
                         battery_efficiency_input = gr.Number(
                             label="充放電効率 [%]",
                             value=BATTERY_DEFAULTS["efficiency_pct"], precision=0,
@@ -1849,6 +2185,17 @@ def build_ui():
                     fn=lambda x: gr.update(visible=x),
                     inputs=[battery_enabled],
                     outputs=[battery_settings_group],
+                )
+
+                def on_battery_mode_change(mode):
+                    # 最適容量探索時は容量・効率の行を非表示
+                    hide_cap = (mode == "最適容量探索")
+                    return gr.update(visible=not hide_cap)
+
+                battery_mode_input.change(
+                    fn=on_battery_mode_change,
+                    inputs=[battery_mode_input],
+                    outputs=[battery_cap_row],
                 )
 
                 # --- アレイ設定 ---
@@ -1901,6 +2248,8 @@ def build_ui():
                         daily_plot = gr.Plot(label="日別発電量（48コマ）")
                     with gr.Tab("⚡ デマンド追跡"):
                         demand_plot = gr.Plot(label="月別最大デマンド比較")
+                    with gr.Tab("🔍 最適容量探索"):
+                        capacity_search_plot = gr.Plot(label="蓄電池容量 最適化探索")
                 result_box = gr.Textbox(label="計算結果", lines=28, interactive=False)
                 debug_box = gr.Textbox(label="デバッグ情報", lines=12, interactive=False)
 
@@ -2025,7 +2374,7 @@ def build_ui():
         run_btn.click(
             fn=on_click,
             inputs=all_inputs_with_display,
-            outputs=[monthly_plot, daily_plot, demand_plot, result_box, debug_box, result_state],
+            outputs=[monthly_plot, daily_plot, demand_plot, capacity_search_plot, result_box, debug_box, result_state],
         )
 
         # 月日変更時のグラフ再描画コールバック（再計算なし）
