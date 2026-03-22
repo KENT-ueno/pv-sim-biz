@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls \"E:/jupyterlab/nedo_solar/pv-sim-biz/\"*.csv)",
+      "Bash(python -c \"import app; print\\(''import OK''\\); print\\(f''Lines: {len\\(open\\(\"\"app.py\"\"\\).readlines\\(\\)\\)}''\\); print\\(f''Presets: {list\\(app.DEMAND_PRESETS.keys\\(\\)\\)}''\\)\")",
+      "Bash(for f:*)",
+      "Bash(do echo:*)",
+      "Read(//e/jupyterlab/nedo_solar/pv-sim-biz/**)",
+      "Bash(done)",
+      "Bash(timeout 15 python -c \":*)",
+      "Bash(pkill -f \"python app.py\")",
+      "mcp__Claude_Preview__preview_start",
+      "Bash(timeout 15)",
+      "Bash(ping -n 10 127.0.0.1)",
+      "Bash(python app.py)",
+      "Bash(curl -s http://127.0.0.1:7860 -o nul -w \"%{http_code}\")",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://127.0.0.1:7860)",
+      "Bash(python -c \"import app; print\\(''OK''\\)\")",
+      "Bash(netstat -ano)",
+      "Bash(taskkill //PID 8804 //F)",
+      "Bash(pip install:*)",
+      "Bash(python -c \"import gradio; print\\(gradio.__version__\\)\")"
+    ]
+  }
+}
