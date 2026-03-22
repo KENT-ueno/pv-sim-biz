@@ -182,7 +182,9 @@ URL: https://huggingface.co/spaces/hachinai/pv-sim-biz
   - 充放電レート: 0 ≤ charge(t) ≤ max_charge × 0.5h
   - 0 ≤ discharge(t) ≤ max_discharge × 0.5h
   - SOC遷移: SOC(t+1) = SOC(t) + charge(t)×η − discharge(t)/η
-  - エネルギーバランス: grid_import(t) + pv(t) + discharge(t) = demand(t) + charge(t) + export(t)
+  - エネルギーバランス: grid_import(t) + pv(t) + discharge(t) = demand(t) + charge(t) + export(t) + curtailment(t)
+  - 出力抑制: curtailment(t) ≥ 0（逆潮流禁止時にPV余剰を吸収）
+  - 終端SOC: SOC(T-1) = SOC(0)（年次比較の公平性）
   - 非負制約: grid_import(t) ≥ 0, export(t) ≥ 0
 
 #### ピークカット効果
@@ -244,6 +246,9 @@ CO2削減量: ●● t-CO2/年
 #### 実装上の注意
 - 段階1のLP一体化では、充放電レート上限（max_charge, max_discharge）はユーザー入力値を固定で使用
   - 産業用蓄電池はPCSの定格で決まるため固定が現実的
+- 蓄電池コストは補助金反映後の実質単価でLP・グリッドサーチに渡す
+- LP定式化にカーテイルメント変数を含め、逆潮流禁止時もInfeasibleにならない
+- 数値入力のデフォルト判定は `is not None` で統一（0入力を許容）
 - 段階2のグリッドサーチは段階1+2を一括実行して結果表示（Gradio制約を考慮）
 - ソルバーはCBCで実装（将来HiGHSへの切り替えも検討可能）
 

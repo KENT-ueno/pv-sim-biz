@@ -717,6 +717,8 @@ def optimize_battery(generation_30min, demand_30min, month_day,
         grid_export = [pulp.LpVariable(f"ge_{t}", lowBound=0, upBound=0) for t in range(T)]
     else:
         grid_export = [pulp.LpVariable(f"ge_{t}", lowBound=0) for t in range(T)]
+    # 出力抑制変数（逆潮流禁止時にPV余剰を捨てる）
+    curtailment = [pulp.LpVariable(f"ct_{t}", lowBound=0) for t in range(T)]
     soc_var = [pulp.LpVariable(f"soc_{t}", lowBound=soc_min, upBound=soc_max) for t in range(T)]
     peak_demand = pulp.LpVariable("peak_kw", lowBound=0)  # ピークデマンド（kW）
 
@@ -724,14 +726,14 @@ def optimize_battery(generation_30min, demand_30min, month_day,
     pf_factor = (185 - power_factor_pct) / 100.0
     annual_basic = basic_charge_per_kw * peak_demand * 12 * pf_factor  # 年間基本料金
     annual_energy = pulp.lpSum([grid_import[t] * unit_price[t] for t in range(T)])
-    sell_price_val = sell_price if sell_price else 0
+    sell_price_val = sell_price if sell_price is not None else 0
     annual_sell = pulp.lpSum([grid_export[t] * sell_price_val for t in range(T)])
     prob += annual_basic + annual_energy - annual_sell
 
     # 制約条件
     for t in range(T):
-        # エネルギーバランス: 系統購入 + PV発電 + 放電 = 需要 + 充電 + 系統売電
-        prob += grid_import[t] + gen_flat[t] + discharge[t] == dem_flat[t] + charge[t] + grid_export[t]
+        # エネルギーバランス: 系統購入 + PV発電 + 放電 = 需要 + 充電 + 系統売電 + 出力抑制
+        prob += grid_import[t] + gen_flat[t] + discharge[t] == dem_flat[t] + charge[t] + grid_export[t] + curtailment[t]
 
         # ピークデマンド制約: peak_demand ≥ 系統購入の瞬時電力(kW)
         # grid_import[t]はkWh/30分なので、kWに変換するには÷0.5
@@ -763,10 +765,8 @@ def optimize_battery(generation_30min, demand_30min, month_day,
 
     # 自家消費 = 需要 - 系統購入
     self_consumption = demand_30min - gi_vals
-    curtailment_arr = np.zeros((n_days, n_slots))
-    if no_export:
-        # 逆潮流禁止時: 出力抑制 = PV - 自家消費 - 充電
-        curtailment_arr = np.maximum(0, generation_30min - self_consumption - charge_vals)
+    # 出力抑制はLP変数から直接取得
+    curtailment_arr = np.array([ct.varValue for ct in curtailment]).reshape(n_days, n_slots)
 
     # 年間集計
     annual_self = float(np.sum(self_consumption))
@@ -841,7 +841,7 @@ def optimize_battery_capacity(generation_30min, demand_30min, month_day,
     """段階1: LP一体化で蓄電池の最適容量を求める。
 
     蓄電池容量を決定変数に含め、年間運用コスト＋蓄電池投資年額換算の
-    合計を最小化する。これはP-IRR最大化と等価。
+    合計を最小化する。P-IRR最大化の近似探索として機能する。
     """
     if not HAS_PULP:
         raise RuntimeError("PuLPがインストールされていません。")
@@ -875,6 +875,8 @@ def optimize_battery_capacity(generation_30min, demand_30min, month_day,
         grid_export = [pulp.LpVariable(f"ge_{t}", lowBound=0, upBound=0) for t in range(T)]
     else:
         grid_export = [pulp.LpVariable(f"ge_{t}", lowBound=0) for t in range(T)]
+    # 出力抑制変数（逆潮流禁止時にPV余剰を捨てる）
+    curtailment = [pulp.LpVariable(f"ct_{t}", lowBound=0) for t in range(T)]
     soc_var = [pulp.LpVariable(f"soc_{t}", lowBound=0) for t in range(T)]
     peak_demand = pulp.LpVariable("peak_kw", lowBound=0)
 
@@ -887,7 +889,7 @@ def optimize_battery_capacity(generation_30min, demand_30min, month_day,
     pf_factor = (185 - power_factor_pct) / 100.0
     annual_basic = basic_charge_per_kw * peak_demand * 12 * pf_factor
     annual_energy = pulp.lpSum([grid_import[t] * unit_price[t] for t in range(T)])
-    sell_price_val = sell_price if sell_price else 0
+    sell_price_val = sell_price if sell_price is not None else 0
     annual_sell = pulp.lpSum([grid_export[t] * sell_price_val for t in range(T)])
     # 蓄電池投資の年額換算（容量が変数）
     annual_battery_cost = capacity_var * battery_cost_per_kwh / payback_years
@@ -895,7 +897,8 @@ def optimize_battery_capacity(generation_30min, demand_30min, month_day,
 
     # 制約条件
     for t in range(T):
-        prob += grid_import[t] + gen_flat[t] + discharge[t] == dem_flat[t] + charge[t] + grid_export[t]
+        # エネルギーバランス: 系統購入 + PV発電 + 放電 = 需要 + 充電 + 系統売電 + 出力抑制
+        prob += grid_import[t] + gen_flat[t] + discharge[t] == dem_flat[t] + charge[t] + grid_export[t] + curtailment[t]
         prob += peak_demand >= grid_import[t] / dt
         # SOC上下限（容量に連動）
         prob += soc_var[t] <= capacity_var * soc_max_ratio
@@ -941,10 +944,12 @@ def grid_search_battery_capacity(generation_30min, demand_30min, month_day,
     rate_kwargs: basic_charge_per_kw, energy_charge_summer, etc.
     """
     # 探索範囲を決定
+    # 最低でも充放電レートの2時間分を上限とし、意味のある範囲を探索
+    min_meaningful = max(max_charge_kw * 2, 50)  # 最低50kWh or 充電2時間分
     if optimal_capacity and optimal_capacity > 0:
-        cap_max = optimal_capacity * 3
+        cap_max = max(optimal_capacity * 3, min_meaningful)
     else:
-        cap_max = 1000
+        cap_max = min_meaningful
     cap_min = 0
     capacities = np.linspace(cap_min, cap_max, n_steps + 1)
     # 0は蓄電池なし（LP不要）なので最初のステップだけ特別扱い
@@ -975,7 +980,7 @@ def grid_search_battery_capacity(generation_30min, demand_30min, month_day,
             )
             # 年間コスト削減
             saving = cost_before_total - cost_after["annual_total"]
-            sell_rev = sc["annual_export"] * (sell_price if sell_price else 0)
+            sell_rev = sc["annual_export"] * (sell_price if sell_price is not None else 0)
             annual_merit = saving + sell_rev if not no_export else saving
 
             # 投資額
@@ -1059,10 +1064,12 @@ def make_capacity_search_chart(search_results, optimal_capacity=None):
 
     # 最適容量の縦線
     if optimal_capacity is not None and optimal_capacity > 0:
+        # 小数点以下が意味ある場合は小数表示、そうでなければ整数表示
+        cap_label = f"{optimal_capacity:.1f}" if optimal_capacity < 10 else f"{optimal_capacity:.0f}"
         for row, col in [(1, 1), (1, 2), (2, 1), (2, 2)]:
             fig.add_vline(
                 x=optimal_capacity, line_dash="dash", line_color="red",
-                annotation_text=f"最適 {optimal_capacity:.0f}kWh",
+                annotation_text=f"最適 {cap_label}kWh",
                 row=row, col=col,
             )
 
@@ -1444,18 +1451,18 @@ def run_simulation(
                     sc_result = optimize_battery(
                         result["total_gen_clipped"], demand_30min, result["month_day"],
                         capacity_kwh=bat_capacity,
-                        efficiency_pct=bat_efficiency if bat_efficiency else 95,
-                        max_charge_kw=bat_max_charge if bat_max_charge else 2.5,
-                        max_discharge_kw=bat_max_discharge if bat_max_discharge else 2.5,
+                        efficiency_pct=bat_efficiency if bat_efficiency is not None else 95,
+                        max_charge_kw=bat_max_charge if bat_max_charge is not None else 2.5,
+                        max_discharge_kw=bat_max_discharge if bat_max_discharge is not None else 2.5,
                         soc_min_pct=bat_soc_min if bat_soc_min is not None else 20,
-                        soc_max_pct=bat_soc_max if bat_soc_max else 95,
-                        basic_charge_per_kw=elec_basic if elec_basic else defaults_tmp["basic_charge_per_kw"],
-                        energy_charge_summer=elec_summer if elec_summer else defaults_tmp["energy_charge_summer"],
-                        energy_charge_other=elec_other if elec_other else defaults_tmp["energy_charge_other"],
-                        power_factor_pct=elec_pf if elec_pf else defaults_tmp["power_factor_pct"],
+                        soc_max_pct=bat_soc_max if bat_soc_max is not None else 95,
+                        basic_charge_per_kw=elec_basic if elec_basic is not None else defaults_tmp["basic_charge_per_kw"],
+                        energy_charge_summer=elec_summer if elec_summer is not None else defaults_tmp["energy_charge_summer"],
+                        energy_charge_other=elec_other if elec_other is not None else defaults_tmp["energy_charge_other"],
+                        power_factor_pct=elec_pf if elec_pf is not None else defaults_tmp["power_factor_pct"],
                         fuel_adjustment=elec_fuel if elec_fuel is not None else defaults_tmp["fuel_adjustment"],
-                        renewable_surcharge=elec_renewable if elec_renewable else defaults_tmp["renewable_surcharge"],
-                        sell_price=sell_price if sell_price else DEFAULT_SELL_PRICE,
+                        renewable_surcharge=elec_renewable if elec_renewable is not None else defaults_tmp["renewable_surcharge"],
+                        sell_price=sell_price if sell_price is not None else DEFAULT_SELL_PRICE,
                         no_export=no_export,
                     )
                 else:
@@ -1463,11 +1470,11 @@ def run_simulation(
                     sc_result = simulate_battery(
                         result["total_gen_clipped"], demand_30min, result["month_day"],
                         capacity_kwh=bat_capacity,
-                        efficiency_pct=bat_efficiency if bat_efficiency else 95,
-                        max_charge_kw=bat_max_charge if bat_max_charge else 2.5,
-                        max_discharge_kw=bat_max_discharge if bat_max_discharge else 2.5,
+                        efficiency_pct=bat_efficiency if bat_efficiency is not None else 95,
+                        max_charge_kw=bat_max_charge if bat_max_charge is not None else 2.5,
+                        max_discharge_kw=bat_max_discharge if bat_max_discharge is not None else 2.5,
                         soc_min_pct=bat_soc_min if bat_soc_min is not None else 20,
-                        soc_max_pct=bat_soc_max if bat_soc_max else 95,
+                        soc_max_pct=bat_soc_max if bat_soc_max is not None else 95,
                         no_export=no_export,
                     )
             else:
@@ -1502,7 +1509,7 @@ def run_simulation(
                 result_text += f"売電モード: 逆潮流禁止（売電なし）\n"
             else:
                 result_text += f"余剰売電量: {sc_result['annual_export']:.1f} kWh/年\n"
-                actual_sell_price = sell_price if sell_price else DEFAULT_SELL_PRICE
+                actual_sell_price = sell_price if sell_price is not None else DEFAULT_SELL_PRICE
                 sell_revenue = sc_result['annual_export'] * actual_sell_price
                 result_text += f"売電単価: {actual_sell_price:.2f} 円/kWh\n"
                 result_text += f"売電収入: {sell_revenue:,.0f} 円/年\n"
@@ -1524,12 +1531,12 @@ def run_simulation(
         cost_after = None
         if demand_30min is not None:
             rate_params = dict(
-                basic_charge_per_kw=elec_basic if elec_basic else defaults["basic_charge_per_kw"],
-                energy_charge_summer=elec_summer if elec_summer else defaults["energy_charge_summer"],
-                energy_charge_other=elec_other if elec_other else defaults["energy_charge_other"],
-                power_factor_pct=elec_pf if elec_pf else defaults["power_factor_pct"],
+                basic_charge_per_kw=elec_basic if elec_basic is not None else defaults["basic_charge_per_kw"],
+                energy_charge_summer=elec_summer if elec_summer is not None else defaults["energy_charge_summer"],
+                energy_charge_other=elec_other if elec_other is not None else defaults["energy_charge_other"],
+                power_factor_pct=elec_pf if elec_pf is not None else defaults["power_factor_pct"],
                 fuel_adjustment=elec_fuel if elec_fuel is not None else defaults["fuel_adjustment"],
-                renewable_surcharge=elec_renewable if elec_renewable else defaults["renewable_surcharge"],
+                renewable_surcharge=elec_renewable if elec_renewable is not None else defaults["renewable_surcharge"],
             )
             # 導入前: 需要データそのまま
             cost_before = calc_electricity_cost(
@@ -1563,7 +1570,7 @@ def run_simulation(
                 result_text += f"  電力量料金削減: {cost_before['annual_energy_charge'] - cost_after['annual_energy_charge']:,.0f} 円/年\n"
                 # 売電収入を含めた総合メリット
                 if not no_export and sc_result is not None:
-                    actual_sell_price = sell_price if sell_price else DEFAULT_SELL_PRICE
+                    actual_sell_price = sell_price if sell_price is not None else DEFAULT_SELL_PRICE
                     sell_rev = sc_result['annual_export'] * actual_sell_price
                     total_merit = saving + sell_rev
                     result_text += f"  売電収入: {sell_rev:,.0f} 円/年\n"
@@ -1589,8 +1596,8 @@ def run_simulation(
 
         # --- 初期投資・投資回収 ---
         total_ppeak = sum(f["ppeak"] for f in faces)
-        pv_unit = pv_cost_per_kw if pv_cost_per_kw else PV_COST_PER_KW
-        bat_unit = bat_cost_per_kwh if bat_cost_per_kwh else BATTERY_COST_PER_KWH
+        pv_unit = pv_cost_per_kw if pv_cost_per_kw is not None else PV_COST_PER_KW
+        bat_unit = bat_cost_per_kwh if bat_cost_per_kwh is not None else BATTERY_COST_PER_KWH
         pv_investment = total_ppeak * pv_unit
         bat_investment = 0
         if bat_enabled and bat_capacity and bat_capacity > 0:
@@ -1600,7 +1607,7 @@ def run_simulation(
         # 特別高圧受電設備工事費（高圧→特高変更時のみ）
         # 条件: ユーザーが特別高圧を選択 かつ 導入前契約電力が2000kW以下（元は高圧）
         substation_cost = 0
-        sub_unit = substation_cost_per_kva if substation_cost_per_kva else SUBSTATION_COST_PER_KVA
+        sub_unit = substation_cost_per_kva if substation_cost_per_kva is not None else SUBSTATION_COST_PER_KVA
         if is_ehv and cost_before is not None and cost_before['contract_power_kw'] <= 2000:
             substation_cost = cost_before['contract_power_kw'] * sub_unit
             total_investment += substation_cost
@@ -1609,8 +1616,8 @@ def run_simulation(
         subsidy_pv = 0
         subsidy_bat = 0
         if subsidy_enabled:
-            pv_pct = subsidy_pv_pct if subsidy_pv_pct else 0
-            bat_pct = subsidy_bat_pct if subsidy_bat_pct else 0
+            pv_pct = subsidy_pv_pct if subsidy_pv_pct is not None else 0
+            bat_pct = subsidy_bat_pct if subsidy_bat_pct is not None else 0
             subsidy_pv = pv_investment * pv_pct / 100.0
             subsidy_bat = bat_investment * bat_pct / 100.0
         total_subsidy = subsidy_pv + subsidy_bat
@@ -1638,7 +1645,7 @@ def run_simulation(
         if cost_after is not None and cost_before is not None:
             saving = cost_before['annual_total'] - cost_after['annual_total']
             if not no_export and sc_result is not None:
-                actual_sell_price_val = sell_price if sell_price else DEFAULT_SELL_PRICE
+                actual_sell_price_val = sell_price if sell_price is not None else DEFAULT_SELL_PRICE
                 sell_rev = sc_result['annual_export'] * actual_sell_price_val
                 annual_merit = saving + sell_rev
             else:
@@ -1655,7 +1662,7 @@ def run_simulation(
 
         # --- CO2削減量 ---
         if sc_result is not None:
-            ef = co2_factor if co2_factor else CO2_EMISSION_FACTOR
+            ef = co2_factor if co2_factor is not None else CO2_EMISSION_FACTOR
             # 系統購入削減量 = 導入前需要 - 導入後系統購入
             grid_reduction = sc_result['annual_demand'] - sc_result['annual_import']
             co2_reduction = grid_reduction * ef
@@ -1667,8 +1674,8 @@ def run_simulation(
         # --- 事業モデル計算（モードA: リース/PPA） ---
         biz_model = business_model if business_model else "自己所有"
         if biz_model in ("リース", "PPA") and net_investment > 0:
-            n_years = int(contract_years) if contract_years else DEFAULT_CONTRACT_YEARS
-            r = (target_irr if target_irr else DEFAULT_TARGET_IRR) / 100.0
+            n_years = int(contract_years) if contract_years is not None else DEFAULT_CONTRACT_YEARS
+            r = (target_irr if target_irr is not None else DEFAULT_TARGET_IRR) / 100.0
             # 資本回収係数（CRF）で年間リース料を逆算
             if r > 0:
                 crf = r * (1 + r) ** n_years / ((1 + r) ** n_years - 1)
@@ -1722,10 +1729,10 @@ def run_simulation(
 
         # --- MG収益計算（モードB） ---
         if mg_enabled and sc_result is not None and cost_before is not None:
-            mg_dist = mg_line_distance if mg_line_distance else MG_LINE_DISTANCE_KM
-            mg_cost_km = mg_line_cost_per_km if mg_line_cost_per_km else MG_LINE_COST_PER_KM
+            mg_dist = mg_line_distance if mg_line_distance is not None else MG_LINE_DISTANCE_KM
+            mg_cost_km = mg_line_cost_per_km if mg_line_cost_per_km is not None else MG_LINE_COST_PER_KM
             mg_opex_r = (mg_opex_ratio if mg_opex_ratio is not None else MG_OPEX_RATIO) / 100.0
-            mg_period = int(mg_irr_period) if mg_irr_period else MG_IRR_PERIOD
+            mg_period = int(mg_irr_period) if mg_irr_period is not None else MG_IRR_PERIOD
 
             # MG初期投資 = PV+蓄電池 + 自営線
             mg_line_cost = mg_dist * mg_cost_km
@@ -1737,9 +1744,9 @@ def run_simulation(
             # 系統購入→網内売電: 基本料金差額のみ
             defaults_mg = ELECTRICITY_RATE_EHV if is_ehv else ELECTRICITY_RATE_HV
             avg_energy_price = (
-                elec_summer if elec_summer else defaults_mg["energy_charge_summer"]
+                elec_summer if elec_summer is not None else defaults_mg["energy_charge_summer"]
             ) * 0.25 + (
-                elec_other if elec_other else defaults_mg["energy_charge_other"]
+                elec_other if elec_other is not None else defaults_mg["energy_charge_other"]
             ) * 0.75  # 夏季3ヶ月/12ヶ月の加重平均
 
             # PV由来の売電収入（自家消費分 × 電力量単価）
@@ -1820,20 +1827,26 @@ def run_simulation(
         if battery_mode_label == "最適容量探索" and demand_30min is not None and cost_before is not None:
             defaults_cap = ELECTRICITY_RATE_EHV if is_ehv else ELECTRICITY_RATE_HV
             rate_p = dict(
-                basic_charge_per_kw=elec_basic if elec_basic else defaults_cap["basic_charge_per_kw"],
-                energy_charge_summer=elec_summer if elec_summer else defaults_cap["energy_charge_summer"],
-                energy_charge_other=elec_other if elec_other else defaults_cap["energy_charge_other"],
-                power_factor_pct=elec_pf if elec_pf else defaults_cap["power_factor_pct"],
+                basic_charge_per_kw=elec_basic if elec_basic is not None else defaults_cap["basic_charge_per_kw"],
+                energy_charge_summer=elec_summer if elec_summer is not None else defaults_cap["energy_charge_summer"],
+                energy_charge_other=elec_other if elec_other is not None else defaults_cap["energy_charge_other"],
+                power_factor_pct=elec_pf if elec_pf is not None else defaults_cap["power_factor_pct"],
                 fuel_adjustment=elec_fuel if elec_fuel is not None else defaults_cap["fuel_adjustment"],
-                renewable_surcharge=elec_renewable if elec_renewable else defaults_cap["renewable_surcharge"],
+                renewable_surcharge=elec_renewable if elec_renewable is not None else defaults_cap["renewable_surcharge"],
             )
-            bat_eff = bat_efficiency if bat_efficiency else 95
-            bat_mc = bat_max_charge if bat_max_charge else 2.5
-            bat_md = bat_max_discharge if bat_max_discharge else 2.5
+            bat_eff = bat_efficiency if bat_efficiency is not None else 95
+            bat_mc = bat_max_charge if bat_max_charge is not None else 2.5
+            bat_md = bat_max_discharge if bat_max_discharge is not None else 2.5
             bat_smin = bat_soc_min if bat_soc_min is not None else 20
-            bat_smax = bat_soc_max if bat_soc_max else 95
-            sp = sell_price if sell_price else DEFAULT_SELL_PRICE
-            n_yrs = int(contract_years) if contract_years else DEFAULT_CONTRACT_YEARS
+            bat_smax = bat_soc_max if bat_soc_max is not None else 95
+            sp = sell_price if sell_price is not None else DEFAULT_SELL_PRICE
+            n_yrs = int(contract_years) if contract_years is not None else DEFAULT_CONTRACT_YEARS
+
+            # 蓄電池の実質単価（補助金反映）
+            bat_subsidy_pct = 0
+            if subsidy_enabled:
+                bat_subsidy_pct = subsidy_bat_pct if subsidy_bat_pct is not None else 0
+            bat_unit_net = bat_unit * (1 - bat_subsidy_pct / 100.0)
 
             # 段階1: LP一体化
             try:
@@ -1842,7 +1855,7 @@ def run_simulation(
                     efficiency_pct=bat_eff,
                     max_charge_kw=bat_mc, max_discharge_kw=bat_md,
                     soc_min_pct=bat_smin, soc_max_pct=bat_smax,
-                    sell_price=sp, battery_cost_per_kwh=bat_unit, payback_years=n_yrs,
+                    sell_price=sp, battery_cost_per_kwh=bat_unit_net, payback_years=n_yrs,
                     no_export=no_export, **rate_p,
                 )
                 opt_cap = cap_result["optimal_capacity_kwh"]
@@ -1871,7 +1884,7 @@ def run_simulation(
                 payback_opt = total_inv_opt / merit_opt if merit_opt > 0 else 999
                 cf_opt = [-total_inv_opt] + [merit_opt] * n_yrs
                 irr_opt = _calc_irr(cf_opt)
-                ef = co2_factor if co2_factor else CO2_EMISSION_FACTOR
+                ef = co2_factor if co2_factor is not None else CO2_EMISSION_FACTOR
                 co2_opt = (sc_opt['annual_demand'] - sc_opt['annual_import']) * ef
 
                 result_text += f"  P-IRR: {irr_opt*100:.1f}%\n" if irr_opt else ""
@@ -1886,8 +1899,9 @@ def run_simulation(
                     efficiency_pct=bat_eff,
                     max_charge_kw=bat_mc, max_discharge_kw=bat_md,
                     soc_min_pct=bat_smin, soc_max_pct=bat_smax,
-                    sell_price=sp, pv_cost=pv_unit,
-                    battery_cost_per_kwh=bat_unit,
+                    sell_price=sp,
+                    pv_cost=pv_unit * (1 - (subsidy_pv_pct if subsidy_enabled and subsidy_pv_pct else 0) / 100.0),
+                    battery_cost_per_kwh=bat_unit_net,
                     total_ppeak=total_ppeak,
                     co2_factor=ef,
                     cost_before_total=cost_before['annual_total'],
