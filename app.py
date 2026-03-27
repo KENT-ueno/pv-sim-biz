@@ -84,6 +84,16 @@ DEFAULT_DELTA_T = 21.5  # ℃（架台設置形）
 
 MAX_FACES = 8
 
+# === 両面パネルデフォルト値（Phase 6） ===
+BIFACIAL_DEFAULTS = {
+    "bifaciality": 0.75,    # 背面/前面効率比
+    "gcr": 0.4,             # 地面被覆率（パネル高÷列間隔）
+    "height": 2.0,          # パネル中心地上高 [m]
+    "pitch": 5.0,           # 列間隔 [m]
+}
+ALBEDO_NORMAL = 0.2   # 通常（草・土）
+ALBEDO_SNOW = 0.7     # 積雪時（NEDO METPV-20定義値）
+
 # === 高圧電気料金デフォルト値（東京電力EP 高圧電力A） ===
 # 参考: https://www.tepco.co.jp/ep/corporate/plan_h/plan06.html
 ELECTRICITY_RATE_HV = {  # 高圧（東京電力EP 高圧電力A）
@@ -186,6 +196,57 @@ def load_from_db(point_no):
     temp_df[h_cols] = temp_df[h_cols].replace(8888, np.nan)
 
     return lat, lon, ghi_df, temp_df
+
+
+def load_snow_depth(point_no):
+    """
+    DBから指定地点の積雪深（要素9）を読み込む。
+    Returns:
+        snow_df: DataFrame (365行 × 24列: h01-h24) 単位: 1cm、またはデータなしならNone
+    """
+    if not os.path.exists(DB_PATH):
+        return None
+    conn = sqlite3.connect(DB_PATH)
+    h_cols = ", ".join([f"h{i:02d}" for i in range(1, 25)])
+    rows = conn.execute(
+        f"SELECT month, day, {h_cols} FROM radiation "
+        f"WHERE point_no = ? AND element_no = 9 ORDER BY day_of_year",
+        (point_no,)
+    ).fetchall()
+    conn.close()
+    if not rows:
+        return None
+    cols = ["month", "day"] + [f"h{i:02d}" for i in range(1, 25)]
+    snow_df = pd.DataFrame(rows, columns=cols)
+    # DB内の欠測値(8888)をNaNに変換
+    h_data_cols = [f"h{i:02d}" for i in range(1, 25)]
+    snow_df[h_data_cols] = snow_df[h_data_cols].replace(8888, np.nan)
+    return snow_df
+
+
+def build_albedo_series(snow_df):
+    """
+    積雪深DataFrameからalbedo時系列（30分×365日）を生成する。
+    積雪深 > 0 → 0.7（積雪）、それ以外 → 0.2（通常）。
+    Returns:
+        albedo_flat: np.array (365*48,) — 30分単位のalbedo値
+    """
+    if snow_df is None:
+        return np.full(365 * 48, ALBEDO_NORMAL)
+
+    n_days = len(snow_df)
+    albedo_30min = np.full((n_days, 48), ALBEDO_NORMAL)
+    h_cols = [f"h{i:02d}" for i in range(1, 25)]
+
+    for i in range(n_days):
+        for j, col in enumerate(h_cols):
+            val = snow_df.iloc[i][col]
+            # 積雪深 > 0 なら積雪albedo（NaN/Noneは通常扱い）
+            is_snow = (val is not None and not np.isnan(val) and val > 0)
+            albedo_30min[i, j * 2] = ALBEDO_SNOW if is_snow else ALBEDO_NORMAL
+            albedo_30min[i, j * 2 + 1] = ALBEDO_SNOW if is_snow else ALBEDO_NORMAL
+
+    return albedo_30min.flatten()
 
 
 def load_from_csv(file_obj):
@@ -385,8 +446,26 @@ def prepare_30min_data(ghi_df, temp_df):
 # pvlibによるPOA変換
 # ============================================================
 
-def compute_poa_30min(ghi_30min, lat, lon, surface_tilt, surface_azimuth):
-    """30分GHI配列からpvlibを使ってPOA（傾斜面日射量）を計算する。"""
+def compute_poa_30min(ghi_30min, lat, lon, surface_tilt, surface_azimuth,
+                      bifacial=False, bifaciality=0.75, gcr=0.4,
+                      height=2.0, pitch=5.0, albedo_flat=None):
+    """
+    30分GHI配列からpvlibを使ってPOA（傾斜面日射量）を計算する。
+
+    Args:
+        ghi_30min: np.array (365, 48) [kWh/m2 per 30min interval]
+        lat, lon: 緯度経度
+        surface_tilt: 傾斜角 [度]
+        surface_azimuth: 方位角 [度] (北=0, 時計回り)
+        bifacial: 両面パネルモード
+        bifaciality: 背面/前面効率比（両面時のみ）
+        gcr: 地面被覆率（両面時のみ）
+        height: パネル中心地上高 [m]（両面時のみ）
+        pitch: 列間隔 [m]（両面時のみ）
+        albedo_flat: np.array (365*48,) albedo時系列（両面時のみ）
+    Returns:
+        poa_30min: np.array (365, 48) [kWh/m2 per 30min interval]
+    """
     if not HAS_PVLIB:
         return ghi_30min.copy()
 
@@ -407,16 +486,41 @@ def compute_poa_30min(ghi_30min, lat, lon, surface_tilt, surface_azimuth):
     dni = erbs["dni"].fillna(0).clip(lower=0)
     dhi = erbs["dhi"].fillna(0).clip(lower=0)
 
-    poa_components = pvlib.irradiance.get_total_irradiance(
-        surface_tilt=surface_tilt,
-        surface_azimuth=surface_azimuth,
-        solar_zenith=solpos["zenith"],
-        solar_azimuth=solpos["azimuth"],
-        dni=dni,
-        ghi=ghi_series,
-        dhi=dhi,
-    )
-    poa_global = poa_components["poa_global"].fillna(0).clip(lower=0)
+    if bifacial:
+        # 両面パネル: infinite_sheds モデル
+        from pvlib.bifacial.infinite_sheds import get_irradiance as get_bifacial_irradiance
+
+        albedo_series = pd.Series(
+            albedo_flat if albedo_flat is not None else np.full(total_slots, ALBEDO_NORMAL),
+            index=times,
+        )
+        result = get_bifacial_irradiance(
+            surface_tilt=surface_tilt,
+            surface_azimuth=surface_azimuth,
+            solar_zenith=solpos["zenith"],
+            solar_azimuth=solpos["azimuth"],
+            gcr=gcr,
+            height=height,
+            pitch=pitch,
+            ghi=ghi_series,
+            dhi=dhi,
+            dni=dni,
+            albedo=albedo_series,
+            bifaciality=bifaciality,
+        )
+        poa_global = result["poa_global"].fillna(0).clip(lower=0)
+    else:
+        # 片面パネル: 従来の get_total_irradiance
+        poa_components = pvlib.irradiance.get_total_irradiance(
+            surface_tilt=surface_tilt,
+            surface_azimuth=surface_azimuth,
+            solar_zenith=solpos["zenith"],
+            solar_azimuth=solpos["azimuth"],
+            dni=dni,
+            ghi=ghi_series,
+            dhi=dhi,
+        )
+        poa_global = poa_components["poa_global"].fillna(0).clip(lower=0)
 
     poa_kwh = poa_global.values / 1000.0 / 2.0
     poa_30min = poa_kwh.reshape(n_days, 48)
@@ -431,7 +535,9 @@ def compute_poa_30min(ghi_30min, lat, lon, surface_tilt, surface_azimuth):
 def calculate_generation(
     lat, lon, ghi_df, temp_df,
     faces, KHD, KPD, KPM, KPA, eta_ino,
-    alpha_pct, delta_t
+    alpha_pct, delta_t,
+    bifacial=False, bifaciality=0.75, gcr=0.4,
+    height=2.0, pitch=5.0, albedo_flat=None,
 ):
     """メイン発電量計算関数。"""
     K_prime = KHD * KPD * KPM * KPA * eta_ino
@@ -443,7 +549,12 @@ def calculate_generation(
     for face in faces:
         azimuth = face.get("azimuth", ORIENTATION_TO_AZIMUTH.get(face["orientation"], 180))
         tilt = face["tilt"]
-        poa = compute_poa_30min(ghi_30min, lat, lon, tilt, azimuth)
+        poa = compute_poa_30min(
+            ghi_30min, lat, lon, tilt, azimuth,
+            bifacial=bifacial, bifaciality=bifaciality,
+            gcr=gcr, height=height, pitch=pitch,
+            albedo_flat=albedo_flat,
+        )
         face_poa_list.append(poa)
 
     total_gen = np.zeros((n_days, 48))
@@ -1382,6 +1493,8 @@ def run_simulation(
     co2_factor,
     business_model, contract_years, target_irr,
     mg_enabled, mg_line_distance, mg_line_cost_per_km, mg_opex_ratio, mg_irr_period,
+    bifacial_enabled, bifaciality_val, gcr_val, height_val, pitch_val,
+    snow_albedo_enabled,
     facility_args, face_args,
     num_facilities=1, num_faces=1,
     display_month=1, display_day=1,
@@ -1431,11 +1544,26 @@ def run_simulation(
         if not faces:
             return None, None, None, None, "エラー: 有効な面設定がありません（Ppeak > 0の面が必要です）", "", None
 
+        # --- 両面パネル: albedo時系列の準備 ---
+        albedo_flat = None
+        if bifacial_enabled:
+            if snow_albedo_enabled and csv_file is None and station_choice:
+                snow_df = load_snow_depth(point_no)
+                albedo_flat = build_albedo_series(snow_df)
+            else:
+                albedo_flat = np.full(365 * 48, ALBEDO_NORMAL)
+
         # --- 計算実行 ---
         result = calculate_generation(
             lat, lon, ghi_df, temp_df,
             faces, KHD, KPD, KPM, KPA, eta_ino,
-            alpha_pct, delta_t
+            alpha_pct, delta_t,
+            bifacial=bool(bifacial_enabled),
+            bifaciality=float(bifaciality_val) if bifaciality_val is not None else BIFACIAL_DEFAULTS["bifaciality"],
+            gcr=float(gcr_val) if gcr_val is not None else BIFACIAL_DEFAULTS["gcr"],
+            height=float(height_val) if height_val is not None else BIFACIAL_DEFAULTS["height"],
+            pitch=float(pitch_val) if pitch_val is not None else BIFACIAL_DEFAULTS["pitch"],
+            albedo_flat=albedo_flat,
         )
 
         # --- 自家消費計算 / 蓄電池 ---
@@ -1493,6 +1621,9 @@ def run_simulation(
         # --- 結果テキスト ---
         result_text = f"年間発電量: {result['annual']:.1f} kWh/年\n"
         result_text += f"K' = {result['K_prime']:.4f}\n"
+        if bifacial_enabled:
+            bif_val = float(bifaciality_val) if bifaciality_val is not None else BIFACIAL_DEFAULTS["bifaciality"]
+            result_text += f"パネルタイプ: 両面（bifaciality={bif_val:.2f}）\n"
         result_text += "\n面別年間発電量（PCS制限後）:\n"
         for i, val in enumerate(result['face_annual']):
             pcs_str = f"{faces[i]['pcs_limit_kw']} kW" if faces[i].get('pcs_limit_kw') else "制限なし"
@@ -1811,6 +1942,14 @@ def run_simulation(
         for i, face in enumerate(faces):
             pcs_str = f"{face['pcs_limit_kw']} kW" if face.get('pcs_limit_kw') else "制限なし"
             debug_text += f"  面{i+1}: Ppeak={face['ppeak']}kW, {face['orientation']}({face['azimuth']:.1f}°), 傾斜{face['tilt']}°, PCS={pcs_str}\n"
+        if bifacial_enabled:
+            debug_text += f"両面パネル: ON (bifaciality={float(bifaciality_val) if bifaciality_val is not None else BIFACIAL_DEFAULTS['bifaciality']}, "
+            debug_text += f"GCR={float(gcr_val) if gcr_val is not None else BIFACIAL_DEFAULTS['gcr']}, "
+            debug_text += f"height={float(height_val) if height_val is not None else BIFACIAL_DEFAULTS['height']}m, "
+            debug_text += f"pitch={float(pitch_val) if pitch_val is not None else BIFACIAL_DEFAULTS['pitch']}m)\n"
+            debug_text += f"積雪albedo切替: {'ON' if snow_albedo_enabled else 'OFF'}\n"
+        else:
+            debug_text += "両面パネル: OFF（片面モード）\n"
         debug_text += f"月別発電量:\n"
         for m in range(1, 13):
             debug_text += f"  {m:2d}月: {result['monthly'].get(m, 0):8.1f} kWh\n"
@@ -2234,6 +2373,42 @@ def build_ui():
                     outputs=[battery_cap_row],
                 )
 
+                # --- 両面パネル設定 ---
+                gr.Markdown("### ☀️ 両面パネル設定")
+                bifacial_enabled_input = gr.Checkbox(label="両面パネルを使用", value=False)
+                with gr.Column(visible=False) as bifacial_settings_group:
+                    with gr.Row():
+                        bifaciality_input = gr.Number(
+                            label="背面効率比（bifaciality）",
+                            value=BIFACIAL_DEFAULTS["bifaciality"], precision=2,
+                        )
+                        gcr_input = gr.Number(
+                            label="GCR（地面被覆率）",
+                            value=BIFACIAL_DEFAULTS["gcr"], precision=2,
+                        )
+                    with gr.Row():
+                        height_input = gr.Number(
+                            label="パネル中心地上高 [m]",
+                            value=BIFACIAL_DEFAULTS["height"], precision=1,
+                        )
+                        pitch_input = gr.Number(
+                            label="列間隔（pitch）[m]",
+                            value=BIFACIAL_DEFAULTS["pitch"], precision=1,
+                        )
+                    snow_albedo_input = gr.Checkbox(
+                        label="積雪アルベド自動切替（積雪時0.7 / 通常0.2）", value=True,
+                    )
+                    gr.Markdown(
+                        "<small>bifaciality目安: TOPCon 0.70〜0.80 / HJT 0.85〜0.95。"
+                        "GCR = パネル高さ ÷ 列間隔（0.3〜0.5が一般的）</small>"
+                    )
+
+                bifacial_enabled_input.change(
+                    fn=lambda x: gr.update(visible=x),
+                    inputs=[bifacial_enabled_input],
+                    outputs=[bifacial_settings_group],
+                )
+
                 # --- アレイ設定 ---
                 gr.Markdown("### 🔲 太陽電池アレイ設定")
                 num_faces_input = gr.Slider(
@@ -2350,14 +2525,15 @@ def build_ui():
 
         # --- 計算ボタンのコールバック ---
         # 入力の構成:
-        #   base (41): station, csv, demand_csv, KHD..delta_t(7),
+        #   base (48): station, csv, demand_csv, KHD..delta_t(7),
         #              bat_enabled(1), bat_mode(1), bat_capacity..bat_soc_max(6),
         #              elec_basic..elec_renewable(6), contract_type(1),
         #              sell_mode(1), sell_price(1),
-        #              pv_cost(1), bat_cost(1), subsidy_enabled(1), subsidy_pv(1), subsidy_bat(1),
+        #              pv_cost(1), bat_cost(1), substation_cost(1), subsidy_enabled(1), subsidy_pv(1), subsidy_bat(1),
         #              co2_factor(1),
         #              business_model(1), contract_years(1), target_irr(1),
-        #              mg_enabled(1), mg_line_distance(1), mg_line_cost(1), mg_opex(1), mg_irr_period(1) = 41
+        #              mg_enabled(1), mg_line_distance(1), mg_line_cost(1), mg_opex(1), mg_irr_period(1),
+        #              bifacial_enabled(1), bifaciality(1), gcr(1), height(1), pitch(1), snow_albedo(1) = 48
         #   facility_components: MAX_FACILITIES * 3 = 18
         #   face_components: MAX_FACES * 5 = 40
         #   display: num_facilities, month, day, num_faces = 4
@@ -2380,10 +2556,12 @@ def build_ui():
             business_model_input, contract_years_input, target_irr_input,
             mg_enabled_input, mg_line_distance_input, mg_line_cost_input,
             mg_opex_input, mg_irr_period_input,
+            bifacial_enabled_input, bifaciality_input, gcr_input, height_input, pitch_input,
+            snow_albedo_input,
         ] + facility_components + face_components
 
         def on_click(*args):
-            n_base = 42
+            n_base = 48
             n_fac = MAX_FACILITIES * 3   # 18
             n_face = MAX_FACES * 5       # 40
 

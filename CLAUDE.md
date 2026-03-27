@@ -285,9 +285,13 @@ CO2削減量: ●● t-CO2/年
   - 系統買電→網内売電: 基本料金の差額のみが収益（電力量料金は相殺）
 - P-IRR算出、年次キャッシュフロー表示
 
-### Phase 6: 両面パネル＋積雪反射（野建て/発電シミュレーター用）
-- pvlib.bifacialモジュールで裏面日射量計算
+### Phase 6: 両面パネル＋積雪反射 ✅
+- pvlib.bifacial.infinite_shedsモジュールで裏面日射量計算
 - NEDO METPV-20の積雪深データ（要素番号9）で動的アルベド切替（積雪時0.7、通常0.2）
+- 両面パネルON/OFFチェックボックス（デフォルトOFF、片面動作に影響なし）
+- パラメータ: bifaciality(0.75), GCR(0.4), 地上高(2.0m), pitch(5.0m)
+- solarfactorsパッケージ追加（requirements.txt）
+- pv-sim-genから移植、compute_poa_30minに両面分岐を追加
 
 ---
 
