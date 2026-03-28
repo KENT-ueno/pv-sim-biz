@@ -368,9 +368,12 @@ def load_combined_demand(facility_args, num_facilities, custom_csv=None):
         num_facilities: 表示中の施設数
         custom_csv: カスタムCSVファイル（追加合算用）
     Returns:
-        np.array (365, 48) or None（需要データなし時）
+        tuple: (combined, individual_demands)
+            combined: np.array (365, 48) or None（需要データなし時）
+            individual_demands: list of np.array (365, 48)（個別施設の需要データ）
     """
     combined = None
+    individual_demands = []  # 個別施設の需要データを保持（MG基本料金計算用）
 
     for i in range(int(num_facilities)):
         idx = i * 3
@@ -387,6 +390,7 @@ def load_combined_demand(facility_args, num_facilities, custom_csv=None):
 
         demand = load_building_demand(btype, float(area), int(count))
         if demand is not None:
+            individual_demands.append(demand)
             if combined is None:
                 combined = demand.copy()
             else:
@@ -396,12 +400,13 @@ def load_combined_demand(facility_args, num_facilities, custom_csv=None):
     if custom_csv is not None:
         custom_demand = load_custom_demand_csv(custom_csv)
         if custom_demand is not None:
+            individual_demands.append(custom_demand)
             if combined is None:
                 combined = custom_demand
             else:
                 combined += custom_demand
 
-    return combined
+    return combined, individual_demands
 
 
 # ============================================================
@@ -1513,7 +1518,7 @@ def run_simulation(
             return None, None, None, None, "エラー: 地点を選択するかCSVをアップロードしてください", "", None
 
         # --- 需要データ読み込み（複数施設合算） ---
-        demand_30min = load_combined_demand(
+        demand_30min, individual_demands = load_combined_demand(
             facility_args, num_facilities, custom_csv=demand_custom_csv,
         )
 
@@ -1802,8 +1807,22 @@ def run_simulation(
             result_text += f"  系統購入削減量: {grid_reduction:,.1f} kWh/年\n"
             result_text += f"  CO2削減量: {co2_reduction:,.3f} t-CO2/年\n"
 
-        # --- 事業モデル計算（モードA: リース/PPA） ---
+        # --- MG投資額の事前計算（事業モデル計算で使用） ---
+        mg_line_cost = 0
+        mg_total_investment = net_investment
+        mg_opex_r = 0
+        mg_annual_opex = 0
+        if mg_enabled:
+            mg_dist = mg_line_distance if mg_line_distance is not None else MG_LINE_DISTANCE_KM
+            mg_cost_km = mg_line_cost_per_km if mg_line_cost_per_km is not None else MG_LINE_COST_PER_KM
+            mg_opex_r = (mg_opex_ratio if mg_opex_ratio is not None else MG_OPEX_RATIO) / 100.0
+            mg_line_cost = mg_dist * mg_cost_km
+            mg_total_investment = net_investment + mg_line_cost
+            mg_annual_opex = mg_total_investment * mg_opex_r
+
+        # --- 事業モデル計算（リース/PPA） ---
         biz_model = business_model if business_model else "自己所有"
+        ppa_price = None  # MG収益計算で参照
         if biz_model in ("リース", "PPA") and net_investment > 0:
             n_years = int(contract_years) if contract_years is not None else DEFAULT_CONTRACT_YEARS
             r = (target_irr if target_irr is not None else DEFAULT_TARGET_IRR) / 100.0
@@ -1812,11 +1831,22 @@ def run_simulation(
                 crf = r * (1 + r) ** n_years / ((1 + r) ** n_years - 1)
             else:
                 crf = 1.0 / n_years
-            annual_lease = net_investment * crf
+            # A案: MG有効時はMG投資全額（PV+蓄電池+自営線）をベースに、運営コストも含めて逆算
+            if mg_enabled:
+                lease_base_investment = mg_total_investment
+                annual_lease = lease_base_investment * crf + mg_annual_opex
+            else:
+                lease_base_investment = net_investment
+                annual_lease = lease_base_investment * crf
 
             result_text += f"\n══ 事業モデル: {biz_model} ══\n"
             result_text += f"【事業者側パラメータ】\n"
-            result_text += f"  実質投資額: {net_investment:,.0f} 円\n"
+            result_text += f"  投資ベース: {lease_base_investment:,.0f} 円"
+            if mg_enabled:
+                result_text += f"（MG投資全額）"
+            result_text += f"\n"
+            if mg_enabled and mg_annual_opex > 0:
+                result_text += f"  年間運営コスト: {mg_annual_opex:,.0f} 円/年（単価に織込み済）\n"
             result_text += f"  契約年数: {n_years} 年\n"
             result_text += f"  目標P-IRR: {r*100:.1f}%\n"
 
@@ -1860,19 +1890,29 @@ def run_simulation(
 
         # --- MG収益計算（モードB） ---
         if mg_enabled and sc_result is not None and cost_before is not None:
-            mg_dist = mg_line_distance if mg_line_distance is not None else MG_LINE_DISTANCE_KM
-            mg_cost_km = mg_line_cost_per_km if mg_line_cost_per_km is not None else MG_LINE_COST_PER_KM
-            mg_opex_r = (mg_opex_ratio if mg_opex_ratio is not None else MG_OPEX_RATIO) / 100.0
             mg_period = int(mg_irr_period) if mg_irr_period is not None else MG_IRR_PERIOD
 
-            # MG初期投資 = PV+蓄電池 + 自営線
-            mg_line_cost = mg_dist * mg_cost_km
-            mg_total_investment = net_investment + mg_line_cost
-            mg_annual_opex = mg_total_investment * mg_opex_r
+            # --- 基本料金の束ねメリット計算 ---
+            # 個別施設がそれぞれ系統契約した場合の基本料金合計 vs MG合算の基本料金
+            individual_basic_total = 0
+            if individual_demands and len(individual_demands) > 1:
+                for ind_demand in individual_demands:
+                    ind_cost = calc_electricity_cost(
+                        ind_demand, result["month_day"], **rate_params
+                    )
+                    individual_basic_total += ind_cost['annual_basic']
+            else:
+                # 施設1つの場合は束ねメリットなし
+                individual_basic_total = cost_before['annual_basic']
 
-            # MG収益:
-            # PV発電→網内売電: 自家消費量 × 電力量単価 = 収益（仕入れゼロ）
-            # 系統購入→網内売電: 基本料金差額のみ
+            # MG合算後の基本料金（PV導入後）
+            mg_combined_basic = cost_after['annual_basic'] if cost_after is not None else cost_before['annual_basic']
+            # 束ねメリット = 個別基本料金合計 - MG合算後基本料金（PV導入効果含む）
+            basic_saving = individual_basic_total - mg_combined_basic
+
+            # --- PV売電収入（網内） ---
+            # PPA選択時: PPA単価で計算（MG投資全額を回収する単価）
+            # それ以外: 高圧電力量単価の加重平均で計算
             defaults_mg = ELECTRICITY_RATE_EHV if is_ehv else ELECTRICITY_RATE_HV
             avg_energy_price = (
                 elec_summer if elec_summer is not None else defaults_mg["energy_charge_summer"]
@@ -1880,13 +1920,14 @@ def run_simulation(
                 elec_other if elec_other is not None else defaults_mg["energy_charge_other"]
             ) * 0.75  # 夏季3ヶ月/12ヶ月の加重平均
 
-            # PV由来の売電収入（自家消費分 × 電力量単価）
-            pv_revenue = sc_result['annual_self'] * avg_energy_price
-            # 基本料金差額（MG内集約によるスケールメリット）
-            if cost_after is not None:
-                basic_saving = cost_before['annual_basic'] - cost_after['annual_basic']
+            if ppa_price is not None:
+                mg_sell_price = ppa_price
+                mg_price_label = f"PPA単価 {ppa_price:.2f}円/kWh"
             else:
-                basic_saving = 0
+                mg_sell_price = avg_energy_price
+                mg_price_label = f"電力量単価加重平均 {avg_energy_price:.2f}円/kWh"
+
+            pv_revenue = sc_result['annual_self'] * mg_sell_price
             mg_annual_revenue = pv_revenue + basic_saving
             mg_annual_cashflow = mg_annual_revenue - mg_annual_opex
 
@@ -1896,8 +1937,13 @@ def run_simulation(
             result_text += f"  自営線: {mg_dist:.1f} km × {mg_cost_km:,.0f} 円/km = {mg_line_cost:,.0f} 円\n"
             result_text += f"  MG投資合計: {mg_total_investment:,.0f} 円\n"
             result_text += f"【年間収支】\n"
-            result_text += f"  PV売電収入（網内）: {pv_revenue:,.0f} 円/年\n"
-            result_text += f"  基本料金差額: {basic_saving:,.0f} 円/年\n"
+            result_text += f"  PV売電収入（網内）: {pv_revenue:,.0f} 円/年（{mg_price_label}）\n"
+            if individual_demands and len(individual_demands) > 1:
+                result_text += f"  基本料金差額（束ねメリット含む）: {basic_saving:,.0f} 円/年\n"
+                result_text += f"    個別契約時基本料金合計: {individual_basic_total:,.0f} 円/年\n"
+                result_text += f"    MG合算後基本料金: {mg_combined_basic:,.0f} 円/年\n"
+            else:
+                result_text += f"  基本料金差額: {basic_saving:,.0f} 円/年\n"
             result_text += f"  年間収益合計: {mg_annual_revenue:,.0f} 円/年\n"
             result_text += f"  年間運営コスト: {mg_annual_opex:,.0f} 円/年（投資額の{mg_opex_r*100:.1f}%）\n"
             result_text += f"  年間キャッシュフロー: {mg_annual_cashflow:,.0f} 円/年\n"
