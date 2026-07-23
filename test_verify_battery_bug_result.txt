@@ -5,11 +5,12 @@ pv-sim-biz LP「パススルー乱用」バグ波及チェック
 【観点A】LP定式化の網羅チェック（構造解析）
 ----------------------------------------------------------------------
   app.py内の LpProblem インスタンス:
-    1. optimize_battery        L787 / LpProblem L826
-    2. optimize_battery_capacity L949 / LpProblem L983
+    1. optimize_battery
+    2. optimize_battery_capacity
 
-  両LPとも mutual exclusion 制約 `ch[t] + dc[t] <= max_power_per_slot`
-  が**未実装**である（pv-sim-fipと同じパターン）。
+  mutual exclusion 制約 `ch[t] + dc[t] <= max_power_per_slot`: 2箇所（期待: 2）
+  パススルー禁止制約 `ge[t] + ct[t] <= gen[t] + dc[t]`      : 2箇所（期待: 2）
+  → 両LPに実装済み（2026-07-23 Fable 5レビューで追加）
 
   ただしpv-sim-bizの目的関数:
     minimize: 基本料金 + Σ(grid_import * unit_price) - Σ(grid_export * sell_price)
@@ -21,12 +22,11 @@ pv-sim-biz LP「パススルー乱用」バグ波及チェック
     FIT利用なし        : 8.50 円/kWh
 
   → 買電 > 売電 のため『grid購入→充電→放電→売電』のアービトラージは赤字
-  → SOC遷移 `+ch*eff - dc/eff` のためパススルーは SOC を消費（純損失）
-  理論的にはパススルーは LP 最適解にならないはず。実機テストで確認する。
+  → さらに制約でパススルー・同時充放電を構造的に禁止済み。実機テストで確認する。
 
 【テストデータ準備】
 ----------------------------------------------------------------------
-  PV: 500kW, 年間発電 666524.9 kWh
+  PV: 500kW, 年間発電 635343.5 kWh
   需要: 役所4500m2 x 1棟, 年間需要 278753.5 kWh
 
 【観点E】optimize_battery のSOC物理一貫性チェック
@@ -36,11 +36,11 @@ pv-sim-biz LP「パススルー乱用」バグ波及チェック
     soc<min          : 0
     both_pos (ch&dc) : 0  ← パススルー残党
     pcs_violation    : 0  ← mutual exclusion違反
-    cycles/day       : 0.784  (健全なら ≤2)
+    cycles/day       : 0.778  (健全なら ≤2)
     terminal SOC ok  : True
-    annual_charge    : 2861.8 kWh/年
-    annual_discharge : 2582.8 kWh/年
-    charge/cap ratio : 286.2  (= 2 × cycles/day × 365)
+    annual_charge    : 2839.6 kWh/年
+    annual_discharge : 2562.8 kWh/年
+    charge/cap ratio : 284.0  (= 2 × cycles/day × 365)
     ✓ OK
 
   [mid/FIT19/export] cap=  100.00 kWh
@@ -48,11 +48,11 @@ pv-sim-biz LP「パススルー乱用」バグ波及チェック
     soc<min          : 0
     both_pos (ch&dc) : 0  ← パススルー残党
     pcs_violation    : 0  ← mutual exclusion違反
-    cycles/day       : 0.743  (健全なら ≤2)
+    cycles/day       : 0.739  (健全なら ≤2)
     terminal SOC ok  : True
-    annual_charge    : 27128.0 kWh/年
-    annual_discharge : 24483.1 kWh/年
-    charge/cap ratio : 271.3  (= 2 × cycles/day × 365)
+    annual_charge    : 26987.4 kWh/年
+    annual_discharge : 24356.2 kWh/年
+    charge/cap ratio : 269.9  (= 2 × cycles/day × 365)
     ✓ OK
 
   [large/FIT19/export] cap= 1000.00 kWh
@@ -60,11 +60,11 @@ pv-sim-biz LP「パススルー乱用」バグ波及チェック
     soc<min          : 0
     both_pos (ch&dc) : 0  ← パススルー残党
     pcs_violation    : 0  ← mutual exclusion違反
-    cycles/day       : 0.376  (健全なら ≤2)
+    cycles/day       : 0.371  (健全なら ≤2)
     terminal SOC ok  : True
-    annual_charge    : 137398.2 kWh/年
-    annual_discharge : 124001.9 kWh/年
-    charge/cap ratio : 137.4  (= 2 × cycles/day × 365)
+    annual_charge    : 135256.8 kWh/年
+    annual_discharge : 122069.3 kWh/年
+    charge/cap ratio : 135.3  (= 2 × cycles/day × 365)
     ✓ OK
 
   [mid/sell8.5/export] cap=  100.00 kWh
@@ -72,11 +72,11 @@ pv-sim-biz LP「パススルー乱用」バグ波及チェック
     soc<min          : 0
     both_pos (ch&dc) : 0  ← パススルー残党
     pcs_violation    : 0  ← mutual exclusion違反
-    cycles/day       : 0.743  (健全なら ≤2)
+    cycles/day       : 0.739  (健全なら ≤2)
     terminal SOC ok  : True
-    annual_charge    : 27128.0 kWh/年
-    annual_discharge : 24483.1 kWh/年
-    charge/cap ratio : 271.3  (= 2 × cycles/day × 365)
+    annual_charge    : 26987.4 kWh/年
+    annual_discharge : 24356.2 kWh/年
+    charge/cap ratio : 269.9  (= 2 × cycles/day × 365)
     ✓ OK
 
   [mid/FIT19/no_export] cap=  100.00 kWh
@@ -84,11 +84,11 @@ pv-sim-biz LP「パススルー乱用」バグ波及チェック
     soc<min          : 0
     both_pos (ch&dc) : 0  ← パススルー残党
     pcs_violation    : 0  ← mutual exclusion違反
-    cycles/day       : 0.743  (健全なら ≤2)
+    cycles/day       : 0.739  (健全なら ≤2)
     terminal SOC ok  : True
-    annual_charge    : 27128.0 kWh/年
-    annual_discharge : 24483.1 kWh/年
-    charge/cap ratio : 271.3  (= 2 × cycles/day × 365)
+    annual_charge    : 26987.4 kWh/年
+    annual_discharge : 24356.2 kWh/年
+    charge/cap ratio : 269.9  (= 2 × cycles/day × 365)
     ✓ OK
 
   [large/FIT19/no_export] cap= 1000.00 kWh
@@ -96,49 +96,49 @@ pv-sim-biz LP「パススルー乱用」バグ波及チェック
     soc<min          : 0
     both_pos (ch&dc) : 0  ← パススルー残党
     pcs_violation    : 0  ← mutual exclusion違反
-    cycles/day       : 0.376  (健全なら ≤2)
+    cycles/day       : 0.371  (健全なら ≤2)
     terminal SOC ok  : True
-    annual_charge    : 137398.2 kWh/年
-    annual_discharge : 124001.9 kWh/年
-    charge/cap ratio : 137.4  (= 2 × cycles/day × 365)
+    annual_charge    : 135256.8 kWh/年
+    annual_discharge : 122069.3 kWh/年
+    charge/cap ratio : 135.3  (= 2 × cycles/day × 365)
     ✓ OK
 
 【観点G】optimize_battery_capacity の境界解チェック
 ----------------------------------------------------------------------
-  [FIT19] optimal_capacity_kwh = 10.06 kWh
+  [FIT19] optimal_capacity_kwh = 10.07 kWh
     ✓ 内点解
 
-  [verify_FIT19] cap=   10.06 kWh
-    soc>max          : 0
-    soc<min          : 0
-    both_pos (ch&dc) : 0  ← パススルー残党
-    pcs_violation    : 0  ← mutual exclusion違反
-    cycles/day       : 0.784  (健全なら ≤2)
-    terminal SOC ok  : True
-    annual_charge    : 2877.7 kWh/年
-    annual_discharge : 2597.2 kWh/年
-    charge/cap ratio : 286.2  (= 2 × cycles/day × 365)
-    ✓ OK
-
-  [売電なし] optimal_capacity_kwh = 16.58 kWh
-    ✓ 内点解
-
-  [verify_売電なし] cap=   16.58 kWh
+  [verify_FIT19] cap=   10.07 kWh
     soc>max          : 0
     soc<min          : 0
     both_pos (ch&dc) : 0  ← パススルー残党
     pcs_violation    : 0  ← mutual exclusion違反
     cycles/day       : 0.778  (健全なら ≤2)
     terminal SOC ok  : True
-    annual_charge    : 4705.2 kWh/年
-    annual_discharge : 4246.4 kWh/年
+    annual_charge    : 2858.0 kWh/年
+    annual_discharge : 2579.3 kWh/年
     charge/cap ratio : 283.9  (= 2 × cycles/day × 365)
+    ✓ OK
+
+  [売電なし] optimal_capacity_kwh = 16.71 kWh
+    ✓ 内点解
+
+  [verify_売電なし] cap=   16.71 kWh
+    soc>max          : 0
+    soc<min          : 0
+    both_pos (ch&dc) : 0  ← パススルー残党
+    pcs_violation    : 0  ← mutual exclusion違反
+    cycles/day       : 0.772  (健全なら ≤2)
+    terminal SOC ok  : True
+    annual_charge    : 4706.4 kWh/年
+    annual_discharge : 4247.5 kWh/年
+    charge/cap ratio : 281.6  (= 2 × cycles/day × 365)
     ✓ OK
 
 【観点B】ルールベース simulate_battery の整合性
 ----------------------------------------------------------------------
   ルールベースのboth_pos: 0 (構造上0のはず)
-  年間充電: 27110.9, 年間放電: 24467.6
+  年間充電: 26971.4, 年間放電: 24341.7
   ✓ OK（ルールベースは if/else 構造で物理的にパススルー不可）
 
 【観点C】LP外で蓄電池あり計算をしている箇所

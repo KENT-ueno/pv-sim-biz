@@ -458,7 +458,8 @@ def compute_poa_30min(ghi_30min, lat, lon, surface_tilt, surface_azimuth,
     30分GHI配列からpvlibを使ってPOA（傾斜面日射量）を計算する。
 
     Args:
-        ghi_30min: np.array (365, 48) [kWh/m2 per 30min interval]
+        ghi_30min: np.array (365, 48) [kW/m2] 30分平均日射強度
+                   （毎時kWh値を線形補間した値。大きさは平均kWに等しい）
         lat, lon: 緯度経度
         surface_tilt: 傾斜角 [度]
         surface_azimuth: 方位角 [度] (北=0, 時計回り)
@@ -469,7 +470,7 @@ def compute_poa_30min(ghi_30min, lat, lon, surface_tilt, surface_azimuth,
         pitch: 列間隔 [m]（両面時のみ）
         albedo_flat: np.array (365*48,) albedo時系列（両面時のみ）
     Returns:
-        poa_30min: np.array (365, 48) [kWh/m2 per 30min interval]
+        poa_30min: np.array (365, 48) [kW/m2] 傾斜面30分平均日射強度
     """
     if not HAS_PVLIB:
         return ghi_30min.copy()
@@ -481,7 +482,9 @@ def compute_poa_30min(ghi_30min, lat, lon, surface_tilt, surface_azimuth,
         start="2023-01-01 00:00", periods=total_slots, freq="30min", tz="Asia/Tokyo"
     )
 
-    ghi_flat = ghi_30min.flatten() * 2.0 * 1000.0
+    # kW/m2 → W/m2（実際の日射強度をそのままpvlibに渡す。
+    # ×2000にすると晴天指数ktが2倍で評価されErbsの直達/散乱分離が歪む）
+    ghi_flat = ghi_30min.flatten() * 1000.0
     ghi_series = pd.Series(ghi_flat, index=times)
 
     site = pvlib.location.Location(lat, lon, tz="Asia/Tokyo")
@@ -527,8 +530,8 @@ def compute_poa_30min(ghi_30min, lat, lon, surface_tilt, surface_azimuth,
         )
         poa_global = poa_components["poa_global"].fillna(0).clip(lower=0)
 
-    poa_kwh = poa_global.values / 1000.0 / 2.0
-    poa_30min = poa_kwh.reshape(n_days, 48)
+    poa_kw = poa_global.values / 1000.0  # W/m2 → kW/m2（30分平均）
+    poa_30min = poa_kw.reshape(n_days, 48)
 
     return poa_30min
 
@@ -574,6 +577,7 @@ def calculate_generation(
         kpt = 1.0 + alpha_pct * (tcr - 25.0) / 100.0
         k_total = K_prime * kpt
 
+        # poaは30分平均kW/m2 → 瞬時出力kW × 0.5h = kWh/30分
         ep_face = k_total * ppeak * poa / G_STC * 0.5
         ep_face = np.clip(ep_face, 0, None)
 
@@ -833,10 +837,13 @@ def optimize_battery(generation_30min, demand_30min, month_day,
         grid_export = [pulp.LpVariable(f"ge_{t}", lowBound=0, upBound=0) for t in range(T)]
     else:
         grid_export = [pulp.LpVariable(f"ge_{t}", lowBound=0) for t in range(T)]
-    # 出力抑制変数（逆潮流禁止時にPV余剰を捨てる）
-    curtailment = [pulp.LpVariable(f"ct_{t}", lowBound=0) for t in range(T)]
+    # 出力抑制変数（逆潮流禁止時のみPV余剰を捨てる。余剰売電時は0に固定し縮退を防ぐ）
+    curtail_ub = None if no_export else 0
+    curtailment = [pulp.LpVariable(f"ct_{t}", lowBound=0, upBound=curtail_ub) for t in range(T)]
     soc_var = [pulp.LpVariable(f"soc_{t}", lowBound=soc_min, upBound=soc_max) for t in range(T)]
     peak_demand = pulp.LpVariable("peak_kw", lowBound=0)  # ピークデマンド（kW）
+    # 1台のPCSを充電または放電のどちらかに使う（同時充放電の排他制約用）
+    max_power_per_slot = max(max_charge_per_slot, max_discharge_per_slot)
 
     # 目的関数: 基本料金 + 電力量料金 - 売電収入
     pf_factor = (185 - power_factor_pct) / 100.0
@@ -850,6 +857,13 @@ def optimize_battery(generation_30min, demand_30min, month_day,
     for t in range(T):
         # エネルギーバランス: 系統購入 + PV発電 + 放電 = 需要 + 充電 + 系統売電 + 出力抑制
         prob += grid_import[t] + gen_flat[t] + discharge[t] == dem_flat[t] + charge[t] + grid_export[t] + curtailment[t]
+
+        # 売電・出力抑制はPV発電＋放電からのみ（系統買電の即売り＝パススルー禁止。
+        # この制約がないと売電単価>買電単価のときLPがUnboundedになる）
+        prob += grid_export[t] + curtailment[t] <= gen_flat[t] + discharge[t]
+
+        # 同時充放電の排他制約（ソフト版）: PCS 1台は充電か放電のどちらか
+        prob += charge[t] + discharge[t] <= max_power_per_slot
 
         # ピークデマンド制約: peak_demand ≥ 系統購入の瞬時電力(kW)
         # grid_import[t]はkWh/30分なので、kWに変換するには÷0.5
@@ -991,13 +1005,15 @@ def optimize_battery_capacity(generation_30min, demand_30min, month_day,
         grid_export = [pulp.LpVariable(f"ge_{t}", lowBound=0, upBound=0) for t in range(T)]
     else:
         grid_export = [pulp.LpVariable(f"ge_{t}", lowBound=0) for t in range(T)]
-    # 出力抑制変数（逆潮流禁止時にPV余剰を捨てる）
-    curtailment = [pulp.LpVariable(f"ct_{t}", lowBound=0) for t in range(T)]
+    # 出力抑制変数（逆潮流禁止時のみPV余剰を捨てる。余剰売電時は0に固定し縮退を防ぐ）
+    curtail_ub = None if no_export else 0
+    curtailment = [pulp.LpVariable(f"ct_{t}", lowBound=0, upBound=curtail_ub) for t in range(T)]
     soc_var = [pulp.LpVariable(f"soc_{t}", lowBound=0) for t in range(T)]
     peak_demand = pulp.LpVariable("peak_kw", lowBound=0)
+    # 1台のPCSを充電または放電のどちらかに使う（同時充放電の排他制約用）
+    max_power_per_slot = max(max_charge_per_slot, max_discharge_per_slot)
 
-    # SOC下限 = capacity * soc_min_pct/100 → 非線形なので固定値0とする（容量が変数のため）
-    # SOC上限 = capacity * soc_max_pct/100 → capacity_var * soc_max_pct/100 で線形
+    # SOC上下限 = capacity_var × 比率（capacity_varとの積は線形なので制約として表現可能）
     soc_max_ratio = soc_max_pct / 100.0
     soc_min_ratio = soc_min_pct / 100.0
 
@@ -1015,6 +1031,10 @@ def optimize_battery_capacity(generation_30min, demand_30min, month_day,
     for t in range(T):
         # エネルギーバランス: 系統購入 + PV発電 + 放電 = 需要 + 充電 + 系統売電 + 出力抑制
         prob += grid_import[t] + gen_flat[t] + discharge[t] == dem_flat[t] + charge[t] + grid_export[t] + curtailment[t]
+        # 売電・出力抑制はPV発電＋放電からのみ（パススルー禁止、Unbounded対策）
+        prob += grid_export[t] + curtailment[t] <= gen_flat[t] + discharge[t]
+        # 同時充放電の排他制約（ソフト版）
+        prob += charge[t] + discharge[t] <= max_power_per_slot
         prob += peak_demand >= grid_import[t] / dt
         # SOC上下限（容量に連動）
         prob += soc_var[t] <= capacity_var * soc_max_ratio
@@ -1462,19 +1482,41 @@ def make_daily_chart(result, month, day, sc_result=None, demand_30min=None):
 # ============================================================
 
 def _calc_irr(cashflows, tol=1e-8, max_iter=100):
-    """キャッシュフロー列からIRRをニュートン法で求める。"""
-    # 初期値
+    """キャッシュフロー列からIRRを求める（ニュートン法＋二分法フォールバック）。"""
+    def npv(r):
+        return sum(cf / (1 + r) ** t for t, cf in enumerate(cashflows))
+
+    # ニュートン法（r ≤ -1 に発散したら打ち切って二分法へ）
     r = 0.10
     for _ in range(max_iter):
-        npv = sum(cf / (1 + r) ** t for t, cf in enumerate(cashflows))
-        dnpv = sum(-t * cf / (1 + r) ** (t + 1) for t, cf in enumerate(cashflows))
-        if abs(dnpv) < 1e-15:
-            return None
-        r_new = r - npv / dnpv
+        v = npv(r)
+        dv = sum(-t * cf / (1 + r) ** (t + 1) for t, cf in enumerate(cashflows))
+        if abs(dv) < 1e-15:
+            break
+        r_new = r - v / dv
+        if r_new <= -0.999:
+            break
         if abs(r_new - r) < tol:
             return r_new
         r = r_new
-    return r if abs(sum(cf / (1 + r) ** t for t, cf in enumerate(cashflows))) < 1 else None
+    if abs(npv(r)) < 1:
+        return r
+
+    # 二分法フォールバック（[-0.99, 10]で符号が変わる場合のみ）
+    lo, hi = -0.99, 10.0
+    f_lo = npv(lo)
+    if f_lo * npv(hi) > 0:
+        return None
+    for _ in range(200):
+        mid = (lo + hi) / 2.0
+        f_mid = npv(mid)
+        if abs(f_mid) < tol or hi - lo < tol:
+            return mid
+        if f_lo * f_mid <= 0:
+            hi = mid
+        else:
+            lo, f_lo = mid, f_mid
+    return (lo + hi) / 2.0
 
 
 # ============================================================
@@ -2007,9 +2049,9 @@ def run_simulation(
         if cost_before is not None:
             fig_demand = make_demand_chart(cost_before, cost_after, contract_label)
 
-        # --- 最適容量探索 ---
+        # --- 最適容量探索（蓄電池ONのときのみ。非表示中のドロップダウン値の残留対策） ---
         fig_capacity = None
-        if battery_mode_label == "最適容量探索" and demand_30min is not None and cost_before is not None:
+        if bat_enabled and battery_mode_label == "最適容量探索" and demand_30min is not None and cost_before is not None:
             defaults_cap = ELECTRICITY_RATE_EHV if is_ehv else ELECTRICITY_RATE_HV
             rate_p = dict(
                 basic_charge_per_kw=elec_basic if elec_basic is not None else defaults_cap["basic_charge_per_kw"],
@@ -2027,11 +2069,14 @@ def run_simulation(
             sp = sell_price if sell_price is not None else DEFAULT_SELL_PRICE
             n_yrs = int(contract_years) if contract_years is not None else DEFAULT_CONTRACT_YEARS
 
-            # 蓄電池の実質単価（補助金反映）
+            # PV・蓄電池の実質単価（補助金反映）
             bat_subsidy_pct = 0
+            pv_subsidy_pct = 0
             if subsidy_enabled:
                 bat_subsidy_pct = subsidy_bat_pct if subsidy_bat_pct is not None else 0
+                pv_subsidy_pct = subsidy_pv_pct if subsidy_pv_pct is not None else 0
             bat_unit_net = bat_unit * (1 - bat_subsidy_pct / 100.0)
+            pv_unit_net = pv_unit * (1 - pv_subsidy_pct / 100.0)
 
             # 段階1: LP一体化
             try:
@@ -2064,8 +2109,9 @@ def run_simulation(
                 saving_opt = cost_before['annual_total'] - cost_opt['annual_total']
                 sell_rev_opt = sc_opt['annual_export'] * sp if not no_export else 0
                 merit_opt = saving_opt + sell_rev_opt
-                bat_inv_opt = opt_cap * bat_unit
-                total_inv_opt = total_ppeak * pv_unit + bat_inv_opt
+                # 段階2グリッドサーチと同じ補助金控除後単価で投資額を計算（整合性）
+                bat_inv_opt = opt_cap * bat_unit_net
+                total_inv_opt = total_ppeak * pv_unit_net + bat_inv_opt
                 payback_opt = total_inv_opt / merit_opt if merit_opt > 0 else 999
                 cf_opt = [-total_inv_opt] + [merit_opt] * n_yrs
                 irr_opt = _calc_irr(cf_opt)
@@ -2085,7 +2131,7 @@ def run_simulation(
                     max_charge_kw=bat_mc, max_discharge_kw=bat_md,
                     soc_min_pct=bat_smin, soc_max_pct=bat_smax,
                     sell_price=sp,
-                    pv_cost=pv_unit * (1 - (subsidy_pv_pct if subsidy_enabled and subsidy_pv_pct else 0) / 100.0),
+                    pv_cost=pv_unit_net,
                     battery_cost_per_kwh=bat_unit_net,
                     total_ppeak=total_ppeak,
                     co2_factor=ef,
@@ -2548,6 +2594,7 @@ def build_ui():
         # --- 売電制度/経過年数変更コールバック ---
         def on_sell_scheme_change(scheme, year):
             if scheme == "FIT利用あり":
+                year = year if year is not None else 1  # 空欄入力ガード
                 if year <= 5:
                     price = FIT_PRICE_EARLY
                 elif year <= 20:

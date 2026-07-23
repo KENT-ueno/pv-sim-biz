@@ -6,9 +6,9 @@ pv-sim-fipで発見されたバグ（chargeとdischargeが同一スロットで�
 網羅的に検証する。
 
 検証対象:
-  - optimize_battery (L787)
-  - optimize_battery_capacity (L949)
-  - simulate_battery (L671) ← ルールベース、構造上安全だが念のため
+  - optimize_battery
+  - optimize_battery_capacity
+  - simulate_battery ← ルールベース、構造上安全だが念のため
 """
 
 import os
@@ -118,11 +118,21 @@ def run_tests():
     log("【観点A】LP定式化の網羅チェック（構造解析）")
     log("-" * 70)
     log("  app.py内の LpProblem インスタンス:")
-    log("    1. optimize_battery        L787 / LpProblem L826")
-    log("    2. optimize_battery_capacity L949 / LpProblem L983")
+    log("    1. optimize_battery")
+    log("    2. optimize_battery_capacity")
     log()
-    log("  両LPとも mutual exclusion 制約 `ch[t] + dc[t] <= max_power_per_slot`")
-    log("  が**未実装**である（pv-sim-fipと同じパターン）。")
+    # mutual exclusion制約の実装有無をソースから動的に確認
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "app.py"),
+              encoding="utf-8") as f:
+        app_src = f.read()
+    n_mutex = app_src.count("charge[t] + discharge[t] <= max_power_per_slot")
+    n_passthru = app_src.count("grid_export[t] + curtailment[t] <= gen_flat[t] + discharge[t]")
+    log(f"  mutual exclusion 制約 `ch[t] + dc[t] <= max_power_per_slot`: {n_mutex}箇所（期待: 2）")
+    log(f"  パススルー禁止制約 `ge[t] + ct[t] <= gen[t] + dc[t]`      : {n_passthru}箇所（期待: 2）")
+    if n_mutex >= 2 and n_passthru >= 2:
+        log("  → 両LPに実装済み（2026-07-23 Fable 5レビューで追加）")
+    else:
+        log("  → ★未実装のLPあり！要確認")
     log()
     log("  ただしpv-sim-bizの目的関数:")
     log("    minimize: 基本料金 + Σ(grid_import * unit_price) - Σ(grid_export * sell_price)")
@@ -134,8 +144,7 @@ def run_tests():
     log(f"    FIT利用なし        : {app.DEFAULT_SELL_PRICE:.2f} 円/kWh")
     log()
     log("  → 買電 > 売電 のため『grid購入→充電→放電→売電』のアービトラージは赤字")
-    log("  → SOC遷移 `+ch*eff - dc/eff` のためパススルーは SOC を消費（純損失）")
-    log("  理論的にはパススルーは LP 最適解にならないはず。実機テストで確認する。")
+    log("  → さらに制約でパススルー・同時充放電を構造的に禁止済み。実機テストで確認する。")
     log()
 
     # === データ準備 ===
