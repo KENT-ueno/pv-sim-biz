@@ -4,7 +4,7 @@ emoji: ☀️
 colorFrom: yellow
 colorTo: yellow
 sdk: gradio
-sdk_version: 6.6.0
+sdk_version: 6.26.0
 app_file: app.py
 pinned: false
 ---
@@ -14,7 +14,7 @@ pinned: false
 [![Hugging Face Space](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Spaces-yellow)](https://huggingface.co/spaces/hachinai/pv-sim-biz)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://www.python.org/)
-[![Gradio](https://img.shields.io/badge/Gradio-6.6-orange)](https://gradio.app/)
+[![Gradio](https://img.shields.io/badge/Gradio-6.26-orange)](https://gradio.app/)
 
 A web-based simulator for **industrial-scale solar PV + battery storage systems** in Japan, designed for high-voltage and extra-high-voltage customers. Built on JIS C 8907 generation modeling, NEDO METPV-20 weather data for 47 Japanese sites, and PuLP/CBC linear programming for optimal battery dispatch.
 
@@ -70,7 +70,7 @@ A web-based simulator for **industrial-scale solar PV + battery storage systems*
 ## 🛠 Tech Stack / 技術スタック
 
 - **Language**: Python 3.10+
-- **UI**: Gradio 6.6
+- **UI**: Gradio 6.26（MCP対応）
 - **Plotting**: Plotly
 - **Solar modeling**: pvlib (Erbs, isotropic transposition, infinite_sheds for bifacial)
 - **Optimization**: PuLP + CBC (linear programming)

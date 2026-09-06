@@ -2220,6 +2220,7 @@ def build_ui():
                         fn=on_building_type_change,
                         inputs=[ftype],
                         outputs=[farea],
+                        api_visibility="hidden",
                     )
 
                 # 施設数変更で表示切替
@@ -2230,6 +2231,7 @@ def build_ui():
                     fn=update_facility_visibility,
                     inputs=[num_facilities_input],
                     outputs=facility_groups,
+                    api_visibility="hidden",
                 )
 
                 demand_csv_input = gr.File(
@@ -2331,6 +2333,7 @@ def build_ui():
                         fn=lambda x: gr.update(visible=x),
                         inputs=[subsidy_enabled_input],
                         outputs=[subsidy_settings_group],
+                        api_visibility="hidden",
                     )
                     co2_factor_input = gr.Number(
                         label="CO2排出係数 [t-CO2/kWh]",
@@ -2362,6 +2365,7 @@ def build_ui():
                         fn=on_business_model_change,
                         inputs=[business_model_input],
                         outputs=[lease_ppa_group],
+                        api_visibility="hidden",
                     )
 
                 # --- マイクログリッド設定 ---
@@ -2391,6 +2395,7 @@ def build_ui():
                         fn=lambda x: gr.update(visible=x),
                         inputs=[mg_enabled_input],
                         outputs=[mg_settings_group],
+                        api_visibility="hidden",
                     )
 
                 # --- 太陽光発電設定 ---
@@ -2452,6 +2457,7 @@ def build_ui():
                     fn=lambda x: gr.update(visible=x),
                     inputs=[battery_enabled],
                     outputs=[battery_settings_group],
+                    api_visibility="hidden",
                 )
 
                 def on_battery_mode_change(mode):
@@ -2463,6 +2469,7 @@ def build_ui():
                     fn=on_battery_mode_change,
                     inputs=[battery_mode_input],
                     outputs=[battery_cap_row],
+                    api_visibility="hidden",
                 )
 
                 # --- 両面パネル設定 ---
@@ -2499,6 +2506,7 @@ def build_ui():
                     fn=lambda x: gr.update(visible=x),
                     inputs=[bifacial_enabled_input],
                     outputs=[bifacial_settings_group],
+                    api_visibility="hidden",
                 )
 
                 # --- アレイ設定 ---
@@ -2535,6 +2543,7 @@ def build_ui():
                     fn=update_face_visibility,
                     inputs=[num_faces_input],
                     outputs=face_groups,
+                    api_visibility="hidden",
                 )
 
                 run_btn = gr.Button("▶️ 計算", variant="primary", size="lg")
@@ -2578,6 +2587,7 @@ def build_ui():
                 elec_basic_input, elec_summer_input, elec_other_input,
                 elec_pf_input, elec_fuel_input, elec_renewable_input,
             ],
+            api_visibility="hidden",
         )
 
         # --- 売電モード変更コールバック ---
@@ -2589,6 +2599,7 @@ def build_ui():
             fn=on_sell_mode_change,
             inputs=[sell_mode_input],
             outputs=[sell_scheme_group],
+            api_visibility="hidden",
         )
 
         # --- 売電制度/経過年数変更コールバック ---
@@ -2609,11 +2620,13 @@ def build_ui():
             fn=on_sell_scheme_change,
             inputs=[sell_scheme_input, fit_year_input],
             outputs=[sell_price_input, fit_year_input],
+            api_visibility="hidden",
         )
         fit_year_input.change(
             fn=on_sell_scheme_change,
             inputs=[sell_scheme_input, fit_year_input],
             outputs=[sell_price_input, fit_year_input],
+            api_visibility="hidden",
         )
 
         # --- 計算ボタンのコールバック ---
@@ -2682,6 +2695,7 @@ def build_ui():
             fn=on_click,
             inputs=all_inputs_with_display,
             outputs=[monthly_plot, daily_plot, demand_plot, capacity_search_plot, result_box, debug_box, result_state],
+            api_visibility="hidden",
         )
 
         # 月日変更時のグラフ再描画コールバック（再計算なし）
@@ -2698,12 +2712,21 @@ def build_ui():
             fn=on_date_change,
             inputs=[result_state, month_input, day_input],
             outputs=[daily_plot],
+            api_visibility="hidden",
         )
         day_input.change(
             fn=on_date_change,
             inputs=[result_state, month_input, day_input],
             outputs=[daily_plot],
+            api_visibility="hidden",
         )
+
+        # gr.api() でUI無しのAPI関数を登録。mcp_server=True 時にMCPツールとして公開される。
+        import mcp_tools
+        gr.api(mcp_tools.list_stations, api_name="list_stations")
+        gr.api(mcp_tools.estimate_pv_generation, api_name="estimate_pv_generation")
+        gr.api(mcp_tools.validate_industrial_params, api_name="validate_industrial_params")
+        gr.api(mcp_tools.simulate_industrial_pv, api_name="simulate_industrial_pv")
 
     return demo
 
@@ -2715,4 +2738,4 @@ def build_ui():
 demo = build_ui()
 
 if __name__ == "__main__":
-    demo.launch()
+    demo.launch(mcp_server=True)

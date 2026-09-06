@@ -4,3 +4,4 @@ plotly
 pvlib
 PuLP
 solarfactors
+gradio[mcp]>=6.26.0
