@@ -10,11 +10,12 @@ pv-sim-fip / pv-sim-gh で確立したパターンを踏襲:
   - validate → ユーザー確認 → simulate の2段階プロトコル
   - 全simulate結果に assumptions（入力エコー）と caveats（免責）を同梱
 
-スコープ（Phase 4d-1、MCP_HANDOFF.md の段階的実装方針に従う）:
-  対象 — 単体施設・複数施設合算、PV発電、高圧/特別高圧料金、蓄電池
-        （ルールベース or LP最適化）、投資回収、事業モデル（自己所有/リース/PPA）、CO2削減量
-  未対応（後続フェーズで追加予定） — マイクログリッド、両面パネル、
-        最適容量探索（2〜3分かかるため）、カスタム需要CSVアップロード
+スコープ（Phase 4d-2、MCP_HANDOFF.md の段階的実装方針に従う）:
+  対象 — 単体施設・複数施設合算、PV発電（片面/両面）、高圧/特別高圧料金、蓄電池
+        （ルールベース or LP最適化）、投資回収、事業モデル（自己所有/リース/PPA）、CO2削減量、
+        マイクログリッド事業（網内売電・束ねメリット・P-IRR）
+  未対応（後続フェーズで追加予定） — 最適容量探索（2〜3分かかるため）、
+        カスタム需要CSVアップロード
 """
 
 import os
@@ -85,8 +86,8 @@ BUSINESS_MODEL_MAP = {
 
 _COMMON_CAVEATS = [
     "本結果は投資判断の参考情報であり、収益・投資回収年数を保証するものではありません",
-    "本ツールはマイクログリッド事業（網内売電・P-IRR）、両面パネル、最適容量探索"
-    "（2〜3分かかる蓄電池容量のグリッドサーチ）には未対応です。これらはGradio UI側でのみ利用できます",
+    "本ツールは最適容量探索（2〜3分かかる蓄電池容量のグリッドサーチ）には未対応です。"
+    "これはGradio UI側でのみ利用できます",
     "電気料金・FIT単価等のデフォルト値は東京電力EPの公表値を参考にした一例であり、"
     "契約中の電力会社・料金メニューにより実際の単価は異なります",
 ]
@@ -263,6 +264,17 @@ def _normalize_and_validate(
     business_model,
     contract_years,
     target_irr_pct,
+    bifacial_enabled,
+    bifaciality,
+    gcr,
+    panel_height_m,
+    pitch_m,
+    snow_albedo_enabled,
+    mg_enabled,
+    mg_line_distance_km,
+    mg_line_cost_yen_per_km,
+    mg_opex_ratio_pct,
+    mg_irr_period_years,
 ):
     """パラメータを正規化し (params, warnings, errors) を返す。重い計算は実行しない。"""
     app = _get_app()
@@ -331,18 +343,46 @@ def _normalize_and_validate(
         if not (0 <= target_irr_pct <= 50):
             errors.append("target_irr_pct は 0〜50 で指定してください")
 
+    if bifacial_enabled:
+        if not (0 <= bifaciality <= 1):
+            errors.append("bifaciality は 0〜1 で指定してください")
+        if not (0 < gcr <= 1):
+            errors.append("gcr は 0〜1 で指定してください")
+        if not (0 < panel_height_m <= 100):
+            errors.append("panel_height_m は 0〜100 で指定してください")
+        if not (0 < pitch_m <= 100):
+            errors.append("pitch_m は 0〜100 で指定してください")
+
+    if mg_enabled:
+        if mg_line_distance_km < 0:
+            errors.append("mg_line_distance_km は0以上で指定してください")
+        if mg_line_cost_yen_per_km < 0:
+            errors.append("mg_line_cost_yen_per_km は0以上で指定してください")
+        if not (0 <= mg_opex_ratio_pct <= 100):
+            errors.append("mg_opex_ratio_pct は 0〜100 で指定してください")
+        if not (1 <= int(mg_irr_period_years) <= 40):
+            errors.append("mg_irr_period_years は 1〜40 で指定してください")
+
     # --- 警告 ---
     if battery_enabled and battery_capacity_kwh > 0 and battery_max_charge_kw > battery_capacity_kwh:
         warnings.append(
             f"充電レート {battery_max_charge_kw:.0f}kW が容量 {battery_capacity_kwh:.0f}kWh を超えています"
             "（1C超の高速蓄電池想定になっています）"
         )
-    if len(normalized_facilities) == 1 and business_model != "self_owned":
-        pass  # 単一施設でもリース/PPAは成立するため警告不要
     if sell_mode == "no_export" and sell_scheme == "fit":
         warnings.append(
             "逆潮流禁止（売電なし）を選択しているため、FIT単価は投資回収計算に反映されません"
             "（売電収入がゼロになります）"
+        )
+    if mg_enabled and len(normalized_facilities) <= 1:
+        warnings.append(
+            "施設が1つのため、マイクログリッドの束ねメリット（複数施設合算による基本料金差額）"
+            "は発生しません（PV導入効果のみが基本料金差額として計上されます）"
+        )
+    if mg_enabled and business_model == "self_owned":
+        warnings.append(
+            "事業モデルがself_ownedのため、MG網内売電単価は電力量単価の加重平均で計算されます"
+            "（PPA選択時はPPA単価で計算されます）"
         )
 
     # FIT/売電単価の解決（UIのon_sell_scheme_changeロジックを踏襲）
@@ -394,6 +434,17 @@ def _normalize_and_validate(
         "business_model": business_model,
         "contract_years": int(contract_years) if business_model in ("lease", "ppa") else None,
         "target_irr_pct": float(target_irr_pct) if business_model in ("lease", "ppa") else None,
+        "bifacial_enabled": bool(bifacial_enabled),
+        "bifaciality": float(bifaciality) if bifacial_enabled else None,
+        "gcr": float(gcr) if bifacial_enabled else None,
+        "panel_height_m": float(panel_height_m) if bifacial_enabled else None,
+        "pitch_m": float(pitch_m) if bifacial_enabled else None,
+        "snow_albedo_enabled": bool(snow_albedo_enabled) if bifacial_enabled else None,
+        "mg_enabled": bool(mg_enabled),
+        "mg_line_distance_km": float(mg_line_distance_km) if mg_enabled else None,
+        "mg_line_cost_yen_per_km": float(mg_line_cost_yen_per_km) if mg_enabled else None,
+        "mg_opex_ratio_pct": float(mg_opex_ratio_pct) if mg_enabled else None,
+        "mg_irr_period_years": int(mg_irr_period_years) if mg_enabled else None,
     }
     return params, warnings, errors
 
@@ -407,12 +458,27 @@ def _run_industrial_simulation(p: dict):
     app = _get_app()
     lat, lon, ghi_df, temp_df, _ = _resolve_station(p["station_no"])
 
+    # --- 両面パネル: albedo時系列の準備（app.run_simulationと同じロジック） ---
+    albedo_flat = None
+    if p["bifacial_enabled"]:
+        if p["snow_albedo_enabled"]:
+            snow_df = app.load_snow_depth(p["station_no"])
+            albedo_flat = app.build_albedo_series(snow_df)
+        else:
+            albedo_flat = np.full(365 * 48, app.ALBEDO_NORMAL)
+
     faces_app = _faces_to_app_format(p["faces"])
     result = app.calculate_generation(
         lat, lon, ghi_df, temp_df, faces_app,
         app.DEFAULT_KHD, app.DEFAULT_KPD, app.DEFAULT_KPM,
         app.DEFAULT_KPA, app.DEFAULT_ETA_INO,
         app.DEFAULT_ALPHA, app.DEFAULT_DELTA_T,
+        bifacial=p["bifacial_enabled"],
+        bifaciality=p["bifaciality"] if p["bifacial_enabled"] else app.BIFACIAL_DEFAULTS["bifaciality"],
+        gcr=p["gcr"] if p["bifacial_enabled"] else app.BIFACIAL_DEFAULTS["gcr"],
+        height=p["panel_height_m"] if p["bifacial_enabled"] else app.BIFACIAL_DEFAULTS["height"],
+        pitch=p["pitch_m"] if p["bifacial_enabled"] else app.BIFACIAL_DEFAULTS["pitch"],
+        albedo_flat=albedo_flat,
     )
     gen = result["total_gen_clipped"]
     month_day = result["month_day"]
@@ -501,15 +567,33 @@ def _run_industrial_simulation(p: dict):
     co2_reduction = grid_reduction * p["co2_factor_t_per_kwh"]
 
     # --- 事業モデル（自己所有/リース/PPA、app.run_simulationのCRF式を踏襲） ---
+    # MG有効時はMG投資全額（PV+蓄電池+自営線）をベースに、運営コストも含めて逆算する
+    # （app.run_simulationの「A案」ロジックをそのまま踏襲）
+    mg_line_cost = 0.0
+    mg_total_investment = net_investment
+    mg_annual_opex = 0.0
+    if p["mg_enabled"]:
+        mg_line_cost = p["mg_line_distance_km"] * p["mg_line_cost_yen_per_km"]
+        mg_total_investment = net_investment + mg_line_cost
+        mg_annual_opex = mg_total_investment * (p["mg_opex_ratio_pct"] / 100.0)
+
     business_out = {"business_model": p["business_model"]}
+    ppa_price = None  # MG収益計算で参照（PPA選択時のみ値が入る）
     if p["business_model"] in ("lease", "ppa") and net_investment > 0:
         n_years = p["contract_years"]
         r = p["target_irr_pct"] / 100.0
         crf = r * (1 + r) ** n_years / ((1 + r) ** n_years - 1) if r > 0 else 1.0 / n_years
-        annual_lease = net_investment * crf
-        business_out["investment_base_yen"] = round(net_investment)
+        if p["mg_enabled"]:
+            lease_base_investment = mg_total_investment
+            annual_lease = lease_base_investment * crf + mg_annual_opex
+        else:
+            lease_base_investment = net_investment
+            annual_lease = lease_base_investment * crf
+        business_out["investment_base_yen"] = round(lease_base_investment)
         business_out["contract_years"] = n_years
         business_out["target_irr_pct"] = p["target_irr_pct"]
+        if p["mg_enabled"]:
+            business_out["mg_opex_included_yen_per_year"] = round(mg_annual_opex)
         if p["business_model"] == "lease":
             business_out["required_lease_yen_per_year"] = round(annual_lease)
             if annual_merit > 0:
@@ -536,6 +620,58 @@ def _run_industrial_simulation(p: dict):
     else:
         business_out["note"] = "自己所有のため事業者側パラメータ（投資ベース・リース料等）は算出していません"
 
+    # --- マイクログリッド事業（モードB、app.run_simulationのMG収益計算セクションを踏襲） ---
+    # モードA（lease/ppa）と異なり、MGはP-IRRの算出自体が事業者側のゴールのため
+    # project_irr_pct をそのまま開示する（CLAUDE.md: モードBはP-IRR算出がゴール）
+    microgrid_out = None
+    if p["mg_enabled"]:
+        if len(individual_demands) > 1:
+            individual_basic_total = 0.0
+            for ind_demand in individual_demands:
+                ind_cost = app.calc_electricity_cost(ind_demand, month_day, **rate_params)
+                individual_basic_total += ind_cost["annual_basic"]
+        else:
+            individual_basic_total = cost_before["annual_basic"]
+        mg_combined_basic = cost_after["annual_basic"]
+        bundling_merit = individual_basic_total - mg_combined_basic
+
+        avg_energy_price = (
+            p["energy_charge_summer_yen_per_kwh"] * 0.25
+            + p["energy_charge_other_yen_per_kwh"] * 0.75
+        )
+        if ppa_price is not None:
+            mg_sell_price = ppa_price
+            mg_sell_price_basis = "ppa_price"
+        else:
+            mg_sell_price = avg_energy_price
+            mg_sell_price_basis = "energy_charge_weighted_average"
+
+        pv_revenue = sc_result["annual_self"] * mg_sell_price
+        mg_annual_revenue = pv_revenue + bundling_merit
+        mg_annual_cashflow = mg_annual_revenue - mg_annual_opex
+
+        mg_period = p["mg_irr_period_years"]
+        cashflows = [-mg_total_investment] + [mg_annual_cashflow] * mg_period
+        mg_irr = app._calc_irr(cashflows)
+
+        microgrid_out = {
+            "mg_line_cost_yen": round(mg_line_cost),
+            "mg_total_investment_yen": round(mg_total_investment),
+            "mg_annual_opex_yen": round(mg_annual_opex),
+            "pv_sell_price_yen_per_kwh": round(mg_sell_price, 2),
+            "pv_sell_price_basis": mg_sell_price_basis,
+            "pv_revenue_yen_per_year": round(pv_revenue),
+            "bundling_merit_yen_per_year": round(bundling_merit),
+            "individual_basic_charge_total_yen": round(individual_basic_total),
+            "mg_combined_basic_charge_yen": round(mg_combined_basic),
+            "mg_annual_revenue_yen": round(mg_annual_revenue),
+            "mg_annual_cashflow_yen": round(mg_annual_cashflow),
+            "irr_period_years": mg_period,
+            "project_irr_pct": round(mg_irr * 100, 2) if mg_irr is not None else None,
+            "project_irr_note": "モードB（マイクログリッド事業）ではP-IRRの算出自体が事業者向けの"
+                                "ゴールのため、モードA（lease/ppa）の目標P-IRRとは異なりそのまま開示しています",
+        }
+
     caveats = list(_COMMON_CAVEATS)
     if p["business_model"] in ("lease", "ppa"):
         caveats.append(
@@ -544,6 +680,17 @@ def _run_industrial_simulation(p: dict):
         )
     if no_export:
         caveats.append("逆潮流禁止モードのため出力抑制（カーテイルメント）が発生する場合があります")
+    if p["bifacial_enabled"]:
+        caveats.append(
+            "両面パネルモードのためinfinite_shedsモデル（GCR/パネル高/列間隔考慮）でPOAを計算しています。"
+            f"積雪アルベド自動切替: {'ON（積雪時0.7/通常0.2）' if p['snow_albedo_enabled'] else 'OFF（常時0.2）'}"
+        )
+    if p["mg_enabled"]:
+        caveats.append(
+            "マイクログリッド事業の網内売電単価はPPA単価（PPA選択時）または電力量単価の"
+            "加重平均（それ以外）で近似計算しています。実際の託送料金相当額・特定送配電事業の"
+            "認可条件は考慮していません"
+        )
 
     return {
         "assumptions": p,
@@ -584,6 +731,7 @@ def _run_industrial_simulation(p: dict):
             "simple_payback_years": round(payback_years, 1) if payback_years is not None else None,
         },
         "business": business_out,
+        "microgrid": microgrid_out,
         "caveats": caveats,
     }
 
@@ -692,12 +840,23 @@ def validate_industrial_params(
     business_model: str = "self_owned",
     contract_years: int = 15,
     target_irr_pct: float = 10.0,
+    bifacial_enabled: bool = False,
+    bifaciality: float = 0.75,
+    gcr: float = 0.4,
+    panel_height_m: float = 2.0,
+    pitch_m: float = 5.0,
+    snow_albedo_enabled: bool = True,
+    mg_enabled: bool = False,
+    mg_line_distance_km: float = 2.0,
+    mg_line_cost_yen_per_km: float = 30000000.0,
+    mg_opex_ratio_pct: float = 2.0,
+    mg_irr_period_years: int = 20,
 ) -> dict:
     """産業用PV+蓄電池シミュレーションのパラメータを検証する（即答）。
 
     **simulate_industrial_pv を呼ぶ前に必ずこのツールで検証し、返ってきた
     normalized_params をユーザーに提示して確認を得てから実行すること。**
-    マイクログリッド事業・両面パネル・最適容量探索は本ツールでは扱わない
+    最適容量探索（2〜3分かかる蓄電池容量のグリッドサーチ）は本ツールでは扱わない
     （Gradio UI側のみで利用可能）。
 
     Args:
@@ -740,6 +899,21 @@ def validate_industrial_params(
         contract_years: 契約年数（lease/ppa時のみ有効）
         target_irr_pct: 事業者目標P-IRR [%]（lease/ppa時のみ有効。需要家には開示しない
             内部パラメータで、リース料/PPA単価の逆算にのみ使用する）
+        bifacial_enabled: 両面パネルを使用するか（infinite_shedsモデルで背面日射を計算）
+        bifaciality: 背面/前面効率比（bifacial_enabled時のみ有効。TOPCon 0.70〜0.80、
+            HJT 0.85〜0.95が目安）
+        gcr: 地面被覆率＝パネル高さ÷列間隔（bifacial_enabled時のみ有効、0.3〜0.5が一般的）
+        panel_height_m: パネル中心地上高 [m]（bifacial_enabled時のみ有効）
+        pitch_m: 列間隔 [m]（bifacial_enabled時のみ有効）
+        snow_albedo_enabled: 積雪深データに応じてアルベドを自動切替するか
+            （bifacial_enabled時のみ有効。ON=積雪時0.7/通常0.2、OFF=常時0.2）
+        mg_enabled: マイクログリッド事業（モードB）を有効にするか。ONにするとPV余剰を
+            網内（施設間）で融通し、束ねメリット・P-IRRを算出する事業者向け試算になる
+            （モードA=自家消費/lease/ppaとは異なり、P-IRRをそのまま開示する）
+        mg_line_distance_km: 自営線距離 [km]（mg_enabled時のみ有効）
+        mg_line_cost_yen_per_km: 自営線単価 [円/km]（mg_enabled時のみ有効）
+        mg_opex_ratio_pct: 年間運営コスト [%]（投資額比、mg_enabled時のみ有効）
+        mg_irr_period_years: P-IRR計算期間 [年]（mg_enabled時のみ有効）
 
     Returns:
         dict: {"valid": bool, "normalized_params": {...}, "warnings": [...], "errors": [...]}
@@ -757,8 +931,13 @@ def validate_industrial_params(
             pv_cost_yen_per_kw, battery_cost_yen_per_kwh, substation_cost_yen_per_kva,
             subsidy_enabled, subsidy_pv_pct, subsidy_bat_pct,
             co2_factor_t_per_kwh, business_model, contract_years, target_irr_pct,
+            bifacial_enabled, bifaciality, gcr, panel_height_m, pitch_m, snow_albedo_enabled,
+            mg_enabled, mg_line_distance_km, mg_line_cost_yen_per_km,
+            mg_opex_ratio_pct, mg_irr_period_years,
         )
         runtime = "1-3秒" if not battery_enabled or battery_mode == "rule_based" else "5-20秒（LP最適化）"
+        if bifacial_enabled:
+            runtime += "。両面パネル計算のため数秒程度余分にかかる場合があります"
         return {
             "valid": len(errors) == 0,
             "normalized_params": params,
@@ -805,14 +984,26 @@ def simulate_industrial_pv(
     business_model: str = "self_owned",
     contract_years: int = 15,
     target_irr_pct: float = 10.0,
+    bifacial_enabled: bool = False,
+    bifaciality: float = 0.75,
+    gcr: float = 0.4,
+    panel_height_m: float = 2.0,
+    pitch_m: float = 5.0,
+    snow_albedo_enabled: bool = True,
+    mg_enabled: bool = False,
+    mg_line_distance_km: float = 2.0,
+    mg_line_cost_yen_per_km: float = 30000000.0,
+    mg_opex_ratio_pct: float = 2.0,
+    mg_irr_period_years: int = 20,
 ) -> dict:
     """産業用（高圧・特別高圧）太陽光＋蓄電池の需給・電気料金・投資回収を試算する
     （実行1〜3秒、蓄電池LP最適化時は5〜20秒）。
 
-    JIS C 8907準拠の発電量計算、複数施設合算需要との自家消費シミュレーション
-    （蓄電池はルールベース or LP最適化）、高圧/特別高圧電気料金の導入前後比較、
-    投資額・補助金・投資回収年数、事業モデル（自己所有/リース/PPA）を計算する。
-    マイクログリッド事業・両面パネル・最適容量探索には対応しない。
+    JIS C 8907準拠の発電量計算（片面 or 両面パネル）、複数施設合算需要との
+    自家消費シミュレーション（蓄電池はルールベース or LP最適化）、高圧/特別高圧
+    電気料金の導入前後比較、投資額・補助金・投資回収年数、事業モデル
+    （自己所有/リース/PPA、モードA）、マイクログリッド事業（網内売電・束ねメリット・
+    P-IRR、モードB）を計算する。最適容量探索（2〜3分かかるグリッドサーチ）には対応しない。
 
     **事前に validate_industrial_params で検証し、パラメータをユーザーに
     確認してから呼び出すこと。** 引数の意味は validate_industrial_params と同一。
@@ -820,7 +1011,9 @@ def simulate_industrial_pv(
     Returns:
         dict: assumptions（入力エコー）/ annual（発電・自家消費・蓄電池・CO2）/
               electricity_cost（導入前後の電気料金比較）/ investment（投資額・回収年数）/
-              business（事業モデル計算結果）/ caveats（免責事項）
+              business（事業モデル計算結果、モードA）/
+              microgrid（mg_enabled時のみ、束ねメリット・P-IRR等、モードB）/
+              caveats（免責事項）
     """
     v = validate_industrial_params(
         station_no=station_no, faces=faces, facilities=facilities,
@@ -846,6 +1039,11 @@ def simulate_industrial_pv(
         subsidy_enabled=subsidy_enabled, subsidy_pv_pct=subsidy_pv_pct, subsidy_bat_pct=subsidy_bat_pct,
         co2_factor_t_per_kwh=co2_factor_t_per_kwh,
         business_model=business_model, contract_years=contract_years, target_irr_pct=target_irr_pct,
+        bifacial_enabled=bifacial_enabled, bifaciality=bifaciality, gcr=gcr,
+        panel_height_m=panel_height_m, pitch_m=pitch_m, snow_albedo_enabled=snow_albedo_enabled,
+        mg_enabled=mg_enabled, mg_line_distance_km=mg_line_distance_km,
+        mg_line_cost_yen_per_km=mg_line_cost_yen_per_km,
+        mg_opex_ratio_pct=mg_opex_ratio_pct, mg_irr_period_years=mg_irr_period_years,
     )
     if not v.get("valid"):
         return {"error": "パラメータ検証エラー", "errors": v.get("errors", []),
