@@ -16,6 +16,7 @@ app.py - 産業用太陽光需給シミュレーター（JIS C 8907準拠）
 """
 
 import os
+import sys
 import csv
 import io
 import sqlite3
@@ -36,6 +37,29 @@ try:
     HAS_PULP = True
 except ImportError:
     HAS_PULP = False
+
+
+def _force_utf8_stdio():
+    """標準出力をUTF-8に切り替える（Windowsローカル開発用）。
+
+    Windowsの既定コンソールコードページ（日本語環境ではCP932）だと、
+    Gradioが `mcp_server=True` の起動時に出力するバナーの絵文字（🔨）で
+    UnicodeEncodeError を起こし、`python app.py` がクラッシュする。
+    HF Spaces（Linux・UTF-8）では元々問題にならないため、この関数は実質no-opになる。
+    """
+    for name in ("stdout", "stderr"):
+        stream = getattr(sys, name, None)
+        enc = (getattr(stream, "encoding", "") or "").lower()
+        if stream is None or enc in ("utf-8", "utf8"):
+            continue
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")  # Python 3.7+
+        except Exception:
+            pass
+
+
+_force_utf8_stdio()
+
 
 # === 定数・設定 ===
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
