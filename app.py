@@ -300,6 +300,18 @@ DC_DEFAULTS = {
     "kw_per_rack": 10.0,        # ラック電力密度 [kW/ラック]（同上）
 }
 
+# --- 需要ソース（run_simulation の分岐キー。UIでは gr.Tab.select → gr.State で保持する） ---
+DEMAND_SOURCE_INDUSTRIAL = "industrial"   # 産業用・MG（ComStock需要プリセット・複数施設合算）
+DEMAND_SOURCE_DATACENTER = "datacenter"   # データセンター（IT負荷 × PUE）
+
+# UIのDC入力コンポーネントを dc_args 辞書に戻すためのキー。
+# build_ui の dc_components と同じ並びにすること（on_click が zip で対応づける）。
+DC_INPUT_KEYS = (
+    "workload_preset", "capacity_mode", "size_preset", "it_capacity_kw", "n_racks", "kw_per_rack",
+    "profile_mode", "noise_level", "it_load_factor_pct", "it_peak_pct", "it_bottom_pct", "it_peak_hour",
+    "pue_const",
+)
+
 # CEC 2025 IEPR の受電容量→最大需要の換算係数（§5-6(2)）。
 # ⚠ これは「観測された上限」であり典型値ではない。予測用途では安全側だが、
 #    受電容量の逆算に使うと必要容量を小さく見積もる方向に働く（保守性の向きが反転する）。
@@ -1962,6 +1974,149 @@ def build_dc_demand_30min(it_load_30min, pue_30min):
     return demand, breakdown
 
 
+def resolve_dc_demand(dc_args, temp_30min=None):
+    """DC入力（UIの値をそのまま詰めた辞書）からDC需要 (365, 48) を生成する。
+
+    run_simulation の需要ソース分岐（データセンター）から呼ばれる。
+    None・空欄は DC_DEFAULTS で補う（数値入力を `is not None` で判定する既存の作法に合わせる）。
+    下流（LP・料金計算・経済性）は (365, 48) 配列を受け取るだけなので、この関数の戻り値を
+    産業用の load_combined_demand() の代わりに差し込める。
+
+    Args:
+        dc_args: DC_INPUT_KEYS をキーとする辞書
+        temp_30min: (365, 48) 外気温 [℃]。気温連動PUE用（未実装）。PUE一定では不要
+
+    Returns:
+        (demand_30min, dc_info)
+        dc_info: 結果テキスト用の解決済み入力・IT負荷・内訳・ピークデマンド
+
+    Raises:
+        ValueError: IT定格容量が0以下／IT負荷率が範囲外／PUEが1.0未満
+    """
+    a = dict(dc_args or {})
+
+    def pick(key, default):
+        v = a.get(key)
+        return default if v is None else v
+
+    capacity_mode = a.get("capacity_mode") or "IT容量を直接入力"
+    it_cap = resolve_it_capacity_kw(
+        capacity_mode,
+        size_preset=a.get("size_preset"),
+        it_capacity_kw=pick("it_capacity_kw", DC_DEFAULTS["it_capacity_kw"]),
+        n_racks=pick("n_racks", DC_DEFAULTS["n_racks"]),
+        kw_per_rack=pick("kw_per_rack", DC_DEFAULTS["kw_per_rack"]),
+    )
+    if it_cap <= 0:
+        raise ValueError("IT定格容量が0以下です。容量の指定方法と値を確認してください")
+
+    it_lf = float(pick("it_load_factor_pct", DC_DEFAULTS["it_load_factor_pct"]))
+    if not (0 < it_lf <= 100):
+        raise ValueError(f"IT負荷率（年平均）は0より大きく100以下で指定してください（現在: {it_lf:g}%）")
+    pue_c = float(pick("pue_const", DC_DEFAULTS["pue_const"]))
+    if pue_c < 1.0:
+        raise ValueError(
+            f"PUEは1.0以上で指定してください（現在: {pue_c:g}）。"
+            "PUE＝施設全体電力÷IT機器電力のため1.0が下限です"
+        )
+    it_pk = float(pick("it_peak_pct", DC_DEFAULTS["it_peak_pct"]))
+    it_bt = float(pick("it_bottom_pct", DC_DEFAULTS["it_bottom_pct"]))
+    it_ph = pick("it_peak_hour", DC_DEFAULTS["it_peak_hour"])
+
+    # 用途プリセットはプロファイルとノイズを一括設定する（「手動設定」なら個別指定を使う）
+    workload = a.get("workload_preset")
+    preset = DC_WORKLOAD_PRESETS.get(workload)
+    if preset:
+        profile_mode = preset["profile"]
+        noise = preset["noise"]
+    else:
+        profile_mode = a.get("profile_mode") or PROFILE_FLAT
+        noise = a.get("noise_level") or "なし"
+
+    it_load_30min = build_it_load_30min(
+        it_cap, profile_mode=profile_mode, load_factor_pct=it_lf,
+        peak_pct=it_pk, bottom_pct=it_bt, peak_hour=it_ph, noise_level=noise,
+    )
+    # PUEは一定値のみ（気温連動は保留。docs/decision_log.md 第2段階）
+    pue_30min = build_pue_30min(
+        pue_mode="一定", temp_30min=temp_30min, pue_const=pue_c, pue_params=PUE_MODEL_DEFAULTS,
+    )
+    demand_30min, breakdown = build_dc_demand_30min(it_load_30min, pue_30min)
+
+    dc_info = {
+        "workload_preset": workload,
+        "capacity_mode": capacity_mode,
+        "size_preset": a.get("size_preset"),
+        "n_racks": pick("n_racks", DC_DEFAULTS["n_racks"]),
+        "kw_per_rack": pick("kw_per_rack", DC_DEFAULTS["kw_per_rack"]),
+        "it_capacity_kw": it_cap,
+        "profile_mode": profile_mode,
+        "noise_level": noise,
+        "it_load_factor_pct": it_lf,
+        "it_peak_pct": it_pk,
+        "it_bottom_pct": it_bt,
+        "it_peak_hour": it_ph,
+        "pue_const": pue_c,
+        "it_load_30min": it_load_30min,
+        "breakdown": breakdown,
+        # 導入前ピークデマンド[kW] = 30分需要[kWh]の年間最大 ÷ 0.5h
+        "peak_demand_kw": float(np.max(demand_30min)) * 2.0,
+    }
+    return demand_30min, dc_info
+
+
+def format_dc_summary(dc_info, contract_type=None):
+    """DC需要の結果テキスト（結果ボックス先頭に置く節）を返す。
+
+    Args:
+        dc_info: resolve_dc_demand が返す辞書
+        contract_type: 電気料金設定の契約種別（"高圧"/"特別高圧"）。受電電圧の目安との食い違い警告に使う
+    """
+    d = dc_info
+    bd = d["breakdown"]
+    peak_kw = d["peak_demand_kw"]
+    t = "══ データセンター需要 ══\n"
+    if d["workload_preset"] and DC_WORKLOAD_PRESETS.get(d["workload_preset"]):
+        t += f"  用途: {d['workload_preset']}\n"
+    if d["capacity_mode"] == "規模プリセット" and d["size_preset"] in DC_SIZE_PRESETS:
+        t += f"  規模: {d['size_preset']}（{DC_SIZE_PRESETS[d['size_preset']]['note']}）※区分は暫定値\n"
+    elif d["capacity_mode"] == "ラック数×density":
+        t += f"  容量指定: {float(d['n_racks']):,.0f} ラック × {float(d['kw_per_rack']):,.1f} kW/ラック\n"
+    t += f"  IT定格容量: {d['it_capacity_kw']:,.0f} kW\n"
+    t += f"  負荷プロファイル: {d['profile_mode']}"
+    if d["profile_mode"] == PROFILE_DIURNAL:
+        t += f"（ピーク{d['it_peak_pct']:.0f}% / ボトム{d['it_bottom_pct']:.0f}% / ピーク{int(d['it_peak_hour'])}時）"
+    t += "\n"
+    t += f"  IT負荷率（年平均）: {d['it_load_factor_pct']:.0f}%\n"
+    t += f"  短周期変動: {d['noise_level']}\n"
+    it_kw = d["it_load_30min"] * 2.0
+    t += (f"  IT負荷 実効: 平均 {it_kw.mean():,.0f} kW / 最小 {it_kw.min():,.0f} kW"
+          f" / 最大 {it_kw.max():,.0f} kW\n")
+    t += f"  PUE: {d['pue_const']:.2f}（一定。空冷前提）\n"
+    t += f"  年間IT電力量: {bd['annual_it_kwh']:,.0f} kWh/年\n"
+    t += f"  年間施設総電力量: {bd['annual_total_kwh']:,.0f} kWh/年\n"
+    t += f"  うち冷却＋電源設備損失: {bd['annual_overhead_kwh']:,.0f} kWh/年\n"
+    t += f"  年間平均PUE（実効）: {bd['avg_pue']:.3f}\n"
+    t += f"  導入前ピークデマンド: {peak_kw:,.1f} kW\n"
+    t += (f"  推奨する申請受電容量の目安: {peak_kw / CEC_UTILIZATION_FACTOR:,.0f} kW"
+          f"（施設最大需要 ÷ {CEC_UTILIZATION_FACTOR:.2f}）\n")
+    t += ("    ※ CEC 2025 IEPR の utilization factor 67%（申請受電容量→最大運転需要）の逆算。\n"
+          "       67%は「観測された上限」であり典型値ではないため、実際の申請容量は\n"
+          "       これより大きくなる可能性がある（設計書 §5-6(2)）\n")
+
+    # 契約種別（高圧/特別高圧）と、ピークデマンドから見た受電電圧区分の目安の食い違いを知らせる
+    suggest_ehv = resolve_voltage_class(peak_kw) != "hv_6000"
+    if contract_type == "高圧" and suggest_ehv:
+        t += (f"  ⚠ 導入前ピーク {peak_kw:,.0f} kW は2,000kW以上のため、契約種別は「特別高圧」が目安です"
+              "（現在は「高圧」。「電気料金設定」で切り替えられます）\n")
+    elif contract_type == "特別高圧" and not suggest_ehv:
+        t += (f"  ⚠ 導入前ピーク {peak_kw:,.0f} kW は2,000kW未満のため、契約種別は「高圧」が目安です"
+              "（現在は「特別高圧」。「電気料金設定」で切り替えられます）\n")
+    t += ("  ※ 電気料金は共通の「電気料金設定」を使用します"
+          "（既定値は東京電力EP。北海道電力タリフ表との連動は未実装）\n")
+    return t
+
+
 # ============================================================
 # IRR計算（ニュートン法）
 # ============================================================
@@ -2030,8 +2185,15 @@ def run_simulation(
     facility_args, face_args,
     num_facilities=1, num_faces=1,
     display_month=1, display_day=1,
+    demand_source=DEMAND_SOURCE_INDUSTRIAL, dc_args=None,
 ):
-    """メイン計算コールバック"""
+    """メイン計算コールバック
+
+    demand_source で需要の生成方法を切り替える。下流（蓄電池・料金計算・経済性）は
+    どちらも (365, 48) の需要配列を受け取るだけなので共通。
+      - DEMAND_SOURCE_INDUSTRIAL: ComStock需要プリセット・複数施設合算（facility_args 等を使用）
+      - DEMAND_SOURCE_DATACENTER: IT負荷 × PUE（dc_args を使用。facility_args 等は無視）
+    """
     try:
         # --- データ読み込み ---
         if csv_file is not None:
@@ -2044,10 +2206,22 @@ def run_simulation(
         else:
             return None, None, None, None, "エラー: 地点を選択するかCSVをアップロードしてください", "", None
 
-        # --- 需要データ読み込み（複数施設合算） ---
-        demand_30min, individual_demands = load_combined_demand(
-            facility_args, num_facilities, custom_csv=demand_custom_csv,
-        )
+        # --- 需要データの生成（需要ソースで分岐） ---
+        dc_info = None
+        if demand_source == DEMAND_SOURCE_DATACENTER:
+            # データセンター: IT負荷 × PUE。PUEは一定値のみのため外気温は使わない
+            # （気温連動PUEを実装するときは prepare_30min_data の気温を temp_30min として渡す）
+            try:
+                demand_30min, dc_info = resolve_dc_demand(dc_args)
+            except ValueError as e:
+                return None, None, None, None, f"エラー: {e}", "", None
+            # マイクログリッドの束ねメリット計算は施設ごとの需要リストを使う。DCは単一サイト
+            individual_demands = [demand_30min]
+        else:
+            # 産業用・MG: 複数施設合算
+            demand_30min, individual_demands = load_combined_demand(
+                facility_args, num_facilities, custom_csv=demand_custom_csv,
+            )
 
         # --- 面設定パース（5項目: Ppeak, 方位選択, 方位角, 傾斜角, PCS出力制限） ---
         faces = []
@@ -2163,7 +2337,11 @@ def run_simulation(
         )
 
         # --- 結果テキスト ---
-        result_text = f"年間発電量: {result['annual']:.1f} kWh/年\n"
+        result_text = ""
+        if dc_info is not None:
+            # データセンター: 需要（IT負荷×PUE）の節を先頭に置く
+            result_text += format_dc_summary(dc_info, contract_type) + "\n"
+        result_text += f"年間発電量: {result['annual']:.1f} kWh/年\n"
         result_text += f"K' = {result['K_prime']:.4f}\n"
         if bifacial_enabled:
             bif_val = float(bifaciality_val) if bifaciality_val is not None else BIFACIAL_DEFAULTS["bifaciality"]
@@ -2192,9 +2370,23 @@ def run_simulation(
             if bat_enabled and "annual_charge" in sc_result:
                 result_text += f"\n── 蓄電池 ──\n"
                 result_text += f"充放電モード: {battery_mode_label}\n"
-                result_text += f"年間充電量: {sc_result['annual_charge']:.1f} kWh/年\n"
-                result_text += f"年間放電量: {sc_result['annual_discharge']:.1f} kWh/年\n"
-                result_text += f"充放電損失: {sc_result['annual_charge'] - sc_result['annual_discharge']:.1f} kWh/年\n"
+                ch_kwh = sc_result['annual_charge']
+                dc_kwh = sc_result['annual_discharge']
+                loss_kwh = ch_kwh - dc_kwh
+                if dc_info is not None:
+                    # DC: LPのゼロ解が -0.0 と表示されるのを 0 に丸める（産業用の表示は従来どおり）
+                    ch_kwh, dc_kwh, loss_kwh = (v if abs(v) > 1e-6 else 0.0 for v in (ch_kwh, dc_kwh, loss_kwh))
+                result_text += f"年間充電量: {ch_kwh:.1f} kWh/年\n"
+                result_text += f"年間放電量: {dc_kwh:.1f} kWh/年\n"
+                result_text += f"充放電損失: {loss_kwh:.1f} kWh/年\n"
+                if dc_info is not None and ch_kwh == 0.0 and dc_kwh == 0.0:
+                    # DC特有: 需要が平坦だと契約電力を下げられず、料金に日内差もないため蓄電池の価値は
+                    # 構造的にゼロになりうる（バグではない。設計書 §11）
+                    result_text += ("  ※ 充放電量ゼロ: この条件では蓄電池に裁定余地がありません。DCの需要が平坦\n"
+                                    "     （24時間一定）だと契約電力を下げられず、料金にも日内の差（時間帯別単価）が\n"
+                                    "     ないためです（LPは正しく充放電ゼロを返しています）。\n"
+                                    "     IT負荷を日変動／CEC実測形状にする・PV容量を増やして余剰を作る・\n"
+                                    "     受電上限制約（今後実装予定）で価値が出ます。\n")
                 if sc_result.get("optimized"):
                     result_text += f"最適化ピークデマンド: {sc_result['opt_peak_kw']:.1f} kW\n"
                     result_text += f"最適化年間コスト: {sc_result['opt_annual_cost']:,.0f} 円\n"
@@ -2506,8 +2698,8 @@ def run_simulation(
                 cumulative += mg_annual_cashflow
                 result_text += f"  {y:>3d}  {mg_annual_cashflow:>12,.0f}  {cumulative:>14,.0f}\n"
 
-        # --- 需要構成サマリー ---
-        if demand_30min is not None:
+        # --- 需要構成サマリー（産業用のみ。DCは冒頭の「データセンター需要」節が担う） ---
+        if demand_30min is not None and dc_info is None:
             result_text += "\n── 需要構成 ──\n"
             for i in range(int(num_facilities)):
                 idx = i * 3
@@ -2521,6 +2713,12 @@ def run_simulation(
 
         # --- デバッグ情報 ---
         debug_text = f"データソース: {source_text}\n"
+        if dc_info is not None:
+            bd = dc_info["breakdown"]
+            debug_text += (f"需要ソース: データセンター（IT {dc_info['it_capacity_kw']:,.0f}kW, "
+                           f"PUE {dc_info['pue_const']:.2f}, {dc_info['profile_mode']}, "
+                           f"ノイズ={dc_info['noise_level']}）\n")
+            debug_text += f"  年間平均PUE={bd['avg_pue']:.3f} / ピークデマンド={dc_info['peak_demand_kw']:,.1f}kW\n"
         debug_text += f"緯度: {lat:.4f}°  経度: {lon:.4f}°\n"
         debug_text += f"pvlib: {'利用' if HAS_PVLIB else '未使用（GHI直接）'}\n"
         debug_text += f"面数: {len(faces)}\n"
@@ -2675,65 +2873,237 @@ def build_ui():
                 )
                 csv_input = gr.File(label="またはCSVアップロード（NEDO形式）", file_types=[".csv"])
 
-                # --- 需要設定（複数施設合算） ---
-                gr.Markdown("### ⚡ 需要設定（施設を組み合わせて需要カーブを作成）")
-                num_facilities_input = gr.Slider(
-                    label="施設数", minimum=1, maximum=MAX_FACILITIES, step=1, value=1,
+                # --- 需要設定（タブ: 産業用・MG / データセンター） ---
+                # 需要設定だけをタブで分割し、地点・PV面・蓄電池・料金・経済性は共通のまま使う
+                # （全部をタブ化するとPV面設定8面×5項目などが二重定義になるため。docs/decision_log.md 第5段階）。
+                # 選択中のタブは gr.Tab.select → gr.State で保持し、計算時に demand_source として渡す。
+                gr.Markdown("### ⚡ 需要設定")
+                demand_source_state = gr.State(DEMAND_SOURCE_INDUSTRIAL)
+
+                with gr.Tabs():
+                    # ===== タブ1: 産業用・MG（従来の需要設定。複数施設合算） =====
+                    with gr.Tab("🏭 産業用・MG") as tab_industrial:
+                        gr.Markdown("施設を組み合わせて需要カーブを作成します")
+                        num_facilities_input = gr.Slider(
+                            label="施設数", minimum=1, maximum=MAX_FACILITIES, step=1, value=1,
+                        )
+
+                        facility_components = []  # [type, area, count] × MAX_FACILITIES
+                        facility_groups = []
+
+                        for i in range(MAX_FACILITIES):
+                            visible = (i == 0)
+                            with gr.Group(visible=visible) as grp:
+                                gr.Markdown(f"**施設{i+1}**")
+                                with gr.Row():
+                                    ftype = gr.Dropdown(
+                                        label="施設タイプ",
+                                        choices=BUILDING_TYPE_CHOICES,
+                                        value="なし",
+                                    )
+                                    farea = gr.Number(
+                                        label="延床面積 [m²]",
+                                        value=0,
+                                        precision=0,
+                                    )
+                                    fcount = gr.Number(
+                                        label="棟数",
+                                        value=1,
+                                        precision=0,
+                                    )
+                            facility_components.extend([ftype, farea, fcount])
+                            facility_groups.append(grp)
+
+                            # 施設タイプ変更 → デフォルト延床面積を自動設定
+                            def on_building_type_change(btype):
+                                info = BUILDING_TYPES.get(btype, {})
+                                default_area = info.get("default_area_m2", 0)
+                                return gr.update(value=default_area)
+
+                            ftype.change(
+                                fn=on_building_type_change,
+                                inputs=[ftype],
+                                outputs=[farea],
+                                api_visibility="hidden",
+                            )
+
+                        # 施設数変更で表示切替
+                        def update_facility_visibility(n):
+                            return [gr.update(visible=(i < n)) for i in range(MAX_FACILITIES)]
+
+                        num_facilities_input.change(
+                            fn=update_facility_visibility,
+                            inputs=[num_facilities_input],
+                            outputs=facility_groups,
+                            api_visibility="hidden",
+                        )
+
+                        demand_csv_input = gr.File(
+                            label="カスタム需要CSV（追加合算、timestamp + demand_kWh）",
+                            file_types=[".csv"],
+                        )
+
+                    # ===== タブ2: データセンター（IT負荷 × PUE） =====
+                    with gr.Tab("🏢 データセンター") as tab_datacenter:
+                        gr.Markdown(
+                            "IT負荷とPUEからDCの電力需要を生成します（30分×365日）。"
+                            "<br><small>空冷前提（液冷は対象外）。PUEは一定値のみ（気温連動は保留）。"
+                            "地点・PV・蓄電池・電気料金・経済性は下の共通設定を使います。</small>"
+                        )
+                        workload_input = gr.Dropdown(
+                            label="用途",
+                            choices=list(DC_WORKLOAD_PRESETS.keys()),
+                            value="ハウジング（コロケーション）",
+                        )
+                        gr.Markdown(
+                            "<small>用途を選ぶと負荷プロファイルと短周期変動が自動設定されます"
+                            "（「手動設定」で個別指定）。<br>"
+                            "ハウジング＝CEC実測形状（米国商用DC約100施設のinterval meter由来）／"
+                            "AI学習＝定常（LBNL: 大規模AI学習クラスタは連続バッチで時刻変動なし）</small>"
+                        )
+
+                        # --- 容量の指定（3方式。内部では常にIT容量[kW]に正規化） ---
+                        capacity_mode_input = gr.Radio(
+                            label="容量の指定方法",
+                            choices=CAPACITY_MODES,
+                            value="規模プリセット",
+                        )
+                        with gr.Row(visible=True) as cap_preset_row:
+                            size_preset_input = gr.Dropdown(
+                                label="規模",
+                                choices=list(DC_SIZE_PRESETS.keys()),
+                                value="中規模",
+                            )
+                        with gr.Row(visible=False) as cap_direct_row:
+                            it_capacity_input = gr.Number(
+                                label="IT定格容量 [kW]",
+                                value=DC_DEFAULTS["it_capacity_kw"], precision=1,
+                            )
+                        with gr.Row(visible=False) as cap_rack_row:
+                            n_racks_input = gr.Number(
+                                label="ラック数", value=DC_DEFAULTS["n_racks"], precision=0,
+                            )
+                            kw_per_rack_input = gr.Number(
+                                label="ラック電力密度 [kW/ラック]",
+                                value=DC_DEFAULTS["kw_per_rack"], precision=1,
+                            )
+                        gr.Markdown(
+                            "<small>⚠ 規模区分は<b>暫定値</b>（LBNL Shape Makerは large/medium/small を"
+                            "用いるがMW区分は非公開）。エッジ 0.1〜0.5 ／ 小規模 0.5〜2 ／ "
+                            "中規模 2〜20 ／ ハイパースケール 20〜100+ MW<br>"
+                            f"ラック電力密度の目安（参考値）: {RACK_DENSITY_HINT} kW/ラック<br>"
+                            "延床面積では指定しません（DCはラック密度で電力密度が1桁変わるため）</small>"
+                        )
+
+                        # --- 負荷プロファイル（用途=手動設定のときのみ表示） ---
+                        with gr.Column(visible=False) as profile_manual_group:
+                            it_profile_input = gr.Dropdown(
+                                label="負荷プロファイル",
+                                choices=IT_LOAD_PROFILE_MODES,
+                                value=PROFILE_CEC,
+                            )
+                            noise_input = gr.Dropdown(
+                                label="短周期変動（ノイズ）",
+                                choices=NOISE_LEVELS,
+                                value="低（3〜7%）",
+                            )
+                        it_load_factor_input = gr.Number(
+                            label="IT負荷率（年平均）[%]",
+                            value=DC_DEFAULTS["it_load_factor_pct"], precision=1,
+                        )
+                        with gr.Row(visible=False) as it_daily_row:
+                            it_peak_input = gr.Number(
+                                label="ピーク負荷率 [%]",
+                                value=DC_DEFAULTS["it_peak_pct"], precision=1,
+                            )
+                            it_bottom_input = gr.Number(
+                                label="ボトム負荷率 [%]",
+                                value=DC_DEFAULTS["it_bottom_pct"], precision=1,
+                            )
+                            it_peak_hour_input = gr.Number(
+                                label="ピーク時刻 [時]",
+                                value=DC_DEFAULTS["it_peak_hour"], precision=0,
+                                minimum=0, maximum=23,
+                            )
+                        gr.Markdown(
+                            "<small>「IT負荷率（年平均）」が<b>水準</b>、プロファイルが<b>形状</b>を決めます"
+                            "（形状は年平均=1.0に正規化）。CSVアップロードによるIT負荷指定は未実装</small>"
+                        )
+
+                        pue_const_input = gr.Number(
+                            label="PUE（施設全体電力 ÷ IT機器電力）",
+                            value=DC_DEFAULTS["pue_const"], precision=2,
+                        )
+                        gr.Markdown(
+                            "<small>PUEは一定値です。既存DCの実績PUEを持っている場合はそれを直接入力してください"
+                            "（気温連動PUEは出典が固まるまで保留）。</small>"
+                        )
+
+                # DC入力コンポーネント。DC_INPUT_KEYS と同じ並びにすること（on_click が zip で辞書に戻す）
+                dc_components = [
+                    workload_input, capacity_mode_input, size_preset_input, it_capacity_input,
+                    n_racks_input, kw_per_rack_input, it_profile_input, noise_input,
+                    it_load_factor_input, it_peak_input, it_bottom_input, it_peak_hour_input,
+                    pue_const_input,
+                ]
+                if len(dc_components) != len(DC_INPUT_KEYS):
+                    raise RuntimeError("dc_components と DC_INPUT_KEYS の要素数が一致しません")
+
+                # 選択中のタブを需要ソースとして保持する
+                tab_industrial.select(
+                    fn=lambda: DEMAND_SOURCE_INDUSTRIAL,
+                    outputs=[demand_source_state],
+                    api_visibility="hidden",
                 )
-
-                facility_components = []  # [type, area, count] × MAX_FACILITIES
-                facility_groups = []
-
-                for i in range(MAX_FACILITIES):
-                    visible = (i == 0)
-                    with gr.Group(visible=visible) as grp:
-                        gr.Markdown(f"**施設{i+1}**")
-                        with gr.Row():
-                            ftype = gr.Dropdown(
-                                label="施設タイプ",
-                                choices=BUILDING_TYPE_CHOICES,
-                                value="なし",
-                            )
-                            farea = gr.Number(
-                                label="延床面積 [m²]",
-                                value=0,
-                                precision=0,
-                            )
-                            fcount = gr.Number(
-                                label="棟数",
-                                value=1,
-                                precision=0,
-                            )
-                    facility_components.extend([ftype, farea, fcount])
-                    facility_groups.append(grp)
-
-                    # 施設タイプ変更 → デフォルト延床面積を自動設定
-                    def on_building_type_change(btype):
-                        info = BUILDING_TYPES.get(btype, {})
-                        default_area = info.get("default_area_m2", 0)
-                        return gr.update(value=default_area)
-
-                    ftype.change(
-                        fn=on_building_type_change,
-                        inputs=[ftype],
-                        outputs=[farea],
-                        api_visibility="hidden",
-                    )
-
-                # 施設数変更で表示切替
-                def update_facility_visibility(n):
-                    return [gr.update(visible=(i < n)) for i in range(MAX_FACILITIES)]
-
-                num_facilities_input.change(
-                    fn=update_facility_visibility,
-                    inputs=[num_facilities_input],
-                    outputs=facility_groups,
+                tab_datacenter.select(
+                    fn=lambda: DEMAND_SOURCE_DATACENTER,
+                    outputs=[demand_source_state],
                     api_visibility="hidden",
                 )
 
-                demand_csv_input = gr.File(
-                    label="カスタム需要CSV（追加合算、timestamp + demand_kWh）",
-                    file_types=[".csv"],
+                def on_capacity_mode_change(mode):
+                    """容量の指定方法に応じて入力欄を切り替える。"""
+                    return (
+                        gr.update(visible=(mode == "規模プリセット")),
+                        gr.update(visible=(mode == "IT容量を直接入力")),
+                        gr.update(visible=(mode == "ラック数×density")),
+                    )
+
+                capacity_mode_input.change(
+                    fn=on_capacity_mode_change,
+                    inputs=[capacity_mode_input],
+                    outputs=[cap_preset_row, cap_direct_row, cap_rack_row],
+                    api_visibility="hidden",
+                )
+
+                def on_workload_change(preset, cur_profile):
+                    """用途プリセットでプロファイルとノイズを一括設定する。
+
+                    「手動設定」のときだけ個別指定の欄を出す。日変動の形状パラメータ
+                    （ピーク/ボトム/時刻）は、実際に使われるプロファイルが日変動のときだけ表示する。
+                    """
+                    p = DC_WORKLOAD_PRESETS.get(preset)
+                    manual = p is None
+                    profile = cur_profile if manual else p["profile"]
+                    return (
+                        gr.update(visible=manual),
+                        gr.update() if manual else gr.update(value=p["profile"]),
+                        gr.update() if manual else gr.update(value=p["noise"]),
+                        gr.update(visible=(profile == PROFILE_DIURNAL)),
+                    )
+
+                workload_input.change(
+                    fn=on_workload_change,
+                    inputs=[workload_input, it_profile_input],
+                    outputs=[profile_manual_group, it_profile_input, noise_input, it_daily_row],
+                    api_visibility="hidden",
+                )
+
+                it_profile_input.change(
+                    fn=lambda mode: gr.update(visible=(mode == PROFILE_DIURNAL)),
+                    inputs=[it_profile_input],
+                    outputs=[it_daily_row],
+                    api_visibility="hidden",
                 )
 
                 # --- 電気料金設定 ---
@@ -3145,6 +3515,8 @@ def build_ui():
         #   facility_components: MAX_FACILITIES * 3 = 18
         #   face_components: MAX_FACES * 5 = 40
         #   display: num_facilities, month, day, num_faces = 4
+        #   demand_source_state (1): 選択中の需要タブ（industrial / datacenter）
+        #   dc_components: len(DC_INPUT_KEYS) = 13（データセンタータブの入力。産業用のときは無視される）
         all_inputs = [
             station_input, csv_input,
             demand_csv_input,
@@ -3182,16 +3554,21 @@ def build_ui():
             month_val = args[tail_start + 1]
             day_val = args[tail_start + 2]
             num_f = args[tail_start + 3]
+            demand_source = args[tail_start + 4]
+            dc_vals = args[tail_start + 5: tail_start + 5 + len(DC_INPUT_KEYS)]
+            dc_args = dict(zip(DC_INPUT_KEYS, dc_vals))
 
             return run_simulation(
                 *base, fac_args, face_args,
                 num_facilities=num_fac, num_faces=num_f,
                 display_month=month_val, display_day=day_val,
+                demand_source=demand_source, dc_args=dc_args,
             )
 
         all_inputs_with_display = all_inputs + [
             num_facilities_input, month_input, day_input, num_faces_input,
-        ]
+            demand_source_state,
+        ] + dc_components
 
         run_btn.click(
             fn=on_click,
