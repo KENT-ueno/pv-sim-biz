@@ -3942,6 +3942,10 @@ def build_ui():
         gr.api(mcp_tools.estimate_pv_generation, api_name="estimate_pv_generation")
         gr.api(mcp_tools.validate_industrial_params, api_name="validate_industrial_params")
         gr.api(mcp_tools.simulate_industrial_pv, api_name="simulate_industrial_pv")
+        # データセンター（Phase 7 段階4）
+        gr.api(mcp_tools.estimate_dc_demand, api_name="estimate_dc_demand")
+        gr.api(mcp_tools.validate_dc_params, api_name="validate_dc_params")
+        gr.api(mcp_tools.simulate_dc, api_name="simulate_dc")
 
     return demo
 

@@ -338,7 +338,7 @@ demand(t) = IT定格容量 × IT負荷率(年平均) × 形状(t) × PUE × 0.5 
 | 1 | 計算層の移植（タリフ表・DC需要モデルの定数と関数） | ✅ 完了（commit e783cf9） |
 | 2 | `run_simulation` に需要ソース分岐（産業用 / データセンター） | ✅ 完了。`demand_source` / `dc_args` をキーワード引数の末尾に追加（省略時=産業用で従来どおり）。DC入力の解決と検証は `resolve_dc_demand()`、結果テキストは `format_dc_summary()`。PUEは一定値のみ |
 | 3 | UI: 需要設定を `gr.Tabs()` で分割。共通セクションは据え置き | ✅ 完了。タブ「産業用・MG」/「データセンター」。選択タブは `gr.Tab.select` → `gr.State`、`on_click` が末尾の引数から `dc_args` を復元（並びは `DC_INPUT_KEYS`）。出力4タブは共通 |
-| 4 | MCPツール `estimate_dc_demand` / `validate_dc_params` / `simulate_dc` | 未着手 |
+| 4 | MCPツール `estimate_dc_demand` / `validate_dc_params` / `simulate_dc` | ✅ 実装済み（**未コミット**）。`mcp_tools.py` に3ツール追加（計7ツール）。需要は `app.resolve_dc_demand()`、以降は産業用と同じ `_run_industrial_simulation`（`demand_override` / `grid_cap_kw` 引数）を再利用。受電上限を守れないときは `error` でなく `grid_cap_infeasible: true` の診断を返す。`estimate_pue` は気温連動PUEが保留のため作らない。MGは非対応。詳細は設計書 §10 実装メモ |
 | 5 | **受電上限制約**: `optimize_battery()` に `grid_import_cap_kw` を追加（MGにも有用） | ✅ 実装済み（**未コミット**）。DCタブに「系統受電上限」（制限なし／高圧に収める1,999kW／22・33kVに収める9,999kW／手入力）。上限を強制できるのは蓄電池「最適充放電（LP）」のみ（他は超過判定と必要量の目安の表示）。守れないときは `diagnose_grid_cap()` の診断（energy/power/capacity）を返す。上限ありのLPだけ周期SOC。上限なしのLPはビット同一。詳細は設計書 §7 実装メモ |
 | （保留）| 需要側の調整（IT負荷のシフト）。DCCN Phase 5・将来項目で簡易版の範囲外 | **保留**（ユーザー判断 2026-09-19「ここをいじり始めるとよくない」）。再開時は蓄電池優先で「必要な柔軟負荷割合」を出力として返す形を先に検討し、実装前に目的を確認する。経緯は `docs/decision_log.md` 第8段階 |
 
@@ -349,7 +349,8 @@ demand(t) = IT定格容量 × IT負荷率(年平均) × 形状(t) × PUE × 0.5 
 - **変更後は必ず既存テストを全部回す**（回帰の有無を確認）:
   `test_fable5_fixes.py`（PASS 24）／`test_mcp_tools.py`（PASS 45）／`test_verify_battery_bug.py`／
   `test_dc_mode.py`（PASS 48。DC需要・分岐・UI配線）／`test_azimuth_input.py`（PASS 19。方位角欄の解釈）／
-  `test_grid_cap.py`（PASS 75。受電上限・診断・LP。診断の健全性は乱数60ケースで診断⇔LPの実行可否が完全一致）
+  `test_grid_cap.py`（PASS 75。受電上限・診断・LP。診断の健全性は乱数60ケースで診断⇔LPの実行可否が完全一致）／
+  `test_mcp_dc_tools.py`（PASS 117。DCのMCPツール。UI（run_simulation）との数値一致・受電上限の各状態・入力検証）
 - **産業用の出力を厳密に守るには**、変更前後で `run_simulation` の出力（結果テキスト・デバッグ・グラフJSON）を
   複数シナリオで保存→照合する（LPも決定論的に再現する）。段階2・3では5シナリオ×7項目=35項目が全て同一だった
 - **ブランチは `feature/datacenter`。push はユーザーの明示的指示を待つこと**

@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-test_mcp_tools.py — pv-sim-biz MCPツール群のローカル検証（gitに含めない）
+test_mcp_tools.py — pv-sim-biz MCPツール群（産業用）の検証
 ====================================================================
-fip/ghと同じ慣習: このファイルはリポジトリにコミットしない。
+リポジトリで管理する（CLAUDE.md の「変更後に必ず回すテスト」に含まれるため。
+fip/ghは同種のファイルをコミットしない慣習だが、bizでは回帰テストとして管理する）。
 直接呼び出し検証のみ（HTTP経由の検証は別途 python app.py 起動後にcurlで実施）。
+データセンター用ツールは test_mcp_dc_tools.py。
 """
 import sys
 import os

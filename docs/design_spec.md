@@ -803,6 +803,27 @@ IT_load(t) = IT_base(t) + IT_flex(t)
 50地点ループで比較する使い方ができる。**これが3サーバー横断デモの目玉になりうる**
 （pv-sim-dc でPUE、pv-sim-fip でJEPX/FIP、pv-sim-biz で産業需要を同時に引く）。
 
+**実装メモ（2026-09-19、Phase 7 段階4）**
+
+`mcp_tools.py` に `estimate_dc_demand` / `validate_dc_params` / `simulate_dc` を追加した（合計7ツール）。
+`estimate_pue` は**作っていない**（PUEが一定値で、地点に依存しないため。気温連動PUEを再開するときに追加する）。
+
+- **需要の生成**: `app.resolve_dc_demand()` をそのまま呼ぶ（UIと同じ検証・同じ需要）。以降は産業用と同じ計算経路
+  `_run_industrial_simulation(p, demand_override=…, grid_cap_kw=…)` を再利用する（重複実装しない）。産業用は
+  引数を省略した呼び出しのままで出力がビット同一（HEAD版との突き合わせで確認）
+- **入力**: 簡易キー（`housing` / `size_preset` / `hv_under_2000kw` など）を `_dc_maps()` で app.py の日本語ラベルに対応づける。
+  容量は3方式（`size_preset` / `it_capacity` / `rack_density`）。**延床面積では指定しない**。
+  `estimate_dc_demand` には受電上限を含めない（需要だけを見るツールのため）
+- **検証**: `validate_dc_params` は DC入力の不備・共通入力（PV・蓄電池・料金など）の不備を**まとめて**返す。
+  需要を生成して、契約種別とピークの食い違い、受電上限が拘束しない／強制できない（LP以外）／LPに時間がかかる、
+  を警告する。MG（`mg_*`）はDCツールでは扱わない
+- **受電上限を守れないとき**: `simulate_dc` は `error` ではなく `grid_cap_infeasible: true` の**診断結果**を返す
+  （`reason` / UIと同じ説明文 `message` / `grid_cap.violations` / 必要な蓄電池の下限の目安 / `next_step`）。
+  経済性の節は含まない。エージェントが「上限を上げる／蓄電池を増やす」を提案できるようにするため
+- **`grid_cap` 節**（上限指定時のみ）: `status`（`enforced` / `not_enforced` / `infeasible` / `infeasible_lp`）、
+  導入前後のピークと上限内か、必要な蓄電池の下限の目安
+- 公開スキーマ: `simulate_*` は引数の説明を持たない（産業用と同じ既存の挙動）。`validate_*` に全引数の説明を置く
+
 ---
 
 ## 11. 開発フェーズ
