@@ -338,8 +338,8 @@ demand(t) = IT定格容量 × IT負荷率(年平均) × 形状(t) × PUE × 0.5 
 | 1 | 計算層の移植（タリフ表・DC需要モデルの定数と関数） | ✅ 完了（commit e783cf9） |
 | 2 | `run_simulation` に需要ソース分岐（産業用 / データセンター） | ✅ 完了。`demand_source` / `dc_args` をキーワード引数の末尾に追加（省略時=産業用で従来どおり）。DC入力の解決と検証は `resolve_dc_demand()`、結果テキストは `format_dc_summary()`。PUEは一定値のみ |
 | 3 | UI: 需要設定を `gr.Tabs()` で分割。共通セクションは据え置き | ✅ 完了。タブ「産業用・MG」/「データセンター」。選択タブは `gr.Tab.select` → `gr.State`、`on_click` が末尾の引数から `dc_args` を復元（並びは `DC_INPUT_KEYS`）。出力4タブは共通 |
-| 4 | MCPツール `estimate_dc_demand` / `validate_dc_params` / `simulate_dc` | ✅ 実装済み（**未コミット**）。`mcp_tools.py` に3ツール追加（計7ツール）。需要は `app.resolve_dc_demand()`、以降は産業用と同じ `_run_industrial_simulation`（`demand_override` / `grid_cap_kw` 引数）を再利用。受電上限を守れないときは `error` でなく `grid_cap_infeasible: true` の診断を返す。`estimate_pue` は気温連動PUEが保留のため作らない。MGは非対応。詳細は設計書 §10 実装メモ |
-| 5 | **受電上限制約**: `optimize_battery()` に `grid_import_cap_kw` を追加（MGにも有用） | ✅ 実装済み（**未コミット**）。DCタブに「系統受電上限」（制限なし／高圧に収める1,999kW／22・33kVに収める9,999kW／手入力）。上限を強制できるのは蓄電池「最適充放電（LP）」のみ（他は超過判定と必要量の目安の表示）。守れないときは `diagnose_grid_cap()` の診断（energy/power/capacity）を返す。上限ありのLPだけ周期SOC。上限なしのLPはビット同一。詳細は設計書 §7 実装メモ |
+| 4 | MCPツール `estimate_dc_demand` / `validate_dc_params` / `simulate_dc` | ✅ 完了・**本番反映済み**（2026-09-19）。`mcp_tools.py` に3ツール追加（計7ツール）。需要は `app.resolve_dc_demand()`、以降は産業用と同じ `_run_industrial_simulation`（`demand_override` / `grid_cap_kw` 引数）を再利用。受電上限を守れないときは `error` でなく `grid_cap_infeasible: true` の診断を返す。`estimate_pue` は気温連動PUEが保留のため作らない。MGは非対応。詳細は設計書 §10 実装メモ |
+| 5 | **受電上限制約**: `optimize_battery()` に `grid_import_cap_kw` を追加（MGにも有用） | ✅ 完了・**本番反映済み**（2026-09-19）。DCタブに「系統受電上限」（制限なし／高圧に収める1,999kW／22・33kVに収める9,999kW／手入力）。上限を強制できるのは蓄電池「最適充放電（LP）」のみ（他は超過判定と必要量の目安の表示）。守れないときは `diagnose_grid_cap()` の診断（energy/power/capacity）を返す。上限ありのLPだけ周期SOC。上限なしのLPはビット同一。詳細は設計書 §7 実装メモ |
 | （保留）| 需要側の調整（IT負荷のシフト）。DCCN Phase 5・将来項目で簡易版の範囲外 | **保留**（ユーザー判断 2026-09-19「ここをいじり始めるとよくない」）。再開時は蓄電池優先で「必要な柔軟負荷割合」を出力として返す形を先に検討し、実装前に目的を確認する。経緯は `docs/decision_log.md` 第8段階 |
 
 ### 作業上の厳守事項
@@ -353,8 +353,10 @@ demand(t) = IT定格容量 × IT負荷率(年平均) × 形状(t) × PUE × 0.5 
   `test_mcp_dc_tools.py`（PASS 117。DCのMCPツール。UI（run_simulation）との数値一致・受電上限の各状態・入力検証）
 - **産業用の出力を厳密に守るには**、変更前後で `run_simulation` の出力（結果テキスト・デバッグ・グラフJSON）を
   複数シナリオで保存→照合する（LPも決定論的に再現する）。段階2・3では5シナリオ×7項目=35項目が全て同一だった
-- **ブランチは `feature/datacenter`。push はユーザーの明示的指示を待つこと**
-  （`origin` = HF Space なので **push = 本番デプロイ**）
+- **push はユーザーの明示的指示を待つこと**（`origin` = HF Space なので **`main` への push = 本番デプロイ**）。
+  DC統合は 2026-09-19 に `main` へマージ済み（`main` = 4d67237）。以後の開発ブランチは
+  `feature/datacenter`（`main` と同じ位置から続ける）。**HF・GitHubにリモートの feature ブランチは無い**
+  （公開済みだった非公開メモの除去のため削除した。下の「本番反映の記録」参照）
 
 ### DCで判明している重要な事実（設計書 §11・§5-7）
 
@@ -389,8 +391,20 @@ demand(t) = IT定格容量 × IT負荷率(年平均) × 形状(t) × PUE × 0.5 
 - MCP経由（`faces` の `azimuth_deg` 既定180）は元から影響を受けない
 - **本番反映済み（2026-09-19）**: `main` に cherry-pick（b9378b9）して push（`main` = 2f30079）。本番UIで未操作の既定が
   南(180.0°)・年間5,038.5kWh になることと、MCP経由の既知値（東京500kW・福岡MG）が不変なことを確認。
-  `main` にはDC統合を入れていない（DCは `feature/datacenter` のみ）。`feature/datacenter` の 841ca22 と `main` の
-  b9378b9 は同一内容の別コミットで、将来 `feature/datacenter` を `main` に取り込むときは同一変更として競合しない
+  （その後、DC統合を `main` にマージした。同一内容の別コミット 841ca22 と b9378b9 は競合しなかった）
+
+### 本番反映の記録（2026-09-19、`main` = 4d67237）
+
+- `main` に `feature/datacenter` をマージして HF・GitHub の `main` に push。本番の確認:
+  産業用MCP（既定・LP+逆潮流禁止）の出力がローカルと**完全一致**、DCツール（`estimate_dc_demand` /
+  `validate_dc_params` / `simulate_dc`）の結果もローカルと一致、公開スキーマは7ツール、UIに「データセンター」タブと
+  「系統受電上限」あり（方位角欄は空欄の既定＝南向き）。受電上限＋LPは約16秒
+- **非公開の構想メモ（`next_development_idea.md`）**: 以前の feature ブランチのpushでHF・GitHubに公開されていた。
+  履歴から除去（13コミットを書き換え）して `main` に反映し、リモートの feature ブランチを削除した。
+  ローカルには残し `.git/info/exclude` で無視している。設計書・判断記録の言及は「将来構想（非公開メモ）」に置換済み。
+  ⚠ 旧コミットは、SHAを指定したURL（旧feature先端 9e0930d）ではHF・GitHubとも**まだ取得できる**（ブランチ削除では消えない）。
+  完全に消すには GitHub のサポート依頼／HFの履歴スカッシュ等が必要（未実施）
+- ローカルに `backup/feature-datacenter-before-memo-purge`（メモ入りの旧履歴）がある。**pushしないこと**（不要なら削除）
 
 ---
 
