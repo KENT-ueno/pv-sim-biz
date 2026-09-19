@@ -177,6 +177,8 @@ pv-sim-biz/
 - **NEDO METPV-20** — Japanese solar irradiance database
 - **NREL ComStock EULP** — End-Use Load Profiles for the U.S. building stock: https://comstock.nrel.gov/page/datasets
 - **PuLP** — Python LP modeler: https://coin-or.github.io/pulp/
+- **CEC 2025 IEPR** — *Data Center Methodology Memo* (source of the commercial data-center load shape used in data center mode): https://www.energy.ca.gov/media/12647
+- **LBNL Data Center and Industrial Electrical Load Shape Maker** — definitions of the flat profile and short-cycle noise bands: https://github.com/LBNL-DataCenter-CoE/shape_maker
 
 ---
 
