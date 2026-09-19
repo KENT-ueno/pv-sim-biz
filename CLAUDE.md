@@ -379,7 +379,11 @@ demand(t) = IT定格容量 × IT負荷率(年平均) × 形状(t) × PUE × 0.5 
 - **修正**: 方位角欄を `gr.Textbox`（空欄=未指定）に変更。`run_simulation` が空欄/空白→方位（選択）、数値→直接入力
   （優先）、数値以外・nan/inf→日本語のエラー、明示的な `0` →真北、と解釈する。**未操作の既定は南向き（180°）になり、
   既定入力の発電量が約+48%になる（従来の値が過小だった）**。`test_azimuth_input.py`（PASS 19）で検証
-- MCP経由（`faces` の `azimuth_deg` 既定180）は元から影響を受けない。本番Spaceは未修正（push待ち）
+- MCP経由（`faces` の `azimuth_deg` 既定180）は元から影響を受けない
+- **本番反映済み（2026-09-19）**: `main` に cherry-pick（b9378b9）して push（`main` = 2f30079）。本番UIで未操作の既定が
+  南(180.0°)・年間5,038.5kWh になることと、MCP経由の既知値（東京500kW・福岡MG）が不変なことを確認。
+  `main` にはDC統合を入れていない（DCは `feature/datacenter` のみ）。`feature/datacenter` の 841ca22 と `main` の
+  b9378b9 は同一内容の別コミットで、将来 `feature/datacenter` を `main` に取り込むときは同一変更として競合しない
 
 ---
 
