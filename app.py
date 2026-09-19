@@ -138,6 +138,223 @@ ELECTRICITY_RATE_EHV = {  # 特別高圧（東京電力EP 特別高圧電力）
 }
 SUBSTATION_COST_PER_KVA = 27500  # 受電設備工事費 [円/kVA]
 
+# ============================================================
+# 電気料金タリフ（パイロット版: 北海道電力エリア）
+# ============================================================
+# 出典・調査記録: docs/hokkaido_power_voltage_tariff.md（2026-09-06確認）
+#   受電電圧の区分:  北海道電力ネットワーク 託送供給等約款 第13条
+#     https://www.hepco.co.jp/network/con_service/stipulation/pdf/r080401_con_supply.pdf
+#   料金単価:  北海道電力 標準電圧6,000V向け
+#     https://www.hepco.co.jp/business/price/unitprice/unitprice04.html
+#              北海道電力 標準電圧30,000V/60,000V向け
+#     https://www.hepco.co.jp/business/price/unitprice/unitprice03.html
+#
+# 【将来の拡張方針】
+#   パイロット版は北海道電力のみ。他エリア（東北・東京・…）を追加するときは
+#   TARIFFS に電力会社を1階層足すだけで済む構造にしてある。
+#   計算関数 calc_electricity_cost() はスカラー単価を受け取るだけで
+#   タリフの出自を問わないため、テーブル追加以外のコード変更は不要。
+#
+# 【注意1: 季時別区分】
+#   北海道電力の「一般料金」は電力量料金が年間単一単価であり、
+#   東京電力EPのような夏季(7-9月)/その他季の区別を持たない。
+#   このため energy_charge_summer と energy_charge_other に同一値を入れている。
+#   （季時別が必要な「時間帯別料金」メニューはパイロット版では扱わない）
+#
+# 【注意2: 低圧を持たない理由】
+#   データセンターは最小規模でも数百kW級であり、低圧（50kW未満）で受電することは
+#   考えられないため、低圧メニューは意図的に実装しない（設計書 §4-2）。
+
+# 受電電圧区分の境界（託送供給等約款 第13条の標準電圧。契約電力[kW]で判定）
+VOLTAGE_CLASS_THRESHOLDS = [
+    # (下限kW, 上限kW（未満）, 区分キー)
+    (0,      2000,        "hv_6000"),    # 50kW以上2,000kW未満  → 標準電圧 6,000V（実系統 6.6kV）
+    (2000,   10000,       "ehv_30000"),  # 2,000kW以上10,000kW未満 → 標準電圧 30,000V（実系統 22/33kV）
+    (10000,  float("inf"), "ehv_60000"), # 10,000kW以上          → 標準電圧 60,000V（実系統 66kV）
+]
+
+VOLTAGE_CLASS_LABELS = {
+    "hv_6000":   "高圧 6,000V（実系統 6.6kV／50kW以上2,000kW未満）",
+    "ehv_30000": "特別高圧 30,000V（実系統 22・33kV／2,000kW以上10,000kW未満）",
+    "ehv_60000": "特別高圧 60,000V（実系統 66kV／10,000kW以上）",
+}
+
+# 共通の従量費目（全国一律・メニュー非依存）
+DEFAULT_POWER_FACTOR_PCT = 85     # 力率 [%]（85%=割引なし）
+DEFAULT_FUEL_ADJUSTMENT = 0.00    # 燃料費調整単価 [円/kWh]（時期により変動、既定0）
+DEFAULT_RENEWABLE_SURCHARGE = 4.18  # 再エネ賦課金 [円/kWh]（R8年度、全国一律）
+
+# 電力会社 → 受電電圧区分 → メニュー
+# メニュー種別:  "業務用電力" = オフィス・商業施設等向け
+#                "高圧電力"/"特別高圧電力" = 工場等の産業用向け（負荷率の高い需要家に有利）
+TARIFFS = {
+    "北海道電力": {
+        "hv_6000": {
+            "高圧電力": {
+                "basic_charge_per_kw": 2880.20,
+                "energy_charge_summer": 21.62,
+                "energy_charge_other": 21.62,
+            },
+            "業務用電力": {
+                "basic_charge_per_kw": 2693.20,
+                "energy_charge_summer": 23.40,
+                "energy_charge_other": 23.40,
+            },
+        },
+        "ehv_30000": {
+            "特別高圧電力": {
+                "basic_charge_per_kw": 2696.50,
+                "energy_charge_summer": 20.07,
+                "energy_charge_other": 20.07,
+            },
+            "業務用電力": {
+                "basic_charge_per_kw": 2630.50,
+                "energy_charge_summer": 21.02,
+                "energy_charge_other": 21.02,
+            },
+        },
+        "ehv_60000": {
+            "特別高圧電力": {
+                "basic_charge_per_kw": 2685.50,
+                "energy_charge_summer": 20.03,
+                "energy_charge_other": 20.03,
+            },
+            "業務用電力": {
+                "basic_charge_per_kw": 2619.50,
+                "energy_charge_summer": 20.98,
+                "energy_charge_other": 20.98,
+            },
+        },
+    },
+}
+
+DEFAULT_UTILITY = "北海道電力"
+# DCは24時間稼働で負荷率が非常に高いため、電力量料金が安い産業用メニュー
+# （高圧電力／特別高圧電力）を既定とする。業務用電力も選択可（比較用）。
+INDUSTRIAL_MENU_BY_CLASS = {
+    "hv_6000": "高圧電力",
+    "ehv_30000": "特別高圧電力",
+    "ehv_60000": "特別高圧電力",
+}
+
+
+# ============================================================
+# データセンター需要モデル（設計書 §5）
+# ============================================================
+# --- 負荷プロファイル方式 ---
+# 「IT負荷率（年平均）」を水準、プロファイルを形状として分離する。
+# 各プロファイルは年平均=1.0に正規化された形状を返し、水準を掛けて load_factor(t) になる。
+PROFILE_CEC = "CEC実測形状（米国商用DC）"
+PROFILE_FLAT = "定常（AI学習・ハイパースケール）"
+PROFILE_DIURNAL = "日変動（自社サーバー室・業務連動）"
+IT_LOAD_PROFILE_MODES = [PROFILE_CEC, PROFILE_FLAT, PROFILE_DIURNAL]
+
+NOISE_LEVELS = ["なし", "低（3〜7%）", "高（12〜18%）"]
+
+PUE_MODES = ["気温連動", "一定"]
+
+# --- 規模プリセット（⚠ 暫定値。公開された定義に基づく数値ではない） ---
+# LBNL Shape Maker のREADMEは large/medium/small を用いるが、
+# その MW 区分はリポジトリに公開されていない（2026-09-19確認）。
+# 下記は業界で一般的に使われる区分をユーザー合意のうえ採用したもの。
+CAPACITY_MODES = ["規模プリセット", "IT容量を直接入力", "ラック数×density"]
+DC_SIZE_PRESETS = {
+    "エッジ": {"it_capacity_kw": 300.0, "note": "0.1〜0.5 MW／基地局併設・地域拠点"},
+    "小規模": {"it_capacity_kw": 1000.0, "note": "0.5〜2 MW／企業自社DC・小規模ハウジング"},
+    "中規模": {"it_capacity_kw": 5000.0, "note": "2〜20 MW／商用ハウジング・コロケーション"},
+    "ハイパースケール": {"it_capacity_kw": 40000.0, "note": "20〜100+ MW／クラウド・AI学習"},
+}
+
+# --- 用途プリセット（プロファイルとノイズを一括設定） ---
+# ハウジング → CEC実測形状（商用DCのinterval meter由来）
+# AI（学習）  → 定常。LBNL "Flat — characteristic of large AI training clusters
+#               running continuous batch jobs" ／ PNNL-38601 "Active states … maintain
+#               elevated levels for tens of minutes to hours" に対応
+DC_WORKLOAD_PRESETS = {
+    "ハウジング（コロケーション）": {"profile": PROFILE_CEC, "noise": "低（3〜7%）"},
+    "AI（学習中心）": {"profile": PROFILE_FLAT, "noise": "低（3〜7%）"},
+    "AI（推論中心）": {"profile": PROFILE_CEC, "noise": "高（12〜18%）"},
+    "自社サーバー室": {"profile": PROFILE_DIURNAL, "noise": "高（12〜18%）"},
+    "手動設定": None,
+}
+
+# ノイズ強度（LBNL Shape Maker: low 3-7% / high 12-18% of baseline）
+NOISE_BANDS = {"なし": (0.0, 0.0), "低（3〜7%）": (0.03, 0.07), "高（12〜18%）": (0.12, 0.18)}
+NOISE_SEED = 20260919  # 再現性のため固定（同じ入力なら常に同じ結果を返す）
+
+# ラック電力密度の目安 [kW/ラック]（⚠ 参考値。UI表示用で計算のデフォルトではない）
+RACK_DENSITY_HINT = "従来型 4〜8 ／ 高密度 10〜20 ／ AI・GPU 40〜130"
+
+# CEC形状で平日/休日を割り当てるための基準年。
+# NEDO METPV-20は代表年データで曜日を持たないため、暦を1つ固定する必要がある。
+CEC_REFERENCE_YEAR = 2025
+
+DC_DEFAULTS = {
+    "it_capacity_kw": 1000.0,   # IT定格容量 [kW]
+    "it_load_factor_pct": 80.0,  # IT負荷率（年平均）[%]
+    "it_peak_pct": 90.0,        # ピーク負荷率（日変動時）[%]
+    "it_bottom_pct": 50.0,      # ボトム負荷率（日変動時）[%]
+    "it_peak_hour": 14,         # ピーク時刻（日変動時）[時]
+    "pue_const": 1.40,          # PUE一定値
+    "n_racks": 100,             # ラック数（ラック数×density方式のとき）
+    "kw_per_rack": 10.0,        # ラック電力密度 [kW/ラック]（同上）
+}
+
+# CEC 2025 IEPR の受電容量→最大需要の換算係数（§5-6(2)）。
+# ⚠ これは「観測された上限」であり典型値ではない。予測用途では安全側だが、
+#    受電容量の逆算に使うと必要容量を小さく見積もる方向に働く（保守性の向きが反転する）。
+CEC_UTILIZATION_FACTOR = 0.67
+
+# CEC 2025 IEPR 調和モデル由来の時間別ロードファクタ（年間最大=1000 の千分率）
+# [月(1-12)][時刻(1-24)]。出典と抽出方法は docs/design_spec.md §5-7 を参照。
+CEC_LF_WEEKDAY = (  # 平日: 12ヶ月 × 24時刻
+    ( 900,  897,  896,  896,  897,  900,  903,  907,  912,  916,  920,  923,  925,  926,  926,  925,  922,  919,  914,  910,  904,  899,  895,  891),  #  1月
+    ( 888,  886,  885,  885,  886,  888,  892,  895,  899,  903,  907,  910,  912,  913,  914,  913,  911,  908,  905,  901,  896,  892,  888,  885),  #  2月
+    ( 882,  881,  880,  880,  882,  885,  888,  892,  896,  900,  904,  907,  910,  912,  913,  912,  911,  908,  906,  902,  898,  894,  890,  887),  #  3月
+    ( 885,  884,  883,  884,  886,  889,  893,  898,  902,  907,  912,  916,  920,  922,  923,  923,  922,  920,  917,  913,  909,  905,  901,  898),  #  4月
+    ( 895,  894,  894,  895,  897,  901,  906,  911,  917,  923,  929,  934,  938,  941,  943,  943,  942,  939,  936,  931,  926,  921,  917,  913),  #  5月
+    ( 910,  908,  908,  910,  913,  917,  923,  929,  936,  943,  950,  956,  961,  964,  966,  966,  964,  961,  957,  952,  946,  940,  934,  929),  #  6月
+    ( 926,  924,  923,  925,  928,  933,  939,  946,  954,  962,  970,  976,  981,  985,  986,  986,  984,  980,  975,  968,  961,  954,  948,  942),  #  7月
+    ( 938,  935,  935,  936,  939,  944,  951,  958,  966,  975,  982,  989,  994,  998,  999,  998,  995,  991,  985,  977,  970,  962,  954,  948),  #  8月
+    ( 943,  940,  939,  940,  943,  948,  955,  962,  970,  978,  985,  992,  996,  999, 1000,  999,  995,  990,  984,  976,  968,  960,  952,  946),  #  9月
+    ( 940,  937,  936,  937,  939,  944,  949,  956,  963,  970,  977,  983,  987,  989,  989,  988,  984,  979,  972,  965,  957,  949,  941,  935),  # 10月
+    ( 930,  927,  926,  926,  928,  932,  937,  942,  949,  955,  960,  965,  968,  970,  970,  968,  964,  960,  953,  946,  939,  932,  926,  920),  # 11月
+    ( 915,  912,  911,  911,  913,  916,  920,  924,  930,  935,  939,  943,  946,  947,  946,  945,  942,  938,  932,  926,  920,  914,  908,  904),  # 12月
+)
+
+CEC_LF_WEEKEND = (  # 休日: 12ヶ月 × 24時刻
+    ( 896,  893,  891,  890,  888,  888,  889,  890,  891,  892,  894,  896,  897,  898,  899,  899,  898,  897,  896,  894,  892,  890,  887,  884),  #  1月
+    ( 882,  880,  879,  877,  877,  877,  877,  878,  879,  880,  882,  883,  884,  886,  886,  886,  886,  886,  885,  884,  882,  880,  879,  877),  #  2月
+    ( 875,  874,  873,  872,  872,  872,  872,  873,  875,  876,  878,  879,  881,  882,  884,  884,  884,  884,  884,  883,  882,  881,  879,  878),  #  3月
+    ( 877,  875,  875,  874,  874,  875,  876,  877,  879,  881,  883,  886,  888,  890,  891,  893,  893,  894,  894,  893,  892,  890,  889,  888),  #  4月
+    ( 886,  885,  884,  884,  884,  885,  886,  888,  891,  894,  897,  900,  903,  905,  908,  909,  910,  911,  911,  910,  909,  907,  905,  903),  #  5月
+    ( 901,  900,  899,  898,  898,  899,  901,  904,  907,  910,  914,  918,  922,  925,  928,  930,  932,  932,  932,  930,  928,  926,  923,  920),  #  6月
+    ( 918,  916,  914,  913,  914,  915,  917,  919,  923,  927,  932,  936,  940,  944,  947,  949,  950,  950,  950,  948,  945,  942,  939,  935),  #  7月
+    ( 932,  929,  927,  926,  925,  926,  928,  931,  935,  939,  944,  948,  953,  957,  960,  962,  962,  962,  961,  958,  955,  951,  947,  943),  #  8月
+    ( 939,  935,  933,  931,  930,  931,  933,  936,  939,  943,  948,  952,  956,  960,  962,  964,  964,  963,  962,  959,  955,  951,  946,  942),  #  9月
+    ( 937,  934,  930,  929,  928,  928,  930,  932,  935,  938,  942,  946,  950,  952,  954,  955,  955,  954,  952,  949,  945,  941,  936,  932),  # 10月
+    ( 928,  924,  921,  919,  918,  918,  919,  921,  923,  926,  929,  932,  935,  937,  938,  939,  938,  937,  935,  932,  928,  924,  920,  916),  # 11月
+    ( 913,  909,  906,  905,  904,  904,  904,  905,  907,  909,  911,  913,  915,  917,  918,  918,  917,  916,  914,  912,  909,  906,  902,  899),  # 12月
+)
+
+
+# --- 気温連動PUEモデルのパラメータ（設計書 §5-4） ---
+# ⚠⚠ 重要: 以下のデフォルトは物理的に妥当なオーダーではあるが、
+#     **特定の公表資料に基づく数値ではない（暫定値）**。
+#     JDCC・環境省/経産省のDC実態調査でPUE実績と突合し、
+#     docs/pue_model.md に出典付きで記録すること（設計書 §5-4・§13）。
+PUE_MODEL_DEFAULTS = {
+    "alpha": 0.10,      # 電源設備損失率（UPS/PDU/変圧器/照明。IT負荷比）
+    "cop_free": 25.0,   # 外気冷房時COP（ファン動力のみ）
+    "t_free": 15.0,     # 外気冷房上限温度 [℃]
+    "t_full": 20.0,     # 機械式冷凍機フル稼働温度 [℃]
+    "cop_ref": 4.5,     # 冷凍機COP（基準外気温時）
+    "t_ref": 25.0,      # COP基準外気温 [℃]
+    "beta": 0.08,       # COP温度勾配 [/℃]
+    "cop_min": 2.0,     # 冷凍機COP下限
+    "pue_max": 1.80,    # PUE上限
+}
+
 # === 売電制度 ===
 SELL_MODES = ["余剰売電", "逆潮流禁止（売電なし）"]
 SELL_SCHEMES = ["FIT利用あり", "FIT利用なし"]
@@ -1499,6 +1716,250 @@ def make_daily_chart(result, month, day, sc_result=None, demand_30min=None):
         )
     fig.update_layout(**layout_kwargs)
     return fig
+
+
+# ============================================================
+# 受電電圧区分・タリフ解決（新規実装。設計書 §6-3・§6-4）
+# ============================================================
+
+def resolve_voltage_class(contract_power_kw):
+    """契約電力[kW]から受電電圧区分を判定する。
+
+    北海道電力ネットワーク 託送供給等約款 第13条の標準電圧に基づく原則判定。
+    実際の受電電圧は需要場所の設備条件・周辺系統の状況により上位/下位になる場合が
+    あるため、UIでは手動指定も選択できるようにしている。
+
+    Args:
+        contract_power_kw: 契約電力 [kW]
+
+    Returns:
+        str: 区分キー（"hv_6000" / "ehv_30000" / "ehv_60000"）
+    """
+    kw = float(contract_power_kw) if contract_power_kw else 0.0
+    for lo, hi, key in VOLTAGE_CLASS_THRESHOLDS:
+        if lo <= kw < hi:
+            return key
+    return "ehv_60000"
+
+
+def get_menu_choices(voltage_class, utility=DEFAULT_UTILITY):
+    """指定の電力会社・電圧区分で選択可能な料金メニュー名のリストを返す。"""
+    return list(TARIFFS.get(utility, {}).get(voltage_class, {}).keys())
+
+
+def get_tariff(voltage_class, menu=None, utility=DEFAULT_UTILITY):
+    """タリフ表から料金単価を取得する。
+
+    Args:
+        voltage_class: 区分キー（"hv_6000" 等）
+        menu: 料金メニュー名。Noneなら産業用メニュー（負荷率の高いDCに有利）を既定採用
+        utility: 電力会社名
+
+    Returns:
+        dict: basic_charge_per_kw / energy_charge_summer / energy_charge_other
+              ＋ 共通の従量費目（力率・燃調・再エネ賦課金）
+        ※ 返す値は「タリフ表の既定値」であり、UIでユーザーが上書きした値はここには入らない
+    """
+    by_class = TARIFFS.get(utility, {}).get(voltage_class, {})
+    if not by_class:
+        raise ValueError(f"タリフが未定義です: {utility} / {voltage_class}")
+    if menu is None or menu not in by_class:
+        menu = INDUSTRIAL_MENU_BY_CLASS.get(voltage_class)
+        if menu not in by_class:
+            menu = list(by_class.keys())[0]
+    rates = dict(by_class[menu])
+    rates["power_factor_pct"] = DEFAULT_POWER_FACTOR_PCT
+    rates["fuel_adjustment"] = DEFAULT_FUEL_ADJUSTMENT
+    rates["renewable_surcharge"] = DEFAULT_RENEWABLE_SURCHARGE
+    rates["menu"] = menu
+    rates["voltage_class"] = voltage_class
+    rates["utility"] = utility
+    return rates
+
+
+# ============================================================
+# データセンター需要モデル（新規実装。設計書 §5）
+# ============================================================
+# demand(t) = IT_load(t) × PUE(T_out(t))
+#
+# 【Phase 0の実装範囲】
+#   IT負荷: 定常 / 日変動（正弦波）に対応。CSVアップロードは未実装（設計書 §13）。
+#   PUE:    「一定」のみ実装。気温連動PUE（§5-4）はPhase 1で実装する。
+# ============================================================
+
+def resolve_it_capacity_kw(capacity_mode, size_preset=None, it_capacity_kw=None,
+                           n_racks=None, kw_per_rack=None):
+    """容量の指定方法を解決して IT定格容量 [kW] を返す。
+
+    DCの容量指定は実務上2軸ある（設計書 §6-2）。内部では常に IT容量[kW] に正規化する。
+      - 規模プリセット: エッジ/小規模/中規模/ハイパースケール
+      - IT容量を直接入力: 「20MWのDC」という業界標準の言い方
+      - ラック数×density: 設備設計者向け。ラック数 × ラック電力密度[kW/ラック]
+
+    延床面積[m2]は採らない。DCはラック密度で電力密度が1桁変わるため
+    （pv-sim-bizのComStock方式がDCに転用できない理由そのもの。設計書 §5-1）。
+    """
+    if capacity_mode == "ラック数×density":
+        n = float(n_racks) if n_racks else 0.0
+        d = float(kw_per_rack) if kw_per_rack else 0.0
+        return n * d
+    if capacity_mode == "規模プリセット":
+        preset = DC_SIZE_PRESETS.get(size_preset)
+        if preset:
+            return float(preset["it_capacity_kw"])
+    return float(it_capacity_kw) if it_capacity_kw else 0.0
+
+
+def _cec_shape_30min():
+    """CEC調和モデル由来の形状を (365, 48) で返す（年平均=1.0に正規化）。
+
+    CEC_LF_WEEKDAY/WEEKEND は [月][時刻] の千分率テーブル（年間最大=1000）。
+    毎時24点を interpolate_to_30min() で48コマへ補間する。
+
+    平日/休日の判定には暦が要るが、NEDO METPV-20は代表年データで曜日を持たない。
+    このため CEC_REFERENCE_YEAR で暦を固定する（設計書 §5-7）。
+    """
+    import datetime as _dt
+    shape = np.zeros((365, 48))
+    d0 = _dt.date(CEC_REFERENCE_YEAR, 1, 1)
+    for i in range(365):
+        day = d0 + _dt.timedelta(days=i)
+        tbl = CEC_LF_WEEKDAY if day.weekday() < 5 else CEC_LF_WEEKEND
+        hourly = np.array(tbl[day.month - 1], dtype=float) / 1000.0
+        shape[i] = interpolate_to_30min(hourly)
+    return shape / shape.mean()
+
+
+def _diurnal_shape_30min(peak_pct, bottom_pct, peak_hour):
+    """日変動（正弦波）の形状を (365, 48) で返す（年平均=1.0に正規化）。
+
+    ピーク時刻を頂点とする正弦波。ピーク/ボトム負荷率の比だけが形状を決め、
+    絶対水準は呼び出し側の「IT負荷率（年平均）」が担う。
+    """
+    pk = float(peak_pct) / 100.0
+    bt = float(bottom_pct) / 100.0
+    ph = float(peak_hour) if peak_hour is not None else 14.0
+    mid = (pk + bt) / 2.0
+    amp = (pk - bt) / 2.0
+    hours = np.arange(0.25, 24.25, 0.5)  # 各30分コマの中央時刻
+    lf_day = mid + amp * np.cos(2.0 * np.pi * (hours - ph) / 24.0)
+    shape = np.tile(lf_day, (365, 1))
+    return shape / shape.mean()
+
+
+def _apply_noise(shape, noise_level):
+    """短周期変動を重畳する（形状の年平均=1.0は保つ）。
+
+    LBNL Shape Maker の定義に合わせ、日ごとにノイズ強度を帯の中で変え、
+    各コマに一様乱数を乗せる（low 3-7% / high 12-18% of baseline）。
+    再現性のため NOISE_SEED で固定する。
+    """
+    lo, hi = NOISE_BANDS.get(noise_level, (0.0, 0.0))
+    if hi <= 0:
+        return shape
+    rng = np.random.default_rng(NOISE_SEED)
+    daily_amp = rng.uniform(lo, hi, size=(365, 1))          # 日ごとのノイズ強度
+    noise = rng.uniform(-1.0, 1.0, size=shape.shape) * daily_amp
+    out = shape * (1.0 + noise)
+    out = np.clip(out, 0.0, None)
+    return out / out.mean()
+
+
+def build_it_load_30min(it_capacity_kw, profile_mode=PROFILE_FLAT,
+                        load_factor_pct=80.0,
+                        peak_pct=90.0, bottom_pct=50.0, peak_hour=14,
+                        noise_level="なし"):
+    """IT機器の消費電力量を (365, 48) [kWh/30分] で返す。
+
+    IT_load(t) = it_capacity_kw × load_factor(t) × 0.5
+    load_factor(t) = IT負荷率（年平均） × 形状(t)      ※形状は年平均=1.0に正規化
+
+    **水準と形状を分離する**のが要点（設計書 §5-7）。
+    水準（IT負荷率）はサイト固有の値でユーザーが決める。
+    形状は出典のあるものを使う:
+
+      - PROFILE_CEC   : CEC 2025 IEPR の調和モデル由来（商用DCのinterval meter、
+                        PG&E約100施設2020-2024で校正）。平日/休日×月×時刻の576点テーブル
+      - PROFILE_FLAT  : 時刻変動なし。LBNL "Flat — characteristic of large AI training
+                        clusters running continuous batch jobs"
+      - PROFILE_DIURNAL: ピーク時刻を頂点とする正弦波。振れ幅は根拠がないため
+                        自社サーバー室など振れの大きいサイトを手で作る用途に限る
+
+    ノイズは LBNL Shape Maker の定義（low 3-7% / high 12-18% of baseline）に準拠。
+
+    Args:
+        it_capacity_kw: IT定格容量 [kW]
+        profile_mode: PROFILE_CEC / PROFILE_FLAT / PROFILE_DIURNAL
+        load_factor_pct: IT負荷率（年平均）[%]
+        peak_pct / bottom_pct / peak_hour: 日変動時の形状パラメータ
+        noise_level: NOISE_LEVELS のいずれか
+
+    Returns:
+        np.ndarray: (365, 48) [kWh/30分]
+    """
+    cap = float(it_capacity_kw) if it_capacity_kw else 0.0
+    dt = 0.5  # 30分 = 0.5時間
+    level = float(load_factor_pct) / 100.0
+
+    if profile_mode == PROFILE_CEC:
+        shape = _cec_shape_30min()
+    elif profile_mode == PROFILE_DIURNAL:
+        shape = _diurnal_shape_30min(peak_pct, bottom_pct, peak_hour)
+    else:  # PROFILE_FLAT
+        shape = np.ones((365, 48))
+
+    shape = _apply_noise(shape, noise_level)
+    return cap * level * shape * dt
+
+
+def build_pue_30min(pue_mode="一定", temp_30min=None, pue_const=1.40, pue_params=None):
+    """各30分コマのPUEを (365, 48) で返す。
+
+    Args:
+        pue_mode: "一定" / "気温連動"
+        temp_30min: (365, 48) 外気温 [℃]（気温連動時に必要）
+        pue_const: PUE一定値
+        pue_params: 気温連動モデルのパラメータ（PUE_MODEL_DEFAULTS 参照）
+
+    Returns:
+        np.ndarray: (365, 48) PUE
+    """
+    if pue_mode == "気温連動":
+        # TODO(Phase 1): 設計書 §5-4 の気温連動PUEモデルを実装する
+        #   PUE(T) = 1 + α + 1/COP_eff(T)
+        #   x = clip((T − T_free)/(T_full − T_free), 0, 1)
+        #   COP_mech(T) = max(COP_min, COP_ref − β×(T − T_ref))
+        #   1/COP_eff(T) = (1 − x)/COP_free + x/COP_mech(T)
+        #   → PUE_max でクリップ
+        raise NotImplementedError(
+            "気温連動PUEはPhase 1で実装予定です。現在は「一定」モードを使用してください。"
+        )
+    return np.full((365, 48), float(pue_const))
+
+
+def build_dc_demand_30min(it_load_30min, pue_30min):
+    """DC施設全体の電力需要 (365, 48) [kWh/30分] を返す。
+
+    demand(t) = IT_load(t) × PUE(t)
+
+    Returns:
+        (demand_30min, breakdown) breakdownは内訳の年間集計 dict
+    """
+    demand = it_load_30min * pue_30min
+    annual_it = float(np.sum(it_load_30min))
+    annual_total = float(np.sum(demand))
+    # 冷却＋電源設備損失（＝施設総電力 − IT電力）。
+    # Phase 0のPUE一定モードでは冷却とその他損失を分離できないため合算で扱う。
+    annual_overhead = annual_total - annual_it
+    breakdown = {
+        "annual_it_kwh": annual_it,
+        "annual_total_kwh": annual_total,
+        "annual_overhead_kwh": annual_overhead,
+        "avg_pue": (annual_total / annual_it) if annual_it > 0 else 0.0,
+        "max_pue": float(np.max(pue_30min)),
+        "min_pue": float(np.min(pue_30min)),
+    }
+    return demand, breakdown
 
 
 # ============================================================
