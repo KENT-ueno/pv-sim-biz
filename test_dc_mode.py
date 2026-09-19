@@ -197,7 +197,7 @@ check("産業用ではdc_argsを渡しても無視される", r_default[4] == r_
 print("\n【10. UI配線】")
 demo = app.demo
 check("Blocksが構築されている", demo is not None)
-check("DC_INPUT_KEYS は13個", len(app.DC_INPUT_KEYS) == 13, f"{len(app.DC_INPUT_KEYS)}")
+check("DC_INPUT_KEYS は15個（DC入力13＋受電上限2）", len(app.DC_INPUT_KEYS) == 15, f"{len(app.DC_INPUT_KEYS)}")
 check("DC_INPUT_KEYS に重複なし", len(set(app.DC_INPUT_KEYS)) == len(app.DC_INPUT_KEYS))
 check("需要ソース定数が異なる", app.DEMAND_SOURCE_INDUSTRIAL != app.DEMAND_SOURCE_DATACENTER)
 
