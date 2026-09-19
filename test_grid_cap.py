@@ -240,7 +240,7 @@ t = r[4]
 check("基底負荷が上限超: LPを実行せず診断を返す（図なし・7要素）", r[0] is None and len(r) == 7 and r[6] is None)
 check("「受電上限を守れません」と「蓄電池を大きくしても解決しません」", "受電上限を守れません" in t and "蓄電池を大きくしても解決しません" in t)
 check("上限の下限の目安（約1,012kW）が出る", "約 1,012 kW 以上" in t or "約 1,013 kW 以上" in t, t[t.find("→ 上限を約"):][:30])
-check("需要側の調整（今後実装予定）への案内", "IT負荷を時間帯でシフトする（今後実装予定）" in t)
+check("実装していない需要シフトを案内しない", "シフト" not in t and "今後実装予定" not in t)
 check("診断メッセージにもDC需要の節が先頭に付く", t.startswith("══ データセンター需要 ══"))
 
 r = run(DC, bat_enabled=True, bat_mode="最適充放電（LP）", bat_capacity=1.0,

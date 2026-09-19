@@ -2282,8 +2282,7 @@ def _grid_cap_reason_lines(diag, battery):
             f"（{diag['spare_energy_kwh']:,.0f} kWh/年）では、超過分（{diag['exceed_energy_kwh']:,.0f} kWh/年）を\n"
             "    蓄電池の効率損失込みで賄えません。蓄電池を大きくしても解決しません。\n"
             f"    → 上限を約 {diag['min_cap_kw_energy']:,.0f} kW 以上にする／PV容量を増やす／"
-            "IT負荷（容量・負荷率）を下げる／\n"
-            "      IT負荷を時間帯でシフトする（今後実装予定）\n")
+            "IT負荷（容量・負荷率）を下げる\n")
     if "power" in v:
         lines.append(
             f"  ・蓄電池の放電出力が不足: 上限内に収めるには最大 {diag['required_power_kw']:,.0f} kW の放電が必要"
@@ -2695,7 +2694,7 @@ def run_simulation(
                                     "     （24時間一定）だと契約電力を下げられず、料金にも日内の差（時間帯別単価）が\n"
                                     "     ないためです（LPは正しく充放電ゼロを返しています）。\n"
                                     "     IT負荷を日変動／CEC実測形状にする・PV容量を増やして余剰を作る・\n"
-                                    "     受電上限制約（今後実装予定）で価値が出ます。\n")
+                                    "     受電上限制約（DCタブの「系統受電上限」）で価値が出ます。\n")
                 if sc_result.get("optimized"):
                     result_text += f"最適化ピークデマンド: {sc_result['opt_peak_kw']:.1f} kW\n"
                     result_text += f"最適化年間コスト: {sc_result['opt_annual_cost']:,.0f} 円\n"
