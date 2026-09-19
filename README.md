@@ -17,9 +17,9 @@ pinned: false
 [![Gradio](https://img.shields.io/badge/Gradio-6.26-orange)](https://gradio.app/)
 [![MCP Compatible](https://img.shields.io/badge/MCP-compatible-9cf)](https://github.com/KENT-ueno/pv-sim-fip/blob/main/docs/mcp_guide.md)
 
-A web-based simulator for **industrial-scale solar PV + battery storage systems** in Japan, designed for high-voltage and extra-high-voltage customers. Built on JIS C 8907 generation modeling, NEDO METPV-20 weather data for 47 Japanese sites, and PuLP/CBC linear programming for optimal battery dispatch.
+A web-based simulator for **industrial-scale solar PV + battery storage systems** in Japan, designed for high-voltage and extra-high-voltage customers. Built on JIS C 8907 generation modeling, NEDO METPV-20 weather data for 50 Japanese sites, and PuLP/CBC linear programming for optimal battery dispatch.
 
-日本国内の**高圧・特別高圧**需要家向けに設計された、産業用太陽光発電＋蓄電池の需給シミュレーターです。JIS C 8907 準拠の発電量計算、NEDO METPV-20 の47地点気象データ、PuLP/CBC 線形計画法による蓄電池最適化を統合し、年間17,520コマ（30分×365日）の需給バランスを一括シミュレートします。
+日本国内の**高圧・特別高圧**需要家向けに設計された、産業用太陽光発電＋蓄電池の需給シミュレーターです。JIS C 8907 準拠の発電量計算、NEDO METPV-20 の50地点気象データ、PuLP/CBC 線形計画法による蓄電池最適化を統合し、年間17,520コマ（30分×365日）の需給バランスを一括シミュレートします。
 
 **🔗 Live Demo / ライブデモ:** https://huggingface.co/spaces/hachinai/pv-sim-biz
 
@@ -32,7 +32,7 @@ A web-based simulator for **industrial-scale solar PV + battery storage systems*
 ### English
 
 - **JIS C 8907 compliant generation model** — Tilted-plane irradiance via pvlib (Erbs decomposition + isotropic transposition), per-array PCS clipping, JIS C 8907 temperature correction with hourly ambient data, and bifacial gain via `pvlib.bifacial.infinite_sheds` with snow-aware albedo switching.
-- **47-site Japanese weather database** — NEDO METPV-20 dataset (10 elements: GHI, temperature, snow depth, etc.) bundled as SQLite (`radiation.db`).
+- **50-site Japanese weather database** — NEDO METPV-20 dataset (10 elements: GHI, temperature, snow depth, etc.) bundled as SQLite (`radiation.db`).
 - **Industrial demand presets** — 6 building types from NREL ComStock EULP (medium office, primary/secondary school, hospital, hotel, retail), normalized to per-m² intensity. Multi-facility aggregation for microgrid scenarios. Custom CSV upload supported.
 - **High-voltage / extra-high-voltage tariffs** — Tokyo Electric Power EP rates with demand-charge tracking, power-factor adjustment, fuel cost surcharge, and renewable energy surcharge. Substation construction cost included.
 - **Industrial FIT sell-back** — Automatic price switching by year (1–5y: ¥19, 6–20y: ¥8.3, 21y+: ¥8.5). Reverse-power-flow prohibition mode with battery curtailment.
@@ -42,11 +42,12 @@ A web-based simulator for **industrial-scale solar PV + battery storage systems*
 - **Battery dispatch optimization (PuLP/CBC LP)** — Annual cost minimization (basic charge + energy charge − sell revenue) over all 17,520 timeslots with peak shaving via demand linearization, SOC continuity constraint, and curtailment variable for no-export mode.
 - **Optimal battery sizing** — Two-stage approach: (1) one-shot LP with battery capacity as a decision variable for fast optimum, (2) grid search across capacity range to visualize the cost/IRR/payback curves.
 - **CO₂ reduction calculation** — Default emission factor 0.000431 t-CO₂/kWh (Japan grid average).
+- **Data center mode** — Demand is generated from IT load × PUE (constant, air-cooled) instead of building presets. Capacity by scale preset (edge / small / medium / hyperscale — *provisional tiers*), direct IT kW, or racks × density; load shape from a CEC-derived commercial-DC profile, flat (AI training) or diurnal. Optional **grid receiving cap** (stay within 6.6 kV < 2,000 kW / 22·33 kV < 10,000 kW): enforced by the battery LP, and if the cap cannot be met the tool explains why and gives a lower-bound estimate of the battery needed.
 
 ### 日本語
 
 - **JIS C 8907 準拠の発電量モデル** — pvlib による傾斜面日射量変換（Erbsモデル＋isotropicモデル）、面別PCSクリップ、毎時外気温反映の温度補正、`pvlib.bifacial.infinite_sheds` による両面パネル対応、積雪深データに基づく動的アルベド切替（積雪時0.7／通常0.2）。
-- **47地点の日本気象データベース** — NEDO METPV-20 の10要素データ（日射量・気温・積雪深ほか）を SQLite (`radiation.db`) として同梱。
+- **50地点の日本気象データベース** — NEDO METPV-20 の10要素データ（日射量・気温・積雪深ほか）を SQLite (`radiation.db`) として同梱。
 - **産業用需要プリセット** — NREL ComStock EULP から取得した6建物タイプ（役所・小学校・中高・病院・ホテル・小売店）を m² 原単位に正規化。複数施設合算でマイクログリッドシナリオに対応。カスタムCSVアップロードも可能。
 - **高圧・特別高圧の料金体系** — 東京電力EPの実料金（基本料金、夏季・他季電力量料金、力率割引、燃料費調整、再エネ賦課金）に対応。デマンド追跡による契約電力推定、受電設備工事費の試算も含む。
 - **産業用FIT売電** — 経過年数で自動単価切替（1〜5年: 19円、6〜20年: 8.3円、21年〜: 8.5円）。逆潮流禁止モードでは蓄電池充電優先＋出力抑制を実装。
@@ -56,6 +57,7 @@ A web-based simulator for **industrial-scale solar PV + battery storage systems*
 - **蓄電池最適充放電（PuLP/CBC LP）** — 17,520コマ全体で年間電気代（基本料金＋電力量料金−売電収入）を最小化。最大デマンドの線形化によるピークカット、SOC連続性制約、逆潮流禁止時のカーテイルメント変数を含む完全な定式化。
 - **最適容量探索** — 2段階アプローチ：(1) 蓄電池容量を決定変数に含めたLP一体化で高速に最適解を取得、(2) 容量範囲のグリッドサーチで コスト削減・P-IRR・投資回収年数のカーブを可視化。
 - **CO2削減量算出** — 排出係数デフォルト 0.000431 t-CO2/kWh（全国平均）。
+- **データセンターモード** — 施設プリセットの代わりに「IT負荷×PUE（一定値・空冷前提）」から需要を生成。容量は規模プリセット（エッジ／小規模／中規模／ハイパースケール。**区分は暫定値**）・IT容量の直接入力・ラック数×密度から指定し、負荷の形状はCEC由来の商用DC形状・定常（AI学習）・日変動から選択。**系統受電上限**（高圧6.6kV＝2,000kW未満／22・33kV＝10,000kW未満に収める）を指定でき、蓄電池の最適充放電（LP）で強制します。守れない場合は理由と、必要な蓄電池の下限の目安を表示します。
 
 ---
 
@@ -75,7 +77,7 @@ A web-based simulator for **industrial-scale solar PV + battery storage systems*
 - **Plotting**: Plotly
 - **Solar modeling**: pvlib (Erbs, isotropic transposition, infinite_sheds for bifacial)
 - **Optimization**: PuLP + CBC (linear programming)
-- **Data**: SQLite (radiation.db, NEDO METPV-20 47-site dataset)
+- **Data**: SQLite (radiation.db, NEDO METPV-20 50-site dataset)
 - **Numerical**: pandas, numpy
 - **Deployment**: Hugging Face Spaces
 
@@ -114,6 +116,8 @@ This Space exposes its calculations as an [MCP](https://modelcontextprotocol.io/
 
 **Tools:** `list_stations` / `estimate_pv_generation` / `validate_industrial_params` → `simulate_industrial_pv`
 
+**Data center tools:** `estimate_dc_demand` / `validate_dc_params` → `simulate_dc`（データセンター用。受電上限を守れない条件では、エラーではなく理由と必要量の目安を返します）
+
 ```bash
 # Claude Code
 claude mcp add --scope user --transport http pv-sim-biz https://hachinai-pv-sim-biz.hf.space/gradio_api/mcp/
@@ -136,7 +140,13 @@ pv-sim-biz/
 ├── README.md                   # This file
 ├── LICENSE                     # MIT
 ├── docs/
-│   └── architecture.md         # Detailed architecture & implementation notes
+│   ├── architecture.md         # Detailed architecture & implementation notes
+│   ├── design_spec.md          # Data center mode: design spec (canonical)
+│   ├── decision_log.md         # Data center mode: decision history
+│   ├── dc_load_data_sources.md # Data center load data: source survey
+│   └── hokkaido_power_voltage_tariff.md  # Hokkaido Electric voltage/tariff sources
+├── test_mcp_tools.py / test_mcp_dc_tools.py   # MCP tool tests (industrial / data center)
+├── test_dc_mode.py / test_grid_cap.py         # Data center demand, UI wiring, grid cap
 ├── prompt_verify_battery_bug.md      # Battery LP verification request
 ├── test_verify_battery_bug.py        # Battery LP pass-through bug check
 └── test_verify_battery_bug_result.txt
