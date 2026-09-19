@@ -1,0 +1,2 @@
+# ローカル設定（許可コマンド一覧など。個人環境の情報を含みうるためgit管理しない）
+.claude/settings.local.json
