@@ -1598,8 +1598,20 @@ def run_simulation(
             tilt = float(face_args[idx + 3]) if face_args[idx + 3] else 30
             pcs_kw = float(face_args[idx + 4]) if face_args[idx + 4] else 0
 
+            # 方位角欄はテキスト入力（空欄=未指定→方位（選択）を使う）。gr.Number は value=None でも
+            # 未操作で 0 を送信し空欄を表現できないため（Gradio 6.26で確認）、Textbox にしている。
+            if isinstance(azi_direct, str):
+                azi_direct = azi_direct.strip()
             if azi_direct is not None and azi_direct != "":
-                azimuth = float(azi_direct) % 360
+                try:
+                    azimuth = float(azi_direct)
+                except (TypeError, ValueError):
+                    azimuth = float("nan")
+                if not np.isfinite(azimuth):
+                    return None, None, None, None, (
+                        f"エラー: 面{i+1}の方位角「{azi_direct}」は数値で入力してください"
+                        "（空欄なら「方位（選択）」を使います）"), "", None
+                azimuth = azimuth % 360
             else:
                 azimuth = float(ORIENTATION_TO_AZIMUTH.get(orientation, 180))
 
@@ -2554,7 +2566,12 @@ def build_ui():
                                 choices=list(ORIENTATION_TO_AZIMUTH.keys()),
                                 value="南",
                             )
-                            azi = gr.Number(label="方位角 [°]（直接入力優先）", value=None, precision=1)
+                            # 空欄=「方位（選択）」を使う。gr.Number(value=None) だと未操作でも 0（北向き）が
+                            # 送られてしまうため Textbox にしている（run_simulation が数値に変換・検証する）
+                            azi = gr.Textbox(
+                                label="方位角 [°]（直接入力優先）", value="", max_lines=1,
+                                placeholder="空欄=方位（選択）を使用",
+                            )
                             tlt = gr.Number(label="傾斜角 [°]", value=30, precision=1)
                             pcs = gr.Number(label="PCS出力制限 [kW]", value=5.5 if i == 0 else 0, precision=2)
                     face_components.extend([pp, ori, azi, tlt, pcs])
