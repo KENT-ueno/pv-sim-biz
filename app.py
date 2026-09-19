@@ -138,6 +138,252 @@ ELECTRICITY_RATE_EHV = {  # 特別高圧（東京電力EP 特別高圧電力）
 }
 SUBSTATION_COST_PER_KVA = 27500  # 受電設備工事費 [円/kVA]
 
+# ============================================================
+# 電気料金タリフ（パイロット版: 北海道電力エリア）
+# ============================================================
+# 出典・調査記録: docs/hokkaido_power_voltage_tariff.md（2026-09-06確認）
+#   受電電圧の区分:  北海道電力ネットワーク 託送供給等約款 第13条
+#     https://www.hepco.co.jp/network/con_service/stipulation/pdf/r080401_con_supply.pdf
+#   料金単価:  北海道電力 標準電圧6,000V向け
+#     https://www.hepco.co.jp/business/price/unitprice/unitprice04.html
+#              北海道電力 標準電圧30,000V/60,000V向け
+#     https://www.hepco.co.jp/business/price/unitprice/unitprice03.html
+#
+# 【将来の拡張方針】
+#   パイロット版は北海道電力のみ。他エリア（東北・東京・…）を追加するときは
+#   TARIFFS に電力会社を1階層足すだけで済む構造にしてある。
+#   計算関数 calc_electricity_cost() はスカラー単価を受け取るだけで
+#   タリフの出自を問わないため、テーブル追加以外のコード変更は不要。
+#
+# 【注意1: 季時別区分】
+#   北海道電力の「一般料金」は電力量料金が年間単一単価であり、
+#   東京電力EPのような夏季(7-9月)/その他季の区別を持たない。
+#   このため energy_charge_summer と energy_charge_other に同一値を入れている。
+#   （季時別が必要な「時間帯別料金」メニューはパイロット版では扱わない）
+#
+# 【注意2: 低圧を持たない理由】
+#   データセンターは最小規模でも数百kW級であり、低圧（50kW未満）で受電することは
+#   考えられないため、低圧メニューは意図的に実装しない（設計書 §4-2）。
+
+# 受電電圧区分の境界（託送供給等約款 第13条の標準電圧。契約電力[kW]で判定）
+VOLTAGE_CLASS_THRESHOLDS = [
+    # (下限kW, 上限kW（未満）, 区分キー)
+    (0,      2000,        "hv_6000"),    # 50kW以上2,000kW未満  → 標準電圧 6,000V（実系統 6.6kV）
+    (2000,   10000,       "ehv_30000"),  # 2,000kW以上10,000kW未満 → 標準電圧 30,000V（実系統 22/33kV）
+    (10000,  float("inf"), "ehv_60000"), # 10,000kW以上          → 標準電圧 60,000V（実系統 66kV）
+]
+
+VOLTAGE_CLASS_LABELS = {
+    "hv_6000":   "高圧 6,000V（実系統 6.6kV／50kW以上2,000kW未満）",
+    "ehv_30000": "特別高圧 30,000V（実系統 22・33kV／2,000kW以上10,000kW未満）",
+    "ehv_60000": "特別高圧 60,000V（実系統 66kV／10,000kW以上）",
+}
+
+# 共通の従量費目（全国一律・メニュー非依存）
+DEFAULT_POWER_FACTOR_PCT = 85     # 力率 [%]（85%=割引なし）
+DEFAULT_FUEL_ADJUSTMENT = 0.00    # 燃料費調整単価 [円/kWh]（時期により変動、既定0）
+DEFAULT_RENEWABLE_SURCHARGE = 4.18  # 再エネ賦課金 [円/kWh]（R8年度、全国一律）
+
+# 電力会社 → 受電電圧区分 → メニュー
+# メニュー種別:  "業務用電力" = オフィス・商業施設等向け
+#                "高圧電力"/"特別高圧電力" = 工場等の産業用向け（負荷率の高い需要家に有利）
+TARIFFS = {
+    "北海道電力": {
+        "hv_6000": {
+            "高圧電力": {
+                "basic_charge_per_kw": 2880.20,
+                "energy_charge_summer": 21.62,
+                "energy_charge_other": 21.62,
+            },
+            "業務用電力": {
+                "basic_charge_per_kw": 2693.20,
+                "energy_charge_summer": 23.40,
+                "energy_charge_other": 23.40,
+            },
+        },
+        "ehv_30000": {
+            "特別高圧電力": {
+                "basic_charge_per_kw": 2696.50,
+                "energy_charge_summer": 20.07,
+                "energy_charge_other": 20.07,
+            },
+            "業務用電力": {
+                "basic_charge_per_kw": 2630.50,
+                "energy_charge_summer": 21.02,
+                "energy_charge_other": 21.02,
+            },
+        },
+        "ehv_60000": {
+            "特別高圧電力": {
+                "basic_charge_per_kw": 2685.50,
+                "energy_charge_summer": 20.03,
+                "energy_charge_other": 20.03,
+            },
+            "業務用電力": {
+                "basic_charge_per_kw": 2619.50,
+                "energy_charge_summer": 20.98,
+                "energy_charge_other": 20.98,
+            },
+        },
+    },
+}
+
+DEFAULT_UTILITY = "北海道電力"
+# DCは24時間稼働で負荷率が非常に高いため、電力量料金が安い産業用メニュー
+# （高圧電力／特別高圧電力）を既定とする。業務用電力も選択可（比較用）。
+INDUSTRIAL_MENU_BY_CLASS = {
+    "hv_6000": "高圧電力",
+    "ehv_30000": "特別高圧電力",
+    "ehv_60000": "特別高圧電力",
+}
+
+
+# ============================================================
+# データセンター需要モデル（設計書 §5）
+# ============================================================
+# --- 負荷プロファイル方式 ---
+# 「IT負荷率（年平均）」を水準、プロファイルを形状として分離する。
+# 各プロファイルは年平均=1.0に正規化された形状を返し、水準を掛けて load_factor(t) になる。
+PROFILE_CEC = "CEC実測形状（米国商用DC）"
+PROFILE_FLAT = "定常（AI学習・ハイパースケール）"
+PROFILE_DIURNAL = "日変動（自社サーバー室・業務連動）"
+IT_LOAD_PROFILE_MODES = [PROFILE_CEC, PROFILE_FLAT, PROFILE_DIURNAL]
+
+NOISE_LEVELS = ["なし", "低（3〜7%）", "高（12〜18%）"]
+
+PUE_MODES = ["気温連動", "一定"]
+
+# --- 規模プリセット（⚠ 暫定値。公開された定義に基づく数値ではない） ---
+# LBNL Shape Maker のREADMEは large/medium/small を用いるが、
+# その MW 区分はリポジトリに公開されていない（2026-09-19確認）。
+# 下記は業界で一般的に使われる区分をユーザー合意のうえ採用したもの。
+CAPACITY_MODES = ["規模プリセット", "IT容量を直接入力", "ラック数×density"]
+DC_SIZE_PRESETS = {
+    "エッジ": {"it_capacity_kw": 300.0, "note": "0.1〜0.5 MW／基地局併設・地域拠点"},
+    "小規模": {"it_capacity_kw": 1000.0, "note": "0.5〜2 MW／企業自社DC・小規模ハウジング"},
+    "中規模": {"it_capacity_kw": 5000.0, "note": "2〜20 MW／商用ハウジング・コロケーション"},
+    "ハイパースケール": {"it_capacity_kw": 40000.0, "note": "20〜100+ MW／クラウド・AI学習"},
+}
+
+# --- 用途プリセット（プロファイルとノイズを一括設定） ---
+# ハウジング → CEC実測形状（商用DCのinterval meter由来）
+# AI（学習）  → 定常。LBNL "Flat — characteristic of large AI training clusters
+#               running continuous batch jobs" ／ PNNL-38601 "Active states … maintain
+#               elevated levels for tens of minutes to hours" に対応
+DC_WORKLOAD_PRESETS = {
+    "ハウジング（コロケーション）": {"profile": PROFILE_CEC, "noise": "低（3〜7%）"},
+    "AI（学習中心）": {"profile": PROFILE_FLAT, "noise": "低（3〜7%）"},
+    "AI（推論中心）": {"profile": PROFILE_CEC, "noise": "高（12〜18%）"},
+    "自社サーバー室": {"profile": PROFILE_DIURNAL, "noise": "高（12〜18%）"},
+    "手動設定": None,
+}
+
+# ノイズ強度（LBNL Shape Maker: low 3-7% / high 12-18% of baseline）
+NOISE_BANDS = {"なし": (0.0, 0.0), "低（3〜7%）": (0.03, 0.07), "高（12〜18%）": (0.12, 0.18)}
+NOISE_SEED = 20260919  # 再現性のため固定（同じ入力なら常に同じ結果を返す）
+
+# ラック電力密度の目安 [kW/ラック]（⚠ 参考値。UI表示用で計算のデフォルトではない）
+RACK_DENSITY_HINT = "従来型 4〜8 ／ 高密度 10〜20 ／ AI・GPU 40〜130"
+
+# CEC形状で平日/休日を割り当てるための基準年。
+# NEDO METPV-20は代表年データで曜日を持たないため、暦を1つ固定する必要がある。
+CEC_REFERENCE_YEAR = 2025
+
+DC_DEFAULTS = {
+    "it_capacity_kw": 1000.0,   # IT定格容量 [kW]
+    "it_load_factor_pct": 80.0,  # IT負荷率（年平均）[%]
+    "it_peak_pct": 90.0,        # ピーク負荷率（日変動時）[%]
+    "it_bottom_pct": 50.0,      # ボトム負荷率（日変動時）[%]
+    "it_peak_hour": 14,         # ピーク時刻（日変動時）[時]
+    "pue_const": 1.40,          # PUE一定値
+    "n_racks": 100,             # ラック数（ラック数×density方式のとき）
+    "kw_per_rack": 10.0,        # ラック電力密度 [kW/ラック]（同上）
+}
+
+# --- 需要ソース（run_simulation の分岐キー。UIでは gr.Tab.select → gr.State で保持する） ---
+DEMAND_SOURCE_INDUSTRIAL = "industrial"   # 産業用・MG（ComStock需要プリセット・複数施設合算）
+DEMAND_SOURCE_DATACENTER = "datacenter"   # データセンター（IT負荷 × PUE）
+
+# UIのDC入力コンポーネントを dc_args 辞書に戻すためのキー。
+# build_ui の dc_components と同じ並びにすること（on_click が zip で対応づける）。
+DC_INPUT_KEYS = (
+    "workload_preset", "capacity_mode", "size_preset", "it_capacity_kw", "n_racks", "kw_per_rack",
+    "profile_mode", "noise_level", "it_load_factor_pct", "it_peak_pct", "it_bottom_pct", "it_peak_hour",
+    "pue_const",
+    "grid_cap_mode", "grid_cap_kw",
+)
+
+# --- 系統受電上限（設計書 §7）。DCタブの入力。上限を守る手段は蓄電池（最適充放電LP） ---
+# 日本の受電電圧は契約電力で階層化されている。上限の実質的な候補はその境界そのもの
+#   高圧 6.6kV: 2,000kW未満 ／ 22・33kV: 10,000kW未満 ／ それ以上は66kV（154kVは対象外）
+# 「〜kW未満」なので、上限は境界の1kW下にする。resolve_voltage_class は2,000kWちょうどを
+# 特別高圧に分類するため、LPが上限に張り付いたとき（通常起きる）に意図した区分から外れてしまう。
+GRID_CAP_NONE = "制限なし"
+GRID_CAP_HV = "高圧6.6kVに収める（2,000kW未満）"
+GRID_CAP_EHV33 = "22・33kVに収める（10,000kW未満）"
+GRID_CAP_MANUAL = "手入力"
+GRID_CAP_MODES = [GRID_CAP_NONE, GRID_CAP_HV, GRID_CAP_EHV33, GRID_CAP_MANUAL]
+GRID_CAP_PRESETS_KW = {
+    GRID_CAP_HV: VOLTAGE_CLASS_THRESHOLDS[0][1] - 1.0,      # 2,000 → 1,999 kW
+    GRID_CAP_EHV33: VOLTAGE_CLASS_THRESHOLDS[1][1] - 1.0,   # 10,000 → 9,999 kW
+}
+GRID_CAP_MANUAL_DEFAULT_KW = 2000.0  # 「手入力」を選んだときの入力欄の初期値（編集前提の目安。出典のある値ではない）
+
+# CEC 2025 IEPR の受電容量→最大需要の換算係数（§5-6(2)）。
+# ⚠ これは「観測された上限」であり典型値ではない。予測用途では安全側だが、
+#    受電容量の逆算に使うと必要容量を小さく見積もる方向に働く（保守性の向きが反転する）。
+CEC_UTILIZATION_FACTOR = 0.67
+
+# CEC 2025 IEPR 調和モデル由来の時間別ロードファクタ（年間最大=1000 の千分率）
+# [月(1-12)][時刻(1-24)]。出典と抽出方法は docs/design_spec.md §5-7 を参照。
+CEC_LF_WEEKDAY = (  # 平日: 12ヶ月 × 24時刻
+    ( 900,  897,  896,  896,  897,  900,  903,  907,  912,  916,  920,  923,  925,  926,  926,  925,  922,  919,  914,  910,  904,  899,  895,  891),  #  1月
+    ( 888,  886,  885,  885,  886,  888,  892,  895,  899,  903,  907,  910,  912,  913,  914,  913,  911,  908,  905,  901,  896,  892,  888,  885),  #  2月
+    ( 882,  881,  880,  880,  882,  885,  888,  892,  896,  900,  904,  907,  910,  912,  913,  912,  911,  908,  906,  902,  898,  894,  890,  887),  #  3月
+    ( 885,  884,  883,  884,  886,  889,  893,  898,  902,  907,  912,  916,  920,  922,  923,  923,  922,  920,  917,  913,  909,  905,  901,  898),  #  4月
+    ( 895,  894,  894,  895,  897,  901,  906,  911,  917,  923,  929,  934,  938,  941,  943,  943,  942,  939,  936,  931,  926,  921,  917,  913),  #  5月
+    ( 910,  908,  908,  910,  913,  917,  923,  929,  936,  943,  950,  956,  961,  964,  966,  966,  964,  961,  957,  952,  946,  940,  934,  929),  #  6月
+    ( 926,  924,  923,  925,  928,  933,  939,  946,  954,  962,  970,  976,  981,  985,  986,  986,  984,  980,  975,  968,  961,  954,  948,  942),  #  7月
+    ( 938,  935,  935,  936,  939,  944,  951,  958,  966,  975,  982,  989,  994,  998,  999,  998,  995,  991,  985,  977,  970,  962,  954,  948),  #  8月
+    ( 943,  940,  939,  940,  943,  948,  955,  962,  970,  978,  985,  992,  996,  999, 1000,  999,  995,  990,  984,  976,  968,  960,  952,  946),  #  9月
+    ( 940,  937,  936,  937,  939,  944,  949,  956,  963,  970,  977,  983,  987,  989,  989,  988,  984,  979,  972,  965,  957,  949,  941,  935),  # 10月
+    ( 930,  927,  926,  926,  928,  932,  937,  942,  949,  955,  960,  965,  968,  970,  970,  968,  964,  960,  953,  946,  939,  932,  926,  920),  # 11月
+    ( 915,  912,  911,  911,  913,  916,  920,  924,  930,  935,  939,  943,  946,  947,  946,  945,  942,  938,  932,  926,  920,  914,  908,  904),  # 12月
+)
+
+CEC_LF_WEEKEND = (  # 休日: 12ヶ月 × 24時刻
+    ( 896,  893,  891,  890,  888,  888,  889,  890,  891,  892,  894,  896,  897,  898,  899,  899,  898,  897,  896,  894,  892,  890,  887,  884),  #  1月
+    ( 882,  880,  879,  877,  877,  877,  877,  878,  879,  880,  882,  883,  884,  886,  886,  886,  886,  886,  885,  884,  882,  880,  879,  877),  #  2月
+    ( 875,  874,  873,  872,  872,  872,  872,  873,  875,  876,  878,  879,  881,  882,  884,  884,  884,  884,  884,  883,  882,  881,  879,  878),  #  3月
+    ( 877,  875,  875,  874,  874,  875,  876,  877,  879,  881,  883,  886,  888,  890,  891,  893,  893,  894,  894,  893,  892,  890,  889,  888),  #  4月
+    ( 886,  885,  884,  884,  884,  885,  886,  888,  891,  894,  897,  900,  903,  905,  908,  909,  910,  911,  911,  910,  909,  907,  905,  903),  #  5月
+    ( 901,  900,  899,  898,  898,  899,  901,  904,  907,  910,  914,  918,  922,  925,  928,  930,  932,  932,  932,  930,  928,  926,  923,  920),  #  6月
+    ( 918,  916,  914,  913,  914,  915,  917,  919,  923,  927,  932,  936,  940,  944,  947,  949,  950,  950,  950,  948,  945,  942,  939,  935),  #  7月
+    ( 932,  929,  927,  926,  925,  926,  928,  931,  935,  939,  944,  948,  953,  957,  960,  962,  962,  962,  961,  958,  955,  951,  947,  943),  #  8月
+    ( 939,  935,  933,  931,  930,  931,  933,  936,  939,  943,  948,  952,  956,  960,  962,  964,  964,  963,  962,  959,  955,  951,  946,  942),  #  9月
+    ( 937,  934,  930,  929,  928,  928,  930,  932,  935,  938,  942,  946,  950,  952,  954,  955,  955,  954,  952,  949,  945,  941,  936,  932),  # 10月
+    ( 928,  924,  921,  919,  918,  918,  919,  921,  923,  926,  929,  932,  935,  937,  938,  939,  938,  937,  935,  932,  928,  924,  920,  916),  # 11月
+    ( 913,  909,  906,  905,  904,  904,  904,  905,  907,  909,  911,  913,  915,  917,  918,  918,  917,  916,  914,  912,  909,  906,  902,  899),  # 12月
+)
+
+
+# --- 気温連動PUEモデルのパラメータ（設計書 §5-4） ---
+# ⚠⚠ 重要: 以下のデフォルトは物理的に妥当なオーダーではあるが、
+#     **特定の公表資料に基づく数値ではない（暫定値）**。
+#     JDCC・環境省/経産省のDC実態調査でPUE実績と突合し、
+#     docs/pue_model.md に出典付きで記録すること（設計書 §5-4・§13）。
+PUE_MODEL_DEFAULTS = {
+    "alpha": 0.10,      # 電源設備損失率（UPS/PDU/変圧器/照明。IT負荷比）
+    "cop_free": 25.0,   # 外気冷房時COP（ファン動力のみ）
+    "t_free": 15.0,     # 外気冷房上限温度 [℃]
+    "t_full": 20.0,     # 機械式冷凍機フル稼働温度 [℃]
+    "cop_ref": 4.5,     # 冷凍機COP（基準外気温時）
+    "t_ref": 25.0,      # COP基準外気温 [℃]
+    "beta": 0.08,       # COP温度勾配 [/℃]
+    "cop_min": 2.0,     # 冷凍機COP下限
+    "pue_max": 1.80,    # PUE上限
+}
+
 # === 売電制度 ===
 SELL_MODES = ["余剰売電", "逆潮流禁止（売電なし）"]
 SELL_SCHEMES = ["FIT利用あり", "FIT利用なし"]
@@ -812,6 +1058,13 @@ def simulate_battery(generation_30min, demand_30min, month_day,
 # 蓄電池最適充放電（PuLP/CBC線形計画法）
 # ============================================================
 
+class GridCapInfeasibleError(RuntimeError):
+    """系統受電上限を守れず、LPが実行不可能（Infeasible）だったことを表す。
+
+    汎用の最適化失敗（RuntimeError）と区別し、呼び出し側が診断メッセージを返せるようにする。
+    """
+
+
 def optimize_battery(generation_30min, demand_30min, month_day,
                      capacity_kwh, efficiency_pct,
                      max_charge_kw, max_discharge_kw,
@@ -819,11 +1072,17 @@ def optimize_battery(generation_30min, demand_30min, month_day,
                      basic_charge_per_kw, energy_charge_summer,
                      energy_charge_other, power_factor_pct,
                      fuel_adjustment, renewable_surcharge,
-                     sell_price, no_export=False):
+                     sell_price, no_export=False, grid_import_cap_kw=None):
     """蓄電池の最適充放電スケジュールをLP（線形計画法）で求める。
 
     目的関数: 年間電気代（基本料金＋電力量料金−売電収入）の最小化
     ソルバー: CBC（PuLP同梱）
+
+    grid_import_cap_kw: 系統受電上限 [kW]（None/0=制限なし）。指定すると全コマで
+        系統購入電力 ≤ 上限 を制約に加える（設計書 §7）。この場合のみ、年初に蓄電池が空から
+        始まる人工的な実行不可能を避けるため「初期SOC＝年末SOC（変数）」の周期条件にする。
+        上限を守れないときは GridCapInfeasibleError を送出する。
+        None のときは従来のLP（初期SOC=SOC下限固定）とビット単位で同一。
     """
     if not HAS_PULP:
         raise RuntimeError("PuLPがインストールされていません。pip install PuLP を実行してください。")
@@ -831,6 +1090,8 @@ def optimize_battery(generation_30min, demand_30min, month_day,
     n_days, n_slots = generation_30min.shape
     T = n_days * n_slots  # 17,520コマ
     dt = 0.5  # 30分 = 0.5時間
+    # 受電上限 [kWh/30分]（制限なしは None → 変数の上限なし）
+    cap_kwh_slot = float(grid_import_cap_kw) * dt if grid_import_cap_kw and grid_import_cap_kw > 0 else None
 
     eff = efficiency_pct / 100.0
     soc_min = capacity_kwh * soc_min_pct / 100.0
@@ -856,7 +1117,8 @@ def optimize_battery(generation_30min, demand_30min, month_day,
     # 決定変数
     charge = [pulp.LpVariable(f"ch_{t}", lowBound=0, upBound=max_charge_per_slot) for t in range(T)]
     discharge = [pulp.LpVariable(f"dc_{t}", lowBound=0, upBound=max_discharge_per_slot) for t in range(T)]
-    grid_import = [pulp.LpVariable(f"gi_{t}", lowBound=0) for t in range(T)]
+    # 系統購入。受電上限があれば変数の上限にする（peak_demand ≥ 購入/dt なので契約電力も上限以下になる）
+    grid_import = [pulp.LpVariable(f"gi_{t}", lowBound=0, upBound=cap_kwh_slot) for t in range(T)]
     if no_export:
         grid_export = [pulp.LpVariable(f"ge_{t}", lowBound=0, upBound=0) for t in range(T)]
     else:
@@ -866,6 +1128,8 @@ def optimize_battery(generation_30min, demand_30min, month_day,
     curtailment = [pulp.LpVariable(f"ct_{t}", lowBound=0, upBound=curtail_ub) for t in range(T)]
     soc_var = [pulp.LpVariable(f"soc_{t}", lowBound=soc_min, upBound=soc_max) for t in range(T)]
     peak_demand = pulp.LpVariable("peak_kw", lowBound=0)  # ピークデマンド（kW）
+    # 受電上限あり: 初期SOCを変数にして年末SOCと一致させる（周期条件）。上限なしは従来どおり soc_min 固定
+    soc_init = pulp.LpVariable("soc_init", lowBound=soc_min, upBound=soc_max) if cap_kwh_slot is not None else soc_min
     # 1台のPCSを充電または放電のどちらかに使う（同時充放電の排他制約用）
     max_power_per_slot = max(max_charge_per_slot, max_discharge_per_slot)
 
@@ -893,21 +1157,24 @@ def optimize_battery(generation_30min, demand_30min, month_day,
         # grid_import[t]はkWh/30分なので、kWに変換するには÷0.5
         prob += peak_demand >= grid_import[t] / dt
 
-        # SOC遷移
+        # SOC遷移（受電上限ありのときの初期SOCは変数 soc_init）
         if t == 0:
-            prob += soc_var[t] == soc_min + charge[t] * eff - discharge[t] / eff
+            prob += soc_var[t] == soc_init + charge[t] * eff - discharge[t] / eff
         else:
             prob += soc_var[t] == soc_var[t - 1] + charge[t] * eff - discharge[t] / eff
 
     # 終端SOC制約: 年末SOCを初期SOCに戻す（年次比較の公平性）
-    # ※現在の初期SOC = soc_min（固定）。初期SOCを可変にする場合は要見直し
-    prob += soc_var[T - 1] == soc_min
+    # 上限なし: 初期SOC = soc_min（固定）／ 受電上限あり: 初期SOC = 年末SOC（変数、周期条件）
+    prob += soc_var[T - 1] == soc_init
 
     # === ソルバー実行 ===
     solver = pulp.PULP_CBC_CMD(msg=0, timeLimit=120)
     prob.solve(solver)
 
     if prob.status != pulp.constants.LpStatusOptimal:
+        if cap_kwh_slot is not None and prob.status == pulp.constants.LpStatusInfeasible:
+            raise GridCapInfeasibleError(
+                f"受電上限 {float(grid_import_cap_kw):,.0f} kW を守れません（LPが実行不可能）")
         raise RuntimeError(f"最適化に失敗しました（ステータス: {pulp.LpStatus[prob.status]}）")
 
     # === 結果取得 ===
@@ -951,7 +1218,7 @@ def optimize_battery(generation_30min, demand_30min, month_day,
     opt_peak_kw = peak_demand.varValue
     opt_cost = pulp.value(prob.objective)
 
-    return {
+    result = {
         "self_consumption": self_consumption,
         "export": ge_vals,
         "import_": gi_vals,
@@ -978,6 +1245,95 @@ def optimize_battery(generation_30min, demand_30min, month_day,
         "opt_peak_kw": opt_peak_kw,
         "opt_annual_cost": opt_cost,
     }
+    if cap_kwh_slot is not None:
+        # 受電上限を制約として強制したことを結果に残す（従来の戻り値のキー構成は上限なしでは変えない）
+        result["grid_import_cap_kw"] = float(grid_import_cap_kw)
+    return result
+
+
+# ============================================================
+# 系統受電上限の診断（実行不可能の理由と、必要な蓄電池の下限の目安）
+# ============================================================
+
+def diagnose_grid_cap(generation_30min, demand_30min, cap_kw, capacity_kwh=0.0,
+                      efficiency_pct=95.0, max_charge_kw=0.0, max_discharge_kw=0.0,
+                      soc_min_pct=20.0, soc_max_pct=95.0):
+    """系統受電上限 cap_kw を守れるかを、LPを解かずに必要条件で診断する（設計書 §7・§13）。
+
+    各コマで PV差引後の負荷 net = 需要 − PV発電 が上限を超える分（need>0）は、その時刻の蓄電池放電で
+    賄うしかない。上限を下回る余力（need<0）は、蓄電池を充電する機会になる。この構造から
+    次の3つを**必要条件**として判定する（1つでも破れていれば、LPを解くまでもなく確実に守れない）。
+
+      energy   : 年間で見て、超過分 Σneed⁺ が、余力を効率損失込みで貯めた量 η²·Σneed⁻ 以下であること
+                 （破れると蓄電池をいくら大きくしても解決しない＝基底負荷が上限に近すぎる）
+      power    : 最大の超過 max(need⁺)/0.5h が蓄電池の最大放電電力以下であること
+      capacity : 理想的な（充電レート無制限の）SOCの最大ドローダウンが、使用可能容量以下であること
+
+    必要量（required_power_kw / required_usable_kwh）は充放電レートや効率のばらつきを考えない**下限の目安**で、
+    実際にはこれ以上必要になりうる。LPが実行不可能でも3条件を満たす場合は、主に充電レート不足など。
+
+    Returns:
+        dict（needs_battery=False なら上限は蓄電池なしで守れる）
+    """
+    dt = 0.5
+    eta = efficiency_pct / 100.0
+    net = (np.asarray(demand_30min, dtype=float) - np.asarray(generation_30min, dtype=float)).ravel()
+    need = net - float(cap_kw) * dt
+    npos = np.maximum(need, 0.0)     # 放電が必要な量 [kWh/30分]
+    spare = np.maximum(-need, 0.0)   # 上限までの余力 [kWh/30分]
+    n_exc = int((npos > 1e-9).sum())
+
+    d = {
+        "cap_kw": float(cap_kw),
+        "peak_net_kw": float(net.max() / dt),
+        "exceed_slots": n_exc,
+        "total_slots": int(net.size),
+        "exceed_energy_kwh": float(npos.sum()),
+        "spare_energy_kwh": float(spare.sum()),
+        "needs_battery": n_exc > 0,
+        "energy_feasible": True,
+        "min_cap_kw_energy": None,
+        "required_power_kw": 0.0,
+        "required_usable_kwh": 0.0,
+        "required_capacity_kwh": 0.0,
+        "usable_kwh": float(capacity_kwh) * (soc_max_pct - soc_min_pct) / 100.0,
+        "max_discharge_kw": float(max_discharge_kw),
+        "violations": [],
+    }
+    if n_exc == 0:
+        return d
+
+    # --- power: 最大の超過を賄う放電電力 ---
+    d["required_power_kw"] = float(npos.max() / dt)
+    if d["required_power_kw"] > max_discharge_kw * (1.0 + 1e-9):
+        d["violations"].append("power")
+
+    # --- energy: 年間の収支 ---
+    d["energy_feasible"] = bool(npos.sum() <= eta ** 2 * spare.sum() * (1.0 + 1e-9))
+    if not d["energy_feasible"]:
+        d["violations"].append("energy")
+        # 蓄電池が無限に大きくても必要な上限の下限（energy条件が成り立つ最小の上限）を二分法で求める
+        lo, hi = 0.0, float(net.max() / dt)
+        for _ in range(80):
+            mid = (lo + hi) / 2.0
+            lack = np.maximum(net - mid * dt, 0.0).sum() - eta ** 2 * np.maximum(mid * dt - net, 0.0).sum()
+            if lack > 0:
+                lo = mid
+            else:
+                hi = mid
+        d["min_cap_kw_energy"] = hi
+        return d
+
+    # --- capacity: 理想SOCの最大ドローダウン（年をまたぐため2周分で評価） ---
+    # 放電 need⁺ でSOCは need⁺/η 減り、余力 need⁻ を全部充電すればSOCは η·need⁻ 増える
+    y = np.where(need > 0, -need / eta, spare * eta)
+    s = np.concatenate([[0.0], np.cumsum(np.concatenate([y, y]))])
+    d["required_usable_kwh"] = float(np.max(np.maximum.accumulate(s) - s))
+    soc_width = (soc_max_pct - soc_min_pct) / 100.0
+    d["required_capacity_kwh"] = d["required_usable_kwh"] / soc_width if soc_width > 0 else float("inf")
+    if d["required_usable_kwh"] > d["usable_kwh"] * (1.0 + 1e-9):
+        d["violations"].append("capacity")
+    return d
 
 
 # ============================================================
@@ -1502,6 +1858,524 @@ def make_daily_chart(result, month, day, sc_result=None, demand_30min=None):
 
 
 # ============================================================
+# 受電電圧区分・タリフ解決（新規実装。設計書 §6-3・§6-4）
+# ============================================================
+
+def resolve_voltage_class(contract_power_kw):
+    """契約電力[kW]から受電電圧区分を判定する。
+
+    北海道電力ネットワーク 託送供給等約款 第13条の標準電圧に基づく原則判定。
+    実際の受電電圧は需要場所の設備条件・周辺系統の状況により上位/下位になる場合が
+    あるため、UIでは手動指定も選択できるようにしている。
+
+    Args:
+        contract_power_kw: 契約電力 [kW]
+
+    Returns:
+        str: 区分キー（"hv_6000" / "ehv_30000" / "ehv_60000"）
+    """
+    kw = float(contract_power_kw) if contract_power_kw else 0.0
+    for lo, hi, key in VOLTAGE_CLASS_THRESHOLDS:
+        if lo <= kw < hi:
+            return key
+    return "ehv_60000"
+
+
+def get_menu_choices(voltage_class, utility=DEFAULT_UTILITY):
+    """指定の電力会社・電圧区分で選択可能な料金メニュー名のリストを返す。"""
+    return list(TARIFFS.get(utility, {}).get(voltage_class, {}).keys())
+
+
+def get_tariff(voltage_class, menu=None, utility=DEFAULT_UTILITY):
+    """タリフ表から料金単価を取得する。
+
+    Args:
+        voltage_class: 区分キー（"hv_6000" 等）
+        menu: 料金メニュー名。Noneなら産業用メニュー（負荷率の高いDCに有利）を既定採用
+        utility: 電力会社名
+
+    Returns:
+        dict: basic_charge_per_kw / energy_charge_summer / energy_charge_other
+              ＋ 共通の従量費目（力率・燃調・再エネ賦課金）
+        ※ 返す値は「タリフ表の既定値」であり、UIでユーザーが上書きした値はここには入らない
+    """
+    by_class = TARIFFS.get(utility, {}).get(voltage_class, {})
+    if not by_class:
+        raise ValueError(f"タリフが未定義です: {utility} / {voltage_class}")
+    if menu is None or menu not in by_class:
+        menu = INDUSTRIAL_MENU_BY_CLASS.get(voltage_class)
+        if menu not in by_class:
+            menu = list(by_class.keys())[0]
+    rates = dict(by_class[menu])
+    rates["power_factor_pct"] = DEFAULT_POWER_FACTOR_PCT
+    rates["fuel_adjustment"] = DEFAULT_FUEL_ADJUSTMENT
+    rates["renewable_surcharge"] = DEFAULT_RENEWABLE_SURCHARGE
+    rates["menu"] = menu
+    rates["voltage_class"] = voltage_class
+    rates["utility"] = utility
+    return rates
+
+
+# ============================================================
+# データセンター需要モデル（新規実装。設計書 §5）
+# ============================================================
+# demand(t) = IT_load(t) × PUE(T_out(t))
+#
+# 【Phase 0の実装範囲】
+#   IT負荷: 定常 / 日変動（正弦波）に対応。CSVアップロードは未実装（設計書 §13）。
+#   PUE:    「一定」のみ実装。気温連動PUE（§5-4）はPhase 1で実装する。
+# ============================================================
+
+def resolve_it_capacity_kw(capacity_mode, size_preset=None, it_capacity_kw=None,
+                           n_racks=None, kw_per_rack=None):
+    """容量の指定方法を解決して IT定格容量 [kW] を返す。
+
+    DCの容量指定は実務上2軸ある（設計書 §6-2）。内部では常に IT容量[kW] に正規化する。
+      - 規模プリセット: エッジ/小規模/中規模/ハイパースケール
+      - IT容量を直接入力: 「20MWのDC」という業界標準の言い方
+      - ラック数×density: 設備設計者向け。ラック数 × ラック電力密度[kW/ラック]
+
+    延床面積[m2]は採らない。DCはラック密度で電力密度が1桁変わるため
+    （pv-sim-bizのComStock方式がDCに転用できない理由そのもの。設計書 §5-1）。
+    """
+    if capacity_mode == "ラック数×density":
+        n = float(n_racks) if n_racks else 0.0
+        d = float(kw_per_rack) if kw_per_rack else 0.0
+        return n * d
+    if capacity_mode == "規模プリセット":
+        preset = DC_SIZE_PRESETS.get(size_preset)
+        if preset:
+            return float(preset["it_capacity_kw"])
+    return float(it_capacity_kw) if it_capacity_kw else 0.0
+
+
+def _cec_shape_30min():
+    """CEC調和モデル由来の形状を (365, 48) で返す（年平均=1.0に正規化）。
+
+    CEC_LF_WEEKDAY/WEEKEND は [月][時刻] の千分率テーブル（年間最大=1000）。
+    毎時24点を interpolate_to_30min() で48コマへ補間する。
+
+    平日/休日の判定には暦が要るが、NEDO METPV-20は代表年データで曜日を持たない。
+    このため CEC_REFERENCE_YEAR で暦を固定する（設計書 §5-7）。
+    """
+    import datetime as _dt
+    shape = np.zeros((365, 48))
+    d0 = _dt.date(CEC_REFERENCE_YEAR, 1, 1)
+    for i in range(365):
+        day = d0 + _dt.timedelta(days=i)
+        tbl = CEC_LF_WEEKDAY if day.weekday() < 5 else CEC_LF_WEEKEND
+        hourly = np.array(tbl[day.month - 1], dtype=float) / 1000.0
+        shape[i] = interpolate_to_30min(hourly)
+    return shape / shape.mean()
+
+
+def _diurnal_shape_30min(peak_pct, bottom_pct, peak_hour):
+    """日変動（正弦波）の形状を (365, 48) で返す（年平均=1.0に正規化）。
+
+    ピーク時刻を頂点とする正弦波。ピーク/ボトム負荷率の比だけが形状を決め、
+    絶対水準は呼び出し側の「IT負荷率（年平均）」が担う。
+    """
+    pk = float(peak_pct) / 100.0
+    bt = float(bottom_pct) / 100.0
+    ph = float(peak_hour) if peak_hour is not None else 14.0
+    mid = (pk + bt) / 2.0
+    amp = (pk - bt) / 2.0
+    hours = np.arange(0.25, 24.25, 0.5)  # 各30分コマの中央時刻
+    lf_day = mid + amp * np.cos(2.0 * np.pi * (hours - ph) / 24.0)
+    shape = np.tile(lf_day, (365, 1))
+    return shape / shape.mean()
+
+
+def _apply_noise(shape, noise_level):
+    """短周期変動を重畳する（形状の年平均=1.0は保つ）。
+
+    LBNL Shape Maker の定義に合わせ、日ごとにノイズ強度を帯の中で変え、
+    各コマに一様乱数を乗せる（low 3-7% / high 12-18% of baseline）。
+    再現性のため NOISE_SEED で固定する。
+    """
+    lo, hi = NOISE_BANDS.get(noise_level, (0.0, 0.0))
+    if hi <= 0:
+        return shape
+    rng = np.random.default_rng(NOISE_SEED)
+    daily_amp = rng.uniform(lo, hi, size=(365, 1))          # 日ごとのノイズ強度
+    noise = rng.uniform(-1.0, 1.0, size=shape.shape) * daily_amp
+    out = shape * (1.0 + noise)
+    out = np.clip(out, 0.0, None)
+    return out / out.mean()
+
+
+def build_it_load_30min(it_capacity_kw, profile_mode=PROFILE_FLAT,
+                        load_factor_pct=80.0,
+                        peak_pct=90.0, bottom_pct=50.0, peak_hour=14,
+                        noise_level="なし"):
+    """IT機器の消費電力量を (365, 48) [kWh/30分] で返す。
+
+    IT_load(t) = it_capacity_kw × load_factor(t) × 0.5
+    load_factor(t) = IT負荷率（年平均） × 形状(t)      ※形状は年平均=1.0に正規化
+
+    **水準と形状を分離する**のが要点（設計書 §5-7）。
+    水準（IT負荷率）はサイト固有の値でユーザーが決める。
+    形状は出典のあるものを使う:
+
+      - PROFILE_CEC   : CEC 2025 IEPR の調和モデル由来（商用DCのinterval meter、
+                        PG&E約100施設2020-2024で校正）。平日/休日×月×時刻の576点テーブル
+      - PROFILE_FLAT  : 時刻変動なし。LBNL "Flat — characteristic of large AI training
+                        clusters running continuous batch jobs"
+      - PROFILE_DIURNAL: ピーク時刻を頂点とする正弦波。振れ幅は根拠がないため
+                        自社サーバー室など振れの大きいサイトを手で作る用途に限る
+
+    ノイズは LBNL Shape Maker の定義（low 3-7% / high 12-18% of baseline）に準拠。
+
+    Args:
+        it_capacity_kw: IT定格容量 [kW]
+        profile_mode: PROFILE_CEC / PROFILE_FLAT / PROFILE_DIURNAL
+        load_factor_pct: IT負荷率（年平均）[%]
+        peak_pct / bottom_pct / peak_hour: 日変動時の形状パラメータ
+        noise_level: NOISE_LEVELS のいずれか
+
+    Returns:
+        np.ndarray: (365, 48) [kWh/30分]
+    """
+    cap = float(it_capacity_kw) if it_capacity_kw else 0.0
+    dt = 0.5  # 30分 = 0.5時間
+    level = float(load_factor_pct) / 100.0
+
+    if profile_mode == PROFILE_CEC:
+        shape = _cec_shape_30min()
+    elif profile_mode == PROFILE_DIURNAL:
+        shape = _diurnal_shape_30min(peak_pct, bottom_pct, peak_hour)
+    else:  # PROFILE_FLAT
+        shape = np.ones((365, 48))
+
+    shape = _apply_noise(shape, noise_level)
+    return cap * level * shape * dt
+
+
+def build_pue_30min(pue_mode="一定", temp_30min=None, pue_const=1.40, pue_params=None):
+    """各30分コマのPUEを (365, 48) で返す。
+
+    Args:
+        pue_mode: "一定" / "気温連動"
+        temp_30min: (365, 48) 外気温 [℃]（気温連動時に必要）
+        pue_const: PUE一定値
+        pue_params: 気温連動モデルのパラメータ（PUE_MODEL_DEFAULTS 参照）
+
+    Returns:
+        np.ndarray: (365, 48) PUE
+    """
+    if pue_mode == "気温連動":
+        # TODO(Phase 1): 設計書 §5-4 の気温連動PUEモデルを実装する
+        #   PUE(T) = 1 + α + 1/COP_eff(T)
+        #   x = clip((T − T_free)/(T_full − T_free), 0, 1)
+        #   COP_mech(T) = max(COP_min, COP_ref − β×(T − T_ref))
+        #   1/COP_eff(T) = (1 − x)/COP_free + x/COP_mech(T)
+        #   → PUE_max でクリップ
+        raise NotImplementedError(
+            "気温連動PUEはPhase 1で実装予定です。現在は「一定」モードを使用してください。"
+        )
+    return np.full((365, 48), float(pue_const))
+
+
+def build_dc_demand_30min(it_load_30min, pue_30min):
+    """DC施設全体の電力需要 (365, 48) [kWh/30分] を返す。
+
+    demand(t) = IT_load(t) × PUE(t)
+
+    Returns:
+        (demand_30min, breakdown) breakdownは内訳の年間集計 dict
+    """
+    demand = it_load_30min * pue_30min
+    annual_it = float(np.sum(it_load_30min))
+    annual_total = float(np.sum(demand))
+    # 冷却＋電源設備損失（＝施設総電力 − IT電力）。
+    # Phase 0のPUE一定モードでは冷却とその他損失を分離できないため合算で扱う。
+    annual_overhead = annual_total - annual_it
+    breakdown = {
+        "annual_it_kwh": annual_it,
+        "annual_total_kwh": annual_total,
+        "annual_overhead_kwh": annual_overhead,
+        "avg_pue": (annual_total / annual_it) if annual_it > 0 else 0.0,
+        "max_pue": float(np.max(pue_30min)),
+        "min_pue": float(np.min(pue_30min)),
+    }
+    return demand, breakdown
+
+
+def resolve_grid_cap(mode, manual_kw=None):
+    """受電上限の指定（UIの選択＋手入力値）から (上限[kW] or None, 表示ラベル) を返す。
+
+    プリセットは受電電圧の階層境界の1kW下（GRID_CAP_PRESETS_KW）。手入力は正の有限値のみ。
+    None・空欄の選択は「制限なし」として扱う。
+
+    Raises:
+        ValueError: 手入力の値が正の有限値でないとき
+    """
+    if not mode or mode == GRID_CAP_NONE:
+        return None, GRID_CAP_NONE
+    if mode in GRID_CAP_PRESETS_KW:
+        return GRID_CAP_PRESETS_KW[mode], mode
+    if mode == GRID_CAP_MANUAL:
+        try:
+            kw = float(manual_kw)
+        except (TypeError, ValueError):
+            kw = float("nan")
+        if not np.isfinite(kw) or kw <= 0:
+            raise ValueError("受電上限（手入力）は0より大きい数値[kW]で指定してください")
+        return kw, GRID_CAP_MANUAL
+    raise ValueError(f"受電上限の指定が不正です: {mode}")
+
+
+def resolve_dc_demand(dc_args, temp_30min=None):
+    """DC入力（UIの値をそのまま詰めた辞書）からDC需要 (365, 48) を生成する。
+
+    run_simulation の需要ソース分岐（データセンター）から呼ばれる。
+    None・空欄は DC_DEFAULTS で補う（数値入力を `is not None` で判定する既存の作法に合わせる）。
+    下流（LP・料金計算・経済性）は (365, 48) 配列を受け取るだけなので、この関数の戻り値を
+    産業用の load_combined_demand() の代わりに差し込める。
+
+    Args:
+        dc_args: DC_INPUT_KEYS をキーとする辞書
+        temp_30min: (365, 48) 外気温 [℃]。気温連動PUE用（未実装）。PUE一定では不要
+
+    Returns:
+        (demand_30min, dc_info)
+        dc_info: 結果テキスト用の解決済み入力・IT負荷・内訳・ピークデマンド
+
+    Raises:
+        ValueError: IT定格容量が0以下／IT負荷率が範囲外／PUEが1.0未満／受電上限（手入力）が不正
+    """
+    a = dict(dc_args or {})
+
+    def pick(key, default):
+        v = a.get(key)
+        return default if v is None else v
+
+    capacity_mode = a.get("capacity_mode") or "IT容量を直接入力"
+    it_cap = resolve_it_capacity_kw(
+        capacity_mode,
+        size_preset=a.get("size_preset"),
+        it_capacity_kw=pick("it_capacity_kw", DC_DEFAULTS["it_capacity_kw"]),
+        n_racks=pick("n_racks", DC_DEFAULTS["n_racks"]),
+        kw_per_rack=pick("kw_per_rack", DC_DEFAULTS["kw_per_rack"]),
+    )
+    if it_cap <= 0:
+        raise ValueError("IT定格容量が0以下です。容量の指定方法と値を確認してください")
+
+    it_lf = float(pick("it_load_factor_pct", DC_DEFAULTS["it_load_factor_pct"]))
+    if not (0 < it_lf <= 100):
+        raise ValueError(f"IT負荷率（年平均）は0より大きく100以下で指定してください（現在: {it_lf:g}%）")
+    pue_c = float(pick("pue_const", DC_DEFAULTS["pue_const"]))
+    if pue_c < 1.0:
+        raise ValueError(
+            f"PUEは1.0以上で指定してください（現在: {pue_c:g}）。"
+            "PUE＝施設全体電力÷IT機器電力のため1.0が下限です"
+        )
+    it_pk = float(pick("it_peak_pct", DC_DEFAULTS["it_peak_pct"]))
+    it_bt = float(pick("it_bottom_pct", DC_DEFAULTS["it_bottom_pct"]))
+    it_ph = pick("it_peak_hour", DC_DEFAULTS["it_peak_hour"])
+    grid_cap_kw, grid_cap_label = resolve_grid_cap(a.get("grid_cap_mode"), a.get("grid_cap_kw"))
+
+    # 用途プリセットはプロファイルとノイズを一括設定する（「手動設定」なら個別指定を使う）
+    workload = a.get("workload_preset")
+    preset = DC_WORKLOAD_PRESETS.get(workload)
+    if preset:
+        profile_mode = preset["profile"]
+        noise = preset["noise"]
+    else:
+        profile_mode = a.get("profile_mode") or PROFILE_FLAT
+        noise = a.get("noise_level") or "なし"
+
+    it_load_30min = build_it_load_30min(
+        it_cap, profile_mode=profile_mode, load_factor_pct=it_lf,
+        peak_pct=it_pk, bottom_pct=it_bt, peak_hour=it_ph, noise_level=noise,
+    )
+    # PUEは一定値のみ（気温連動は保留。docs/decision_log.md 第2段階）
+    pue_30min = build_pue_30min(
+        pue_mode="一定", temp_30min=temp_30min, pue_const=pue_c, pue_params=PUE_MODEL_DEFAULTS,
+    )
+    demand_30min, breakdown = build_dc_demand_30min(it_load_30min, pue_30min)
+
+    dc_info = {
+        "workload_preset": workload,
+        "capacity_mode": capacity_mode,
+        "size_preset": a.get("size_preset"),
+        "n_racks": pick("n_racks", DC_DEFAULTS["n_racks"]),
+        "kw_per_rack": pick("kw_per_rack", DC_DEFAULTS["kw_per_rack"]),
+        "it_capacity_kw": it_cap,
+        "profile_mode": profile_mode,
+        "noise_level": noise,
+        "it_load_factor_pct": it_lf,
+        "it_peak_pct": it_pk,
+        "it_bottom_pct": it_bt,
+        "it_peak_hour": it_ph,
+        "pue_const": pue_c,
+        "it_load_30min": it_load_30min,
+        "breakdown": breakdown,
+        # 導入前ピークデマンド[kW] = 30分需要[kWh]の年間最大 ÷ 0.5h
+        "peak_demand_kw": float(np.max(demand_30min)) * 2.0,
+        # 系統受電上限（None=制限なし）。DCモードのときだけ存在する（産業用には上限を適用しない）
+        "grid_cap_kw": grid_cap_kw,
+        "grid_cap_label": grid_cap_label,
+    }
+    return demand_30min, dc_info
+
+
+def format_dc_summary(dc_info, contract_type=None):
+    """DC需要の結果テキスト（結果ボックス先頭に置く節）を返す。
+
+    Args:
+        dc_info: resolve_dc_demand が返す辞書
+        contract_type: 電気料金設定の契約種別（"高圧"/"特別高圧"）。受電電圧の目安との食い違い警告に使う
+    """
+    d = dc_info
+    bd = d["breakdown"]
+    peak_kw = d["peak_demand_kw"]
+    t = "══ データセンター需要 ══\n"
+    if d["workload_preset"] and DC_WORKLOAD_PRESETS.get(d["workload_preset"]):
+        t += f"  用途: {d['workload_preset']}\n"
+    if d["capacity_mode"] == "規模プリセット" and d["size_preset"] in DC_SIZE_PRESETS:
+        t += f"  規模: {d['size_preset']}（{DC_SIZE_PRESETS[d['size_preset']]['note']}）※区分は暫定値\n"
+    elif d["capacity_mode"] == "ラック数×density":
+        t += f"  容量指定: {float(d['n_racks']):,.0f} ラック × {float(d['kw_per_rack']):,.1f} kW/ラック\n"
+    t += f"  IT定格容量: {d['it_capacity_kw']:,.0f} kW\n"
+    t += f"  負荷プロファイル: {d['profile_mode']}"
+    if d["profile_mode"] == PROFILE_DIURNAL:
+        t += f"（ピーク{d['it_peak_pct']:.0f}% / ボトム{d['it_bottom_pct']:.0f}% / ピーク{int(d['it_peak_hour'])}時）"
+    t += "\n"
+    t += f"  IT負荷率（年平均）: {d['it_load_factor_pct']:.0f}%\n"
+    t += f"  短周期変動: {d['noise_level']}\n"
+    it_kw = d["it_load_30min"] * 2.0
+    t += (f"  IT負荷 実効: 平均 {it_kw.mean():,.0f} kW / 最小 {it_kw.min():,.0f} kW"
+          f" / 最大 {it_kw.max():,.0f} kW\n")
+    t += f"  PUE: {d['pue_const']:.2f}（一定。空冷前提）\n"
+    t += f"  年間IT電力量: {bd['annual_it_kwh']:,.0f} kWh/年\n"
+    t += f"  年間施設総電力量: {bd['annual_total_kwh']:,.0f} kWh/年\n"
+    t += f"  うち冷却＋電源設備損失: {bd['annual_overhead_kwh']:,.0f} kWh/年\n"
+    t += f"  年間平均PUE（実効）: {bd['avg_pue']:.3f}\n"
+    t += f"  導入前ピークデマンド: {peak_kw:,.1f} kW\n"
+    t += (f"  推奨する申請受電容量の目安: {peak_kw / CEC_UTILIZATION_FACTOR:,.0f} kW"
+          f"（施設最大需要 ÷ {CEC_UTILIZATION_FACTOR:.2f}）\n")
+    t += ("    ※ CEC 2025 IEPR の utilization factor 67%（申請受電容量→最大運転需要）の逆算。\n"
+          "       67%は「観測された上限」であり典型値ではないため、実際の申請容量は\n"
+          "       これより大きくなる可能性がある（設計書 §5-6(2)）\n")
+
+    # 契約種別（高圧/特別高圧）と、ピークデマンドから見た受電電圧区分の目安の食い違いを知らせる
+    suggest_ehv = resolve_voltage_class(peak_kw) != "hv_6000"
+    if contract_type == "高圧" and suggest_ehv:
+        t += (f"  ⚠ 導入前ピーク {peak_kw:,.0f} kW は2,000kW以上のため、契約種別は「特別高圧」が目安です"
+              "（現在は「高圧」。「電気料金設定」で切り替えられます）\n")
+    elif contract_type == "特別高圧" and not suggest_ehv:
+        t += (f"  ⚠ 導入前ピーク {peak_kw:,.0f} kW は2,000kW未満のため、契約種別は「高圧」が目安です"
+              "（現在は「特別高圧」。「電気料金設定」で切り替えられます）\n")
+    t += ("  ※ 電気料金は共通の「電気料金設定」を使用します"
+          "（既定値は東京電力EP。北海道電力タリフ表との連動は未実装）\n")
+    return t
+
+
+def _grid_cap_reason_lines(diag, battery):
+    """診断結果（diagnose_grid_cap）の違反ごとの説明行を返す。"""
+    lines = []
+    v = diag["violations"]
+    if "energy" in v:
+        lines.append(
+            "  ・上限が低すぎます: PV差引後の負荷が上限を下回る時間の余力"
+            f"（{diag['spare_energy_kwh']:,.0f} kWh/年）では、超過分（{diag['exceed_energy_kwh']:,.0f} kWh/年）を\n"
+            "    蓄電池の効率損失込みで賄えません。蓄電池を大きくしても解決しません。\n"
+            f"    → 上限を約 {diag['min_cap_kw_energy']:,.0f} kW 以上にする／PV容量を増やす／"
+            "IT負荷（容量・負荷率）を下げる\n")
+    if "power" in v:
+        lines.append(
+            f"  ・蓄電池の放電出力が不足: 上限内に収めるには最大 {diag['required_power_kw']:,.0f} kW の放電が必要"
+            f"（指定 {battery['max_discharge_kw']:,.0f} kW）\n")
+    if "capacity" in v:
+        lines.append(
+            f"  ・蓄電池の容量が不足: 使用可能容量で少なくとも {diag['required_usable_kwh']:,.0f} kWh"
+            f"（公称容量で約 {diag['required_capacity_kwh']:,.0f} kWh）が必要"
+            f"（指定 {battery['capacity_kwh']:,.0f} kWh）\n")
+    return lines
+
+
+def format_grid_cap(dc_info, diag, status, sc_result=None, battery=None):
+    """系統受電上限の結果テキスト（結果ボックスに置く節）を返す。
+
+    status:
+      "enforced"      最適充放電LPで上限を制約として強制し、解けた
+      "not_enforced"  蓄電池が「なし」「ルールベース」のため上限は強制していない（超過判定のみ表示）
+      "infeasible"    診断の必要条件が破れていて確実に守れない（LPは実行していない）
+      "infeasible_lp" 診断の必要条件は満たすが、LPが実行不可能だった
+    battery: {"enabled", "mode_label", "capacity_kwh", "max_charge_kw", "max_discharge_kw"}
+    """
+    cap = diag["cap_kw"]
+    before = dc_info["peak_demand_kw"]
+    b = battery or {"enabled": False, "mode_label": "", "capacity_kwh": 0.0,
+                    "max_charge_kw": 0.0, "max_discharge_kw": 0.0}
+    t = "══ 受電上限 ══\n"
+    t += f"  上限: {cap:,.0f} kW（{dc_info['grid_cap_label']}）\n"
+    if before > cap:
+        t += f"  導入前ピーク: {before:,.1f} kW（上限を {before - cap:,.1f} kW 超過）\n"
+    else:
+        t += f"  導入前ピーク: {before:,.1f} kW（上限内）\n"
+
+    if status in ("infeasible", "infeasible_lp"):
+        if status == "infeasible":
+            t += "  ⚠ この条件では受電上限を守れません。蓄電池の最適化は実行していません。\n"
+        else:
+            t += ("  ⚠ 最適化（LP）が実行不可能でした（受電上限を守れません）。\n"
+                  "    出力・容量・エネルギー収支の必要条件は満たしているため、主な原因は充電レート不足です\n"
+                  f"    （最大充電電力 {b['max_charge_kw']:,.0f} kW では、超過後に蓄電池を回復できない時間帯があります）。\n"
+                  "    最大充電電力・容量を増やして再試行してください。\n")
+        t += (f"  PV差引後の負荷: 最大 {diag['peak_net_kw']:,.0f} kW ／ 上限超過のコマ {diag['exceed_slots']:,} 件"
+              f"（年間の {diag['exceed_slots'] / diag['total_slots'] * 100:.1f}%）"
+              f" ／ 超過エネルギー {diag['exceed_energy_kwh']:,.0f} kWh/年\n")
+        for line in _grid_cap_reason_lines(diag, b):
+            t += line
+        if diag["energy_feasible"]:
+            t += (f"  必要な蓄電池の下限の目安: 放電出力 ≥ {diag['required_power_kw']:,.0f} kW ／ "
+                  f"使用可能容量 ≥ {diag['required_usable_kwh']:,.0f} kWh"
+                  f"（公称容量で約 {diag['required_capacity_kwh']:,.0f} kWh）\n")
+            t += ("    ※ 充放電レート・効率損失・SOC範囲を細かく考えない下限の目安です。\n"
+                  "       実際にはこれ以上必要になる場合があります\n")
+        return t
+
+    peak_after = float(np.max(sc_result["import_"])) * 2.0
+    over = peak_after - cap
+    within = over <= max(1e-6 * cap, 1e-6)
+    after_txt = "上限内" if within else f"上限を {over:,.1f} kW 超過"
+    if status == "enforced":
+        t += f"  導入後ピーク: {peak_after:,.1f} kW（{after_txt}）\n"
+        t += ("  最適充放電（LP）で上限を制約として強制しています"
+              "（受電上限を指定した場合、蓄電池の初期SOCは年末SOCと一致させる周期条件にしています）\n")
+        if diag["needs_battery"] and diag["energy_feasible"]:
+            t += (f"  必要な蓄電池の下限の目安: 放電出力 ≥ {diag['required_power_kw']:,.0f} kW ／ "
+                  f"使用可能容量 ≥ {diag['required_usable_kwh']:,.0f} kWh"
+                  f"（公称容量で約 {diag['required_capacity_kwh']:,.0f} kWh）\n")
+    else:  # not_enforced
+        t += f"  導入後ピーク: {peak_after:,.1f} kW（{after_txt}）\n"
+        if not diag["needs_battery"]:
+            t += "  PV差引後の負荷は常に上限内で、蓄電池なしでも上限を守れます\n"
+        else:
+            why = "「なし」" if not b["enabled"] else f"「{b['mode_label']}」"
+            t += (f"  ⚠ 蓄電池が{why}のため、上限は強制していません。"
+                  "上限を守れるかは「最適充放電（LP）」で判定できます\n")
+            for line in _grid_cap_reason_lines(diag, b):
+                t += line
+            if diag["energy_feasible"]:
+                t += (f"  上限を守るために必要な蓄電池の下限の目安: 放電出力 ≥ {diag['required_power_kw']:,.0f} kW ／ "
+                      f"使用可能容量 ≥ {diag['required_usable_kwh']:,.0f} kWh"
+                      f"（公称容量で約 {diag['required_capacity_kwh']:,.0f} kWh）\n")
+    return t
+
+
+def grid_cap_infeasible_response(dc_info, contract_type, diag, status, battery):
+    """受電上限を守れないときに run_simulation が返す7要素のタプル（エラーではなく診断として返す）。"""
+    text = format_dc_summary(dc_info, contract_type) + "\n"
+    text += format_grid_cap(dc_info, diag, status, battery=battery)
+    dbg = (f"受電上限 {diag['cap_kw']:,.0f} kW を守れません（{status}）: "
+           f"違反={diag['violations'] or ['LP実行不可能']}\n")
+    return None, None, None, None, text, dbg, None
+
+
+# ============================================================
 # IRR計算（ニュートン法）
 # ============================================================
 
@@ -1569,8 +2443,15 @@ def run_simulation(
     facility_args, face_args,
     num_facilities=1, num_faces=1,
     display_month=1, display_day=1,
+    demand_source=DEMAND_SOURCE_INDUSTRIAL, dc_args=None,
 ):
-    """メイン計算コールバック"""
+    """メイン計算コールバック
+
+    demand_source で需要の生成方法を切り替える。下流（蓄電池・料金計算・経済性）は
+    どちらも (365, 48) の需要配列を受け取るだけなので共通。
+      - DEMAND_SOURCE_INDUSTRIAL: ComStock需要プリセット・複数施設合算（facility_args 等を使用）
+      - DEMAND_SOURCE_DATACENTER: IT負荷 × PUE（dc_args を使用。facility_args 等は無視）
+    """
     try:
         # --- データ読み込み ---
         if csv_file is not None:
@@ -1583,10 +2464,22 @@ def run_simulation(
         else:
             return None, None, None, None, "エラー: 地点を選択するかCSVをアップロードしてください", "", None
 
-        # --- 需要データ読み込み（複数施設合算） ---
-        demand_30min, individual_demands = load_combined_demand(
-            facility_args, num_facilities, custom_csv=demand_custom_csv,
-        )
+        # --- 需要データの生成（需要ソースで分岐） ---
+        dc_info = None
+        if demand_source == DEMAND_SOURCE_DATACENTER:
+            # データセンター: IT負荷 × PUE。PUEは一定値のみのため外気温は使わない
+            # （気温連動PUEを実装するときは prepare_30min_data の気温を temp_30min として渡す）
+            try:
+                demand_30min, dc_info = resolve_dc_demand(dc_args)
+            except ValueError as e:
+                return None, None, None, None, f"エラー: {e}", "", None
+            # マイクログリッドの束ねメリット計算は施設ごとの需要リストを使う。DCは単一サイト
+            individual_demands = [demand_30min]
+        else:
+            # 産業用・MG: 複数施設合算
+            demand_30min, individual_demands = load_combined_demand(
+                facility_args, num_facilities, custom_csv=demand_custom_csv,
+            )
 
         # --- 面設定パース（5項目: Ppeak, 方位選択, 方位角, 傾斜角, PCS出力制限） ---
         faces = []
@@ -1653,29 +2546,62 @@ def run_simulation(
         no_export = (sell_mode == "逆潮流禁止（売電なし）")
         sc_result = None
         battery_mode_label = bat_mode if bat_mode else "ルールベース"
+        # 系統受電上限（DCモードのときだけ存在。産業用には適用しない）と、診断に使う蓄電池の諸元。
+        # 上限を強制できるのは最適充放電（LP）だけ。最適容量探索は上限を考慮しないため諸元は0扱い
+        grid_cap_kw = dc_info["grid_cap_kw"] if dc_info is not None else None
+        grid_cap_diag = None
+        _bat_on = bool(bat_enabled and bat_capacity and bat_capacity > 0)
+        _bat_spec = _bat_on and battery_mode_label != "最適容量探索"
+        battery_info = {
+            "enabled": _bat_on,
+            "mode_label": battery_mode_label,
+            "capacity_kwh": float(bat_capacity) if _bat_spec else 0.0,
+            "efficiency_pct": float(bat_efficiency) if bat_efficiency is not None else 95.0,
+            "max_charge_kw": float(bat_max_charge if bat_max_charge is not None else 2.5) if _bat_spec else 0.0,
+            "max_discharge_kw": float(bat_max_discharge if bat_max_discharge is not None else 2.5) if _bat_spec else 0.0,
+            "soc_min_pct": float(bat_soc_min) if bat_soc_min is not None else 20.0,
+            "soc_max_pct": float(bat_soc_max) if bat_soc_max is not None else 95.0,
+        }
         if demand_30min is not None:
             if bat_enabled and bat_capacity and bat_capacity > 0 and battery_mode_label != "最適容量探索":
                 if battery_mode_label == "最適充放電（LP）":
+                    # 受電上限あり: LPを解くまでもなく確実に守れない場合は、診断を返して終える
+                    if grid_cap_kw:
+                        grid_cap_diag = diagnose_grid_cap(
+                            result["total_gen_clipped"], demand_30min, grid_cap_kw,
+                            battery_info["capacity_kwh"], battery_info["efficiency_pct"],
+                            battery_info["max_charge_kw"], battery_info["max_discharge_kw"],
+                            battery_info["soc_min_pct"], battery_info["soc_max_pct"],
+                        )
+                        if grid_cap_diag["violations"]:
+                            return grid_cap_infeasible_response(
+                                dc_info, contract_type, grid_cap_diag, "infeasible", battery_info)
                     # LP最適化: 電気料金パラメータが必要
                     is_ehv_tmp = (contract_type == "特別高圧")
                     defaults_tmp = ELECTRICITY_RATE_EHV if is_ehv_tmp else ELECTRICITY_RATE_HV
-                    sc_result = optimize_battery(
-                        result["total_gen_clipped"], demand_30min, result["month_day"],
-                        capacity_kwh=bat_capacity,
-                        efficiency_pct=bat_efficiency if bat_efficiency is not None else 95,
-                        max_charge_kw=bat_max_charge if bat_max_charge is not None else 2.5,
-                        max_discharge_kw=bat_max_discharge if bat_max_discharge is not None else 2.5,
-                        soc_min_pct=bat_soc_min if bat_soc_min is not None else 20,
-                        soc_max_pct=bat_soc_max if bat_soc_max is not None else 95,
-                        basic_charge_per_kw=elec_basic if elec_basic is not None else defaults_tmp["basic_charge_per_kw"],
-                        energy_charge_summer=elec_summer if elec_summer is not None else defaults_tmp["energy_charge_summer"],
-                        energy_charge_other=elec_other if elec_other is not None else defaults_tmp["energy_charge_other"],
-                        power_factor_pct=elec_pf if elec_pf is not None else defaults_tmp["power_factor_pct"],
-                        fuel_adjustment=elec_fuel if elec_fuel is not None else defaults_tmp["fuel_adjustment"],
-                        renewable_surcharge=elec_renewable if elec_renewable is not None else defaults_tmp["renewable_surcharge"],
-                        sell_price=sell_price if sell_price is not None else DEFAULT_SELL_PRICE,
-                        no_export=no_export,
-                    )
+                    try:
+                        sc_result = optimize_battery(
+                            result["total_gen_clipped"], demand_30min, result["month_day"],
+                            capacity_kwh=bat_capacity,
+                            efficiency_pct=bat_efficiency if bat_efficiency is not None else 95,
+                            max_charge_kw=bat_max_charge if bat_max_charge is not None else 2.5,
+                            max_discharge_kw=bat_max_discharge if bat_max_discharge is not None else 2.5,
+                            soc_min_pct=bat_soc_min if bat_soc_min is not None else 20,
+                            soc_max_pct=bat_soc_max if bat_soc_max is not None else 95,
+                            basic_charge_per_kw=elec_basic if elec_basic is not None else defaults_tmp["basic_charge_per_kw"],
+                            energy_charge_summer=elec_summer if elec_summer is not None else defaults_tmp["energy_charge_summer"],
+                            energy_charge_other=elec_other if elec_other is not None else defaults_tmp["energy_charge_other"],
+                            power_factor_pct=elec_pf if elec_pf is not None else defaults_tmp["power_factor_pct"],
+                            fuel_adjustment=elec_fuel if elec_fuel is not None else defaults_tmp["fuel_adjustment"],
+                            renewable_surcharge=elec_renewable if elec_renewable is not None else defaults_tmp["renewable_surcharge"],
+                            sell_price=sell_price if sell_price is not None else DEFAULT_SELL_PRICE,
+                            no_export=no_export,
+                            grid_import_cap_kw=grid_cap_kw,
+                        )
+                    except GridCapInfeasibleError:
+                        # 診断の必要条件は満たしたがLPが実行不可能（主に充電レート不足）
+                        return grid_cap_infeasible_response(
+                            dc_info, contract_type, grid_cap_diag, "infeasible_lp", battery_info)
                 else:
                     # ルールベース
                     sc_result = simulate_battery(
@@ -1694,6 +2620,21 @@ def run_simulation(
                     no_export=no_export,
                 )
 
+        # --- 受電上限の結果（DCモードで上限が指定されたときのみ） ---
+        # LPで強制した場合は事前診断をそのまま使う。それ以外（蓄電池なし/ルールベース/容量探索）は
+        # 上限を強制していないので、導入後ピークが上限を超えるかの判定と、必要な蓄電池の目安を出す
+        grid_cap_text = ""
+        if grid_cap_kw and sc_result is not None:
+            cap_enforced = bool(sc_result.get("grid_import_cap_kw"))
+            cap_diag = grid_cap_diag if (cap_enforced and grid_cap_diag is not None) else diagnose_grid_cap(
+                result["total_gen_clipped"], demand_30min, grid_cap_kw,
+                battery_info["capacity_kwh"], battery_info["efficiency_pct"],
+                battery_info["max_charge_kw"], battery_info["max_discharge_kw"],
+                battery_info["soc_min_pct"], battery_info["soc_max_pct"],
+            )
+            grid_cap_text = format_grid_cap(
+                dc_info, cap_diag, "enforced" if cap_enforced else "not_enforced", sc_result, battery_info)
+
         # --- グラフ生成 ---
         fig_monthly = make_monthly_chart(result, sc_result)
         fig_daily = make_daily_chart(
@@ -1702,7 +2643,13 @@ def run_simulation(
         )
 
         # --- 結果テキスト ---
-        result_text = f"年間発電量: {result['annual']:.1f} kWh/年\n"
+        result_text = ""
+        if dc_info is not None:
+            # データセンター: 需要（IT負荷×PUE）の節を先頭に置く。受電上限を指定した場合はその結果が続く
+            result_text += format_dc_summary(dc_info, contract_type) + "\n"
+            if grid_cap_text:
+                result_text += grid_cap_text + "\n"
+        result_text += f"年間発電量: {result['annual']:.1f} kWh/年\n"
         result_text += f"K' = {result['K_prime']:.4f}\n"
         if bifacial_enabled:
             bif_val = float(bifaciality_val) if bifaciality_val is not None else BIFACIAL_DEFAULTS["bifaciality"]
@@ -1731,9 +2678,23 @@ def run_simulation(
             if bat_enabled and "annual_charge" in sc_result:
                 result_text += f"\n── 蓄電池 ──\n"
                 result_text += f"充放電モード: {battery_mode_label}\n"
-                result_text += f"年間充電量: {sc_result['annual_charge']:.1f} kWh/年\n"
-                result_text += f"年間放電量: {sc_result['annual_discharge']:.1f} kWh/年\n"
-                result_text += f"充放電損失: {sc_result['annual_charge'] - sc_result['annual_discharge']:.1f} kWh/年\n"
+                ch_kwh = sc_result['annual_charge']
+                dc_kwh = sc_result['annual_discharge']
+                loss_kwh = ch_kwh - dc_kwh
+                if dc_info is not None:
+                    # DC: LPのゼロ解が -0.0 と表示されるのを 0 に丸める（産業用の表示は従来どおり）
+                    ch_kwh, dc_kwh, loss_kwh = (v if abs(v) > 1e-6 else 0.0 for v in (ch_kwh, dc_kwh, loss_kwh))
+                result_text += f"年間充電量: {ch_kwh:.1f} kWh/年\n"
+                result_text += f"年間放電量: {dc_kwh:.1f} kWh/年\n"
+                result_text += f"充放電損失: {loss_kwh:.1f} kWh/年\n"
+                if dc_info is not None and ch_kwh == 0.0 and dc_kwh == 0.0:
+                    # DC特有: 需要が平坦だと契約電力を下げられず、料金に日内差もないため蓄電池の価値は
+                    # 構造的にゼロになりうる（バグではない。設計書 §11）
+                    result_text += ("  ※ 充放電量ゼロ: この条件では蓄電池に裁定余地がありません。DCの需要が平坦\n"
+                                    "     （24時間一定）だと契約電力を下げられず、料金にも日内の差（時間帯別単価）が\n"
+                                    "     ないためです（LPは正しく充放電ゼロを返しています）。\n"
+                                    "     IT負荷を日変動／CEC実測形状にする・PV容量を増やして余剰を作る・\n"
+                                    "     受電上限制約（DCタブの「系統受電上限」）で価値が出ます。\n")
                 if sc_result.get("optimized"):
                     result_text += f"最適化ピークデマンド: {sc_result['opt_peak_kw']:.1f} kW\n"
                     result_text += f"最適化年間コスト: {sc_result['opt_annual_cost']:,.0f} 円\n"
@@ -2045,8 +3006,8 @@ def run_simulation(
                 cumulative += mg_annual_cashflow
                 result_text += f"  {y:>3d}  {mg_annual_cashflow:>12,.0f}  {cumulative:>14,.0f}\n"
 
-        # --- 需要構成サマリー ---
-        if demand_30min is not None:
+        # --- 需要構成サマリー（産業用のみ。DCは冒頭の「データセンター需要」節が担う） ---
+        if demand_30min is not None and dc_info is None:
             result_text += "\n── 需要構成 ──\n"
             for i in range(int(num_facilities)):
                 idx = i * 3
@@ -2060,6 +3021,12 @@ def run_simulation(
 
         # --- デバッグ情報 ---
         debug_text = f"データソース: {source_text}\n"
+        if dc_info is not None:
+            bd = dc_info["breakdown"]
+            debug_text += (f"需要ソース: データセンター（IT {dc_info['it_capacity_kw']:,.0f}kW, "
+                           f"PUE {dc_info['pue_const']:.2f}, {dc_info['profile_mode']}, "
+                           f"ノイズ={dc_info['noise_level']}）\n")
+            debug_text += f"  年間平均PUE={bd['avg_pue']:.3f} / ピークデマンド={dc_info['peak_demand_kw']:,.1f}kW\n"
         debug_text += f"緯度: {lat:.4f}°  経度: {lon:.4f}°\n"
         debug_text += f"pvlib: {'利用' if HAS_PVLIB else '未使用（GHI直接）'}\n"
         debug_text += f"面数: {len(faces)}\n"
@@ -2214,65 +3181,265 @@ def build_ui():
                 )
                 csv_input = gr.File(label="またはCSVアップロード（NEDO形式）", file_types=[".csv"])
 
-                # --- 需要設定（複数施設合算） ---
-                gr.Markdown("### ⚡ 需要設定（施設を組み合わせて需要カーブを作成）")
-                num_facilities_input = gr.Slider(
-                    label="施設数", minimum=1, maximum=MAX_FACILITIES, step=1, value=1,
+                # --- 需要設定（タブ: 産業用・MG / データセンター） ---
+                # 需要設定だけをタブで分割し、地点・PV面・蓄電池・料金・経済性は共通のまま使う
+                # （全部をタブ化するとPV面設定8面×5項目などが二重定義になるため。docs/decision_log.md 第5段階）。
+                # 選択中のタブは gr.Tab.select → gr.State で保持し、計算時に demand_source として渡す。
+                gr.Markdown("### ⚡ 需要設定")
+                demand_source_state = gr.State(DEMAND_SOURCE_INDUSTRIAL)
+
+                with gr.Tabs():
+                    # ===== タブ1: 産業用・MG（従来の需要設定。複数施設合算） =====
+                    with gr.Tab("🏭 産業用・MG") as tab_industrial:
+                        gr.Markdown("施設を組み合わせて需要カーブを作成します")
+                        num_facilities_input = gr.Slider(
+                            label="施設数", minimum=1, maximum=MAX_FACILITIES, step=1, value=1,
+                        )
+
+                        facility_components = []  # [type, area, count] × MAX_FACILITIES
+                        facility_groups = []
+
+                        for i in range(MAX_FACILITIES):
+                            visible = (i == 0)
+                            with gr.Group(visible=visible) as grp:
+                                gr.Markdown(f"**施設{i+1}**")
+                                with gr.Row():
+                                    ftype = gr.Dropdown(
+                                        label="施設タイプ",
+                                        choices=BUILDING_TYPE_CHOICES,
+                                        value="なし",
+                                    )
+                                    farea = gr.Number(
+                                        label="延床面積 [m²]",
+                                        value=0,
+                                        precision=0,
+                                    )
+                                    fcount = gr.Number(
+                                        label="棟数",
+                                        value=1,
+                                        precision=0,
+                                    )
+                            facility_components.extend([ftype, farea, fcount])
+                            facility_groups.append(grp)
+
+                            # 施設タイプ変更 → デフォルト延床面積を自動設定
+                            def on_building_type_change(btype):
+                                info = BUILDING_TYPES.get(btype, {})
+                                default_area = info.get("default_area_m2", 0)
+                                return gr.update(value=default_area)
+
+                            ftype.change(
+                                fn=on_building_type_change,
+                                inputs=[ftype],
+                                outputs=[farea],
+                                api_visibility="hidden",
+                            )
+
+                        # 施設数変更で表示切替
+                        def update_facility_visibility(n):
+                            return [gr.update(visible=(i < n)) for i in range(MAX_FACILITIES)]
+
+                        num_facilities_input.change(
+                            fn=update_facility_visibility,
+                            inputs=[num_facilities_input],
+                            outputs=facility_groups,
+                            api_visibility="hidden",
+                        )
+
+                        demand_csv_input = gr.File(
+                            label="カスタム需要CSV（追加合算、timestamp + demand_kWh）",
+                            file_types=[".csv"],
+                        )
+
+                    # ===== タブ2: データセンター（IT負荷 × PUE） =====
+                    with gr.Tab("🏢 データセンター") as tab_datacenter:
+                        gr.Markdown(
+                            "IT負荷とPUEからDCの電力需要を生成します（30分×365日）。"
+                            "<br><small>空冷前提（液冷は対象外）。PUEは一定値のみ（気温連動は保留）。"
+                            "地点・PV・蓄電池・電気料金・経済性は下の共通設定を使います。</small>"
+                        )
+                        workload_input = gr.Dropdown(
+                            label="用途",
+                            choices=list(DC_WORKLOAD_PRESETS.keys()),
+                            value="ハウジング（コロケーション）",
+                        )
+                        gr.Markdown(
+                            "<small>用途を選ぶと負荷プロファイルと短周期変動が自動設定されます"
+                            "（「手動設定」で個別指定）。<br>"
+                            "ハウジング＝CEC実測形状（米国商用DC約100施設のinterval meter由来）／"
+                            "AI学習＝定常（LBNL: 大規模AI学習クラスタは連続バッチで時刻変動なし）</small>"
+                        )
+
+                        # --- 容量の指定（3方式。内部では常にIT容量[kW]に正規化） ---
+                        capacity_mode_input = gr.Radio(
+                            label="容量の指定方法",
+                            choices=CAPACITY_MODES,
+                            value="規模プリセット",
+                        )
+                        with gr.Row(visible=True) as cap_preset_row:
+                            size_preset_input = gr.Dropdown(
+                                label="規模",
+                                choices=list(DC_SIZE_PRESETS.keys()),
+                                value="中規模",
+                            )
+                        with gr.Row(visible=False) as cap_direct_row:
+                            it_capacity_input = gr.Number(
+                                label="IT定格容量 [kW]",
+                                value=DC_DEFAULTS["it_capacity_kw"], precision=1,
+                            )
+                        with gr.Row(visible=False) as cap_rack_row:
+                            n_racks_input = gr.Number(
+                                label="ラック数", value=DC_DEFAULTS["n_racks"], precision=0,
+                            )
+                            kw_per_rack_input = gr.Number(
+                                label="ラック電力密度 [kW/ラック]",
+                                value=DC_DEFAULTS["kw_per_rack"], precision=1,
+                            )
+                        gr.Markdown(
+                            "<small>⚠ 規模区分は<b>暫定値</b>（LBNL Shape Makerは large/medium/small を"
+                            "用いるがMW区分は非公開）。エッジ 0.1〜0.5 ／ 小規模 0.5〜2 ／ "
+                            "中規模 2〜20 ／ ハイパースケール 20〜100+ MW<br>"
+                            f"ラック電力密度の目安（参考値）: {RACK_DENSITY_HINT} kW/ラック<br>"
+                            "延床面積では指定しません（DCはラック密度で電力密度が1桁変わるため）</small>"
+                        )
+
+                        # --- 負荷プロファイル（用途=手動設定のときのみ表示） ---
+                        with gr.Column(visible=False) as profile_manual_group:
+                            it_profile_input = gr.Dropdown(
+                                label="負荷プロファイル",
+                                choices=IT_LOAD_PROFILE_MODES,
+                                value=PROFILE_CEC,
+                            )
+                            noise_input = gr.Dropdown(
+                                label="短周期変動（ノイズ）",
+                                choices=NOISE_LEVELS,
+                                value="低（3〜7%）",
+                            )
+                        it_load_factor_input = gr.Number(
+                            label="IT負荷率（年平均）[%]",
+                            value=DC_DEFAULTS["it_load_factor_pct"], precision=1,
+                        )
+                        with gr.Row(visible=False) as it_daily_row:
+                            it_peak_input = gr.Number(
+                                label="ピーク負荷率 [%]",
+                                value=DC_DEFAULTS["it_peak_pct"], precision=1,
+                            )
+                            it_bottom_input = gr.Number(
+                                label="ボトム負荷率 [%]",
+                                value=DC_DEFAULTS["it_bottom_pct"], precision=1,
+                            )
+                            it_peak_hour_input = gr.Number(
+                                label="ピーク時刻 [時]",
+                                value=DC_DEFAULTS["it_peak_hour"], precision=0,
+                                minimum=0, maximum=23,
+                            )
+                        gr.Markdown(
+                            "<small>「IT負荷率（年平均）」が<b>水準</b>、プロファイルが<b>形状</b>を決めます"
+                            "（形状は年平均=1.0に正規化）。CSVアップロードによるIT負荷指定は未実装</small>"
+                        )
+
+                        pue_const_input = gr.Number(
+                            label="PUE（施設全体電力 ÷ IT機器電力）",
+                            value=DC_DEFAULTS["pue_const"], precision=2,
+                        )
+                        gr.Markdown(
+                            "<small>PUEは一定値です。既存DCの実績PUEを持っている場合はそれを直接入力してください"
+                            "（気温連動PUEは出典が固まるまで保留）。</small>"
+                        )
+
+                        # --- 系統受電上限（受電電圧の階層境界。守る手段は蓄電池の最適充放電LP） ---
+                        grid_cap_mode_input = gr.Dropdown(
+                            label="系統受電上限",
+                            choices=GRID_CAP_MODES,
+                            value=GRID_CAP_NONE,
+                        )
+                        with gr.Row(visible=False) as grid_cap_manual_row:
+                            grid_cap_kw_input = gr.Number(
+                                label="受電上限 [kW]（手入力）",
+                                value=GRID_CAP_MANUAL_DEFAULT_KW, precision=1,
+                            )
+                        gr.Markdown(
+                            "<small>受電電圧は契約電力で決まります（高圧6.6kV: 2,000kW未満／22・33kV: 10,000kW未満／"
+                            "それ以上は66kV。154kVは対象外）。「高圧に収める」を選ぶと、PV・蓄電池で系統からの受電を"
+                            "1,999kW以下に抑えられるかを判定します（「未満」なので境界の1kW下）。<br>"
+                            "上限を<b>守れるのは蓄電池「最適充放電（LP）」のときだけ</b>です（蓄電池「なし」「ルールベース」では"
+                            "超過の判定と、必要な蓄電池の目安のみ表示）。守れない場合は理由と必要量の目安を表示します。</small>"
+                        )
+
+                # DC入力コンポーネント。DC_INPUT_KEYS と同じ並びにすること（on_click が zip で辞書に戻す）
+                dc_components = [
+                    workload_input, capacity_mode_input, size_preset_input, it_capacity_input,
+                    n_racks_input, kw_per_rack_input, it_profile_input, noise_input,
+                    it_load_factor_input, it_peak_input, it_bottom_input, it_peak_hour_input,
+                    pue_const_input,
+                    grid_cap_mode_input, grid_cap_kw_input,
+                ]
+                if len(dc_components) != len(DC_INPUT_KEYS):
+                    raise RuntimeError("dc_components と DC_INPUT_KEYS の要素数が一致しません")
+
+                # 選択中のタブを需要ソースとして保持する
+                tab_industrial.select(
+                    fn=lambda: DEMAND_SOURCE_INDUSTRIAL,
+                    outputs=[demand_source_state],
+                    api_visibility="hidden",
                 )
-
-                facility_components = []  # [type, area, count] × MAX_FACILITIES
-                facility_groups = []
-
-                for i in range(MAX_FACILITIES):
-                    visible = (i == 0)
-                    with gr.Group(visible=visible) as grp:
-                        gr.Markdown(f"**施設{i+1}**")
-                        with gr.Row():
-                            ftype = gr.Dropdown(
-                                label="施設タイプ",
-                                choices=BUILDING_TYPE_CHOICES,
-                                value="なし",
-                            )
-                            farea = gr.Number(
-                                label="延床面積 [m²]",
-                                value=0,
-                                precision=0,
-                            )
-                            fcount = gr.Number(
-                                label="棟数",
-                                value=1,
-                                precision=0,
-                            )
-                    facility_components.extend([ftype, farea, fcount])
-                    facility_groups.append(grp)
-
-                    # 施設タイプ変更 → デフォルト延床面積を自動設定
-                    def on_building_type_change(btype):
-                        info = BUILDING_TYPES.get(btype, {})
-                        default_area = info.get("default_area_m2", 0)
-                        return gr.update(value=default_area)
-
-                    ftype.change(
-                        fn=on_building_type_change,
-                        inputs=[ftype],
-                        outputs=[farea],
-                        api_visibility="hidden",
-                    )
-
-                # 施設数変更で表示切替
-                def update_facility_visibility(n):
-                    return [gr.update(visible=(i < n)) for i in range(MAX_FACILITIES)]
-
-                num_facilities_input.change(
-                    fn=update_facility_visibility,
-                    inputs=[num_facilities_input],
-                    outputs=facility_groups,
+                tab_datacenter.select(
+                    fn=lambda: DEMAND_SOURCE_DATACENTER,
+                    outputs=[demand_source_state],
                     api_visibility="hidden",
                 )
 
-                demand_csv_input = gr.File(
-                    label="カスタム需要CSV（追加合算、timestamp + demand_kWh）",
-                    file_types=[".csv"],
+                def on_capacity_mode_change(mode):
+                    """容量の指定方法に応じて入力欄を切り替える。"""
+                    return (
+                        gr.update(visible=(mode == "規模プリセット")),
+                        gr.update(visible=(mode == "IT容量を直接入力")),
+                        gr.update(visible=(mode == "ラック数×density")),
+                    )
+
+                capacity_mode_input.change(
+                    fn=on_capacity_mode_change,
+                    inputs=[capacity_mode_input],
+                    outputs=[cap_preset_row, cap_direct_row, cap_rack_row],
+                    api_visibility="hidden",
+                )
+
+                def on_workload_change(preset, cur_profile):
+                    """用途プリセットでプロファイルとノイズを一括設定する。
+
+                    「手動設定」のときだけ個別指定の欄を出す。日変動の形状パラメータ
+                    （ピーク/ボトム/時刻）は、実際に使われるプロファイルが日変動のときだけ表示する。
+                    """
+                    p = DC_WORKLOAD_PRESETS.get(preset)
+                    manual = p is None
+                    profile = cur_profile if manual else p["profile"]
+                    return (
+                        gr.update(visible=manual),
+                        gr.update() if manual else gr.update(value=p["profile"]),
+                        gr.update() if manual else gr.update(value=p["noise"]),
+                        gr.update(visible=(profile == PROFILE_DIURNAL)),
+                    )
+
+                workload_input.change(
+                    fn=on_workload_change,
+                    inputs=[workload_input, it_profile_input],
+                    outputs=[profile_manual_group, it_profile_input, noise_input, it_daily_row],
+                    api_visibility="hidden",
+                )
+
+                it_profile_input.change(
+                    fn=lambda mode: gr.update(visible=(mode == PROFILE_DIURNAL)),
+                    inputs=[it_profile_input],
+                    outputs=[it_daily_row],
+                    api_visibility="hidden",
+                )
+
+                # 受電上限は「手入力」を選んだときだけ数値欄を出す
+                grid_cap_mode_input.change(
+                    fn=lambda mode: gr.update(visible=(mode == GRID_CAP_MANUAL)),
+                    inputs=[grid_cap_mode_input],
+                    outputs=[grid_cap_manual_row],
+                    api_visibility="hidden",
                 )
 
                 # --- 電気料金設定 ---
@@ -2684,6 +3851,8 @@ def build_ui():
         #   facility_components: MAX_FACILITIES * 3 = 18
         #   face_components: MAX_FACES * 5 = 40
         #   display: num_facilities, month, day, num_faces = 4
+        #   demand_source_state (1): 選択中の需要タブ（industrial / datacenter）
+        #   dc_components: len(DC_INPUT_KEYS) = 15（データセンタータブの入力＋受電上限。産業用のときは無視される）
         all_inputs = [
             station_input, csv_input,
             demand_csv_input,
@@ -2721,16 +3890,21 @@ def build_ui():
             month_val = args[tail_start + 1]
             day_val = args[tail_start + 2]
             num_f = args[tail_start + 3]
+            demand_source = args[tail_start + 4]
+            dc_vals = args[tail_start + 5: tail_start + 5 + len(DC_INPUT_KEYS)]
+            dc_args = dict(zip(DC_INPUT_KEYS, dc_vals))
 
             return run_simulation(
                 *base, fac_args, face_args,
                 num_facilities=num_fac, num_faces=num_f,
                 display_month=month_val, display_day=day_val,
+                demand_source=demand_source, dc_args=dc_args,
             )
 
         all_inputs_with_display = all_inputs + [
             num_facilities_input, month_input, day_input, num_faces_input,
-        ]
+            demand_source_state,
+        ] + dc_components
 
         run_btn.click(
             fn=on_click,
@@ -2768,6 +3942,10 @@ def build_ui():
         gr.api(mcp_tools.estimate_pv_generation, api_name="estimate_pv_generation")
         gr.api(mcp_tools.validate_industrial_params, api_name="validate_industrial_params")
         gr.api(mcp_tools.simulate_industrial_pv, api_name="simulate_industrial_pv")
+        # データセンター（Phase 7 段階4）
+        gr.api(mcp_tools.estimate_dc_demand, api_name="estimate_dc_demand")
+        gr.api(mcp_tools.validate_dc_params, api_name="validate_dc_params")
+        gr.api(mcp_tools.simulate_dc, api_name="simulate_dc")
 
     return demo
 

@@ -39,7 +39,7 @@ The application supports two business modes within a single UI:
 ```
 pv-sim-biz/
 ├── app.py                # Standalone main application
-├── radiation.db          # NEDO METPV-20 weather DB (47 sites, 10 elements, Git LFS)
+├── radiation.db          # NEDO METPV-20 weather DB (50 sites, 10 elements, Git LFS)
 ├── comstock_*.csv        # 6 industrial demand presets (per-m² intensity)
 ├── requirements.txt
 ├── README.md             # HF Spaces metadata + project description
