@@ -821,7 +821,7 @@ def _run_industrial_simulation(p: dict, demand_override=None, grid_cap_kw=None):
         "assumptions": p,
         "annual": {
             "generation_kwh": round(result["annual"]),
-            "capacity_factor_pct": round(result["annual"] / (total_ppeak * 8760) * 100, 2) if total_ppeak > 0 else None,
+            "capacity_factor_pct": float(round(result["annual"] / (total_ppeak * 8760) * 100, 2)) if total_ppeak > 0 else None,
             "face_generation_kwh": [round(v) for v in result["face_annual"]],
             "demand_kwh": round(sc_result["annual_demand"]),
             "self_consumption_kwh": round(sc_result["annual_self"]),
@@ -932,7 +932,7 @@ def estimate_pv_generation(
             "station_name": name,
             "total_pv_kw": total_pv_kw,
             "annual_generation_kwh": round(g["annual"]),
-            "capacity_factor_pct": round(g["annual"] / (total_pv_kw * 8760) * 100, 2) if total_pv_kw > 0 else None,
+            "capacity_factor_pct": float(round(g["annual"] / (total_pv_kw * 8760) * 100, 2)) if total_pv_kw > 0 else None,
             "face_generation_kwh": [round(v) for v in g["face_annual"]],
             "monthly_generation_kwh": {str(m): round(g["monthly"].get(m, 0)) for m in range(1, 13)},
             "note": "JIS C 8907準拠（標準補正係数使用、片面パネル）。需要・蓄電池・電気料金・経済性は含まない",

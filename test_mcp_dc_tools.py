@@ -305,6 +305,26 @@ check("産業用の出力に grid_cap / datacenter の節が混ざらない", "g
 check("産業用の出力のキー構成が従来どおり",
       list(ind.keys()) == ["assumptions", "annual", "electricity_cost", "investment", "business",
                            "microgrid", "caveats", "validation_warnings"], str(list(ind.keys())))
+def _numpy_leaks(o, path=""):
+    """出力に numpy のスカラー/配列が混ざっていないか（混ざるとMCP経由で数値が文字列になる）"""
+    out = []
+    if isinstance(o, dict):
+        for k, v in o.items():
+            out += _numpy_leaks(v, f"{path}/{k}")
+    elif isinstance(o, (list, tuple)):
+        for i, v in enumerate(o):
+            out += _numpy_leaks(v, f"{path}[{i}]")
+    elif isinstance(o, (np.generic, np.ndarray)):
+        out.append(path)
+    return out
+
+
+check("MCP出力にnumpy型が混ざらない（産業用: capacity_factor_pct がfloat）", _numpy_leaks(ind) == [], str(_numpy_leaks(ind)))
+check("MCP出力にnumpy型が混ざらない（DC: 蓄電池なし・LP+上限・診断）",
+      _numpy_leaks(s0) == [] and _numpy_leaks(s1) == [] and _numpy_leaks(s2) == [] and _numpy_leaks(e) == [],
+      str([_numpy_leaks(s0), _numpy_leaks(s1), _numpy_leaks(s2), _numpy_leaks(e)]))
+check("estimate_pv_generation の capacity_factor_pct もfloat",
+      _numpy_leaks(mcp_tools.estimate_pv_generation(station_no="44132", faces=[{"ppeak_kw": 500.0, "tilt_deg": 30.0, "azimuth_deg": 180.0, "pcs_limit_kw": 500.0}])) == [])
 check("産業用の validate は facilities 必須のまま",
       not mcp_tools.validate_industrial_params(facilities=[])["valid"])
 
