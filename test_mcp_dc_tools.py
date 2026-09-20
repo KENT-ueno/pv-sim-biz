@@ -111,6 +111,11 @@ for label, kw, key in [
 ]:
     r = mcp_tools.estimate_dc_demand(**kw)
     check(f"異常系: {label} → errors に {key}", "errors" in r and any(key in x for x in r["errors"]), str(r.get("errors")))
+_v_err = mcp_tools.validate_dc_params(workload="warehouse", pue=0.5)
+check("エラーがあるときは規模プリセットの暫定値の警告を出さない（直す点だけを伝える）",
+      not _v_err["valid"] and not any("暫定値" in w for w in _v_err["warnings"]), str(_v_err["warnings"]))
+check("エラーがなければ暫定値の警告は出る（規模プリセット指定時）",
+      any("暫定値" in w for w in mcp_tools.validate_dc_params()["warnings"]))
 check("複数の不備は全て報告される", len(mcp_tools.estimate_dc_demand(pue=0.5, it_load_factor_pct=0, workload="x").get("errors", [])) >= 3)
 check("PUE 2.5 は警告（エラーではない）", "error" not in mcp_tools.estimate_dc_demand(pue=2.5)
       and any("PUE" in w for w in mcp_tools.estimate_dc_demand(pue=2.5)["warnings"]))

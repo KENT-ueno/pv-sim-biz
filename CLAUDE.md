@@ -361,7 +361,10 @@ demand(t) = IT定格容量 × IT負荷率(年平均) × 形状(t) × PUE × 0.5 
   `test_fable5_fixes.py`（PASS 24）／`test_mcp_tools.py`（PASS 45）／`test_verify_battery_bug.py`／
   `test_dc_mode.py`（PASS 48。DC需要・分岐・UI配線）／`test_azimuth_input.py`（PASS 19。方位角欄の解釈）／
   `test_grid_cap.py`（PASS 75。受電上限・診断・LP。診断の健全性は乱数60ケースで診断⇔LPの実行可否が完全一致）／
-  `test_mcp_dc_tools.py`（PASS 117。DCのMCPツール。UI（run_simulation）との数値一致・受電上限の各状態・入力検証）
+  `test_mcp_dc_tools.py`（PASS 126。DCのMCPツール。UI（run_simulation）との数値一致・受電上限の各状態・入力検証・出力がJSON標準の型だけ）
+- **MCPの公開ツール（`mcp_tools.py`）の成功系の `return` は `_jsonable()` で包む。** numpy型（`round()` の結果も含む）が混ざると、
+  MCP経由で数値が文字列（`"11.5"`）になる。直接呼び出しやHTTPの `/call` では検出できないため、変更後は**プロトコル層（`tools/call`）で
+  型まで確認**する（gh・fip も同じ方式。2026-09-20）。デコレータで包まない（Gradioが関数のシグネチャ・docstringからMCPスキーマを作るため）
 - **産業用の出力を厳密に守るには**、変更前後で `run_simulation` の出力（結果テキスト・デバッグ・グラフJSON）を
   複数シナリオで保存→照合する（LPも決定論的に再現する）。段階2・3では5シナリオ×7項目=35項目が全て同一だった
 - **push はユーザーの明示的指示を待つこと**（`origin` = HF Space なので **`main` への push = 本番デプロイ**）。

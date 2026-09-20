@@ -1268,13 +1268,14 @@ def _normalize_dc_params(
     # --- 容量（3方式。内部では常に IT容量[kW] に正規化） ---
     dc["size_preset"] = dc["n_racks"] = dc["kw_per_rack"] = None
     resolved_it_kw = None
+    size_preset_warning = None   # 入力にエラーがあるときは出さない（末尾で判定。エラー時は直す点だけを伝える）
     if choice("capacity_mode", capacity_mode, m["capacity_mode"]):
         if capacity_mode == "size_preset":
             if choice("size_preset", size_preset, m["size_preset"]):
                 dc["size_preset"] = size_preset
                 resolved_it_kw = float(app.DC_SIZE_PRESETS[m["size_preset"][size_preset]]["it_capacity_kw"])
-                warnings.append("規模プリセットの区分（エッジ300kW/小規模1,000kW/中規模5,000kW/"
-                                "ハイパースケール40,000kW）は暫定値です（公開された定義に基づく数値ではありません）")
+                size_preset_warning = ("規模プリセットの区分（エッジ300kW/小規模1,000kW/中規模5,000kW/"
+                                       "ハイパースケール40,000kW）は暫定値です（公開された定義に基づく数値ではありません）")
         elif capacity_mode == "it_capacity":
             resolved_it_kw = num("it_capacity_kw", it_capacity_kw, 0, MAX_IT_CAPACITY_KW)
         else:  # rack_density
@@ -1318,6 +1319,8 @@ def _normalize_dc_params(
             dc["grid_cap_kw"] = float(app.GRID_CAP_PRESETS_KW[label])
         elif grid_cap == "manual":
             dc["grid_cap_kw"] = num("grid_cap_kw", grid_cap_kw, 0, MAX_GRID_CAP_KW)
+    if size_preset_warning and not errors:
+        warnings.insert(0, size_preset_warning)
     return dc, warnings, errors
 
 
