@@ -1087,6 +1087,59 @@ def resolve_wind(wind_args, point_no, annual_demand_kwh, station_label=None, con
     return w
 
 
+def _opt_float(v, label):
+    """UIの任意入力を数値にする。空欄・None は None（既定値を使う）。数値以外・非有限はエラー。
+
+    gr.Number は空欄を表せず（未操作でも0を送る。Gradio 6.26）、方位角欄と同じ理由で、任意入力はテキスト欄にしている。
+    """
+    if v is None:
+        return None
+    if isinstance(v, str):
+        v = v.strip().replace(",", "")
+        if v == "":
+            return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        raise ValueError(f"{label}「{v}」は数値で入力してください（空欄なら既定値を使います）")
+    if not np.isfinite(f):
+        raise ValueError(f"{label}「{v}」は有限の数値で入力してください")
+    return f
+
+
+def build_wind_args(enabled, sizing_mode, capacity_txt, coverage_txt, cf_pct, ppa_price, wheeling_txt, fee_txt):
+    """UIの風力入力（WIND_INPUT_KEYS と同じ並び）を wind_args 辞書にする。OFFなら入力を検証しない。"""
+    if not enabled:
+        return {"enabled": False}
+    return {
+        "enabled": True,
+        "sizing_mode": sizing_mode,
+        "capacity_kw": _opt_float(capacity_txt, "風力の契約容量"),
+        "coverage_pct": _opt_float(coverage_txt, "風力の需要カバー率"),
+        "cf_pct": _opt_float(cf_pct, "風力の設備利用率"),
+        "ppa_price": _opt_float(ppa_price, "風力のPPA単価"),
+        "wheeling_yen": _opt_float(wheeling_txt, "風力の託送料金（電力量料金）"),
+        "retail_fee_yen": _opt_float(fee_txt, "風力の小売手数料"),
+    }
+
+
+def wind_area_note(station_choice, has_csv, contract_type):
+    """風力の入力欄の上に出す、調達エリアと託送・手数料の既定値（表示のみ。エリアは地点から決まる）。"""
+    if has_csv:
+        return "⚠ CSVアップロードでは風力を使えません（需要地が北海道・東北かを確認できないため）。観測地点を選んでください"
+    if not station_choice:
+        return "地点を選ぶと、風力の調達エリアと既定値が決まります"
+    area = station_to_wind_area(str(station_choice).split(" ")[0])
+    if area is None:
+        return (f"⚠ 風力は北海道・東北の地点でのみ使えます（選択中: {station_choice}）。"
+                "他エリアの需要地に対する越境託送はモデル化していません")
+    ct = "特別高圧" if contract_type == "特別高圧" else "高圧"
+    name = WIND_AREA_META[area]["name"]
+    return (f"**調達エリア: {name}**（需要地と同じエリア）　既定: 託送の電力量料金 "
+            f"{WIND_WHEELING_ENERGY_YEN[(area, ct)]:.2f} 円/kWh（{name}・{ct}・標準接続送電・税込表示）／"
+            f"小売手数料 {WIND_RETAIL_FEE_YEN[ct]:.1f} 円/kWh（推定値）")
+
+
 def monthly_sums(arr_365x48, month_day):
     """(365, 48) の配列を月ごとに合計する（{月: 合計}）。"""
     out = {}
@@ -1191,7 +1244,8 @@ def format_247(gen_pv, wind_info, demand_30min, sc_result, month_day, pv_enabled
     t += "【設定どおり（蓄電池・受電上限を含む）】\n"
     t += f"  量ベース達成率: {vol_all:.1f}%（年間の発電量 ÷ 年間の需要量）\n"
     t += f"  時間一致率: {hourly_set:.1f}%（系統購入 {float(sc_result['annual_import']):,.1f} kWh/年）\n"
-    t += f"  差: {vol_all - hourly_set:.1f} ポイント（年間では足りていても、その時間には足りていない分）\n"
+    t += (f"  差: {vol_all - hourly_set:.1f} ポイント"
+          "（量ベース達成率と時間一致率の差。大きいほど、年間では足りていてもその時間には足りていない）\n")
     if sc_result.get("optimized"):
         t += ("  ※ 蓄電池（最適充放電LP）は電気代を最小にする運転で、時間一致率の最大化を目的にしていません。\n"
               "    一致率は結果として上がった値で、上限を示すものではありません\n")
@@ -2072,8 +2126,34 @@ def make_demand_chart(cost_before, cost_after=None, contract_label="高圧"):
 # グラフ生成
 # ============================================================
 
+def _make_monthly_chart_wind(result, sc_result=None):
+    """月別グラフ（風力あり）: 発電量を 太陽光＋風力 の積み上げで、需要・自家消費と並べる。"""
+    months = list(range(1, 13))
+    labels = [f"{m}月" for m in months]
+    pv_m = monthly_sums(result["gen_pv"], result["month_day"])
+    w_m = monthly_sums(result["gen_wind"], result["month_day"])
+    pv_v = [pv_m.get(m, 0.0) for m in months]
+    w_v = [w_m.get(m, 0.0) for m in months]
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=labels, y=pv_v, name="発電量（太陽光）", marker_color="orange", offsetgroup="gen"))
+    fig.add_trace(go.Bar(x=labels, y=w_v, base=pv_v, name="発電量（風力）", marker_color="teal", offsetgroup="gen"))
+    if sc_result is not None:
+        fig.add_trace(go.Bar(x=labels, y=[sc_result["monthly_demand"].get(m, 0) for m in months],
+                             name="需要量", marker_color="steelblue", offsetgroup="dem"))
+        fig.add_trace(go.Bar(x=labels, y=[sc_result["monthly_self"].get(m, 0) for m in months],
+                             name="自家消費（風力の配達分を含む）", marker_color="green", offsetgroup="self"))
+    fig.update_layout(
+        title="月別 発電量（太陽光＋風力の積み上げ） vs 需要量 vs 自家消費", barmode="group",
+        xaxis_title="月", yaxis_title="電力量 [kWh]", template="plotly_white", height=600,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+    return fig
+
+
 def make_monthly_chart(result, sc_result=None):
     """月別発電量棒グラフ（需要データがあれば並列表示）"""
+    if "gen_wind" in result:
+        return _make_monthly_chart_wind(result, sc_result)
     months = list(range(1, 13))
     month_labels = [f"{m}月" for m in months]
     gen_values = [result["monthly"].get(m, 0) for m in months]
@@ -2173,6 +2253,12 @@ def make_daily_chart(result, month, day, sc_result=None, demand_30min=None):
         ))
         title_text = f"{month}月{day}日の発電量（30分単位）"
 
+    if "gen_wind" in result:
+        # 「発電量」は太陽光＋風力の合計。内訳を細い線で足す（風力は発電した全量。需要地に届いた分とは限らない）
+        fig.add_trace(go.Scatter(x=times, y=result["gen_pv"][target_idx], mode="lines",
+                                 line=dict(color="gold", width=1, dash="dot"), name="うち太陽光"))
+        fig.add_trace(go.Scatter(x=times, y=result["gen_wind"][target_idx], mode="lines",
+                                 line=dict(color="teal", width=1, dash="dot"), name="うち風力（発電量）"))
     layout_kwargs = dict(
         title=title_text, xaxis_title="時刻", yaxis_title="電力量 [kWh/30分]",
         template="plotly_white", height=600,
@@ -2830,6 +2916,10 @@ def run_simulation(
         # --- 風力（オフサイトPPA）: 需要地と同じエリアの形状から発電量と支払額を解決する ---
         wind_info = None
         if wind_args and wind_args.get("enabled"):
+            if demand_30min is None:
+                # 施設が未設定（施設タイプ「なし」）だと需要がなく、風力の容量（カバー率）も24/7も評価できない
+                return None, None, None, None, ("エラー: 風力を使うには需要の設定が必要です"
+                                                "（需要設定で施設を1つ以上選ぶか、データセンターの条件を設定してください）"), "", None
             try:
                 wind_info = resolve_wind(
                     wind_args, None if csv_file is not None else point_no,
@@ -4134,7 +4224,79 @@ def build_ui():
                     )
 
                 # --- 太陽光発電設定 ---
+                # --- 風力発電（オフサイトPPA）。設計は docs/wind_design_spec.md §5-6 ---
+                # 入力の並びは WIND_INPUT_KEYS と同じ（on_click が build_wind_args に渡す）。
+                # 任意入力は、空欄=既定値のテキスト欄（gr.Number は空欄を表せず未操作でも0を送るため）
+                with gr.Accordion("🌀 風力発電設定（オフサイトPPA）", open=False):
+                    gr.Markdown(
+                        "<small>風力は**オフサイト電源**（送配電網で届く）です。敷地内の太陽光と違い、届いた風力にも"
+                        "**託送の電力量料金・再エネ賦課金・小売手数料**がかかり、**契約電力（基本料金）は下がりません**。"
+                        "売電できるのは敷地内の太陽光の余剰だけです。<br>"
+                        "※太陽光は平年値（METPV-20）、風力は2025年の実績で別のデータのため、同じ日に凪と曇天が重なるような"
+                        "日単位の同時性は反映されません（月別・時間帯別の平均的な補完関係の目安）。<br>"
+                        "※系統受電上限（データセンター）・最適容量探索とは併用できません。</small>"
+                    )
+                    wind_enabled_input = gr.Checkbox(label="風力発電を併用する", value=False)
+                    with gr.Group(visible=False) as wind_settings_group:
+                        wind_area_md = gr.Markdown(
+                            wind_area_note(station_input.value, False, contract_type_input.value))
+                        wind_sizing_input = gr.Radio(
+                            choices=WIND_SIZING_MODES, value=WIND_SIZING_CAPACITY, label="容量の指定方法")
+                        wind_capacity_input = gr.Textbox(
+                            label="契約容量 [kW]", placeholder="例: 1000", visible=True)
+                        wind_coverage_input = gr.Textbox(
+                            label="需要カバー率 [%]（年間の風力発電量 ÷ 年間需要量）", placeholder="例: 100", visible=False)
+                        with gr.Row():
+                            wind_cf_input = gr.Number(
+                                label="設備利用率 [%]", value=WIND_CF_DEFAULT_PCT, precision=1)
+                            wind_ppa_input = gr.Number(
+                                label="PPA単価 [円/kWh]", value=WIND_PPA_PRICE_DEFAULT, precision=2)
+                        gr.Markdown(
+                            "<small>設備利用率29.1%・PPA単価11.96円/kWhの出典: 資源エネルギー庁 調達価格等算定委員会 第112回"
+                            "（2026年1月）。陸上風力（新設）の想定値と、2025年度入札の平均落札価格。"
+                            "PPA単価そのものの公的な出典はなく、成立した水準の目安です。</small>"
+                        )
+                        with gr.Row():
+                            wind_wheeling_input = gr.Textbox(
+                                label="託送の電力量料金 [円/kWh]（空欄=既定）", placeholder="空欄で既定値（上に表示）")
+                            wind_fee_input = gr.Textbox(
+                                label="小売手数料 [円/kWh]（空欄=既定・推定値）", placeholder="空欄で既定値（上に表示）")
+                        gr.Markdown(
+                            "<small>託送の電力量料金は一次資料（北海道電力NW・東北電力NW、2025年10月〜、税込表示）。"
+                            "小売手数料は自然エネルギー財団の推定（2023年度・全国平均）で、公的な料金表はありません。</small>"
+                        )
+                wind_components = [
+                    wind_enabled_input, wind_sizing_input, wind_capacity_input, wind_coverage_input,
+                    wind_cf_input, wind_ppa_input, wind_wheeling_input, wind_fee_input,
+                ]
+                if len(wind_components) != len(WIND_INPUT_KEYS):
+                    raise RuntimeError("wind_components と WIND_INPUT_KEYS の要素数が一致しません")
+
+                wind_enabled_input.change(
+                    fn=lambda x: gr.update(visible=x),
+                    inputs=[wind_enabled_input],
+                    outputs=[wind_settings_group],
+                    api_visibility="hidden",
+                )
+                wind_sizing_input.change(
+                    fn=lambda m: (gr.update(visible=(m == WIND_SIZING_CAPACITY)),
+                                  gr.update(visible=(m == WIND_SIZING_COVERAGE))),
+                    inputs=[wind_sizing_input],
+                    outputs=[wind_capacity_input, wind_coverage_input],
+                    api_visibility="hidden",
+                )
+                # 調達エリアと既定値の表示は、地点・CSV・契約種別に追従する
+                for _trigger in (station_input, csv_input, contract_type_input):
+                    _trigger.change(
+                        fn=lambda st, f, ct: wind_area_note(st, f is not None, ct),
+                        inputs=[station_input, csv_input, contract_type_input],
+                        outputs=[wind_area_md],
+                        api_visibility="hidden",
+                    )
+
                 with gr.Accordion("⚙️ 太陽光発電設定", open=False):
+                    pv_enabled_input = gr.Checkbox(
+                        label="太陽光発電を使う（OFFなら下の面設定は使わず、風力のみで計算）", value=True)
                     with gr.Row():
                         KHD_input = gr.Number(label="KHD（日射量年変動）", value=DEFAULT_KHD, precision=3)
                         KPD_input = gr.Number(label="KPD（経時変化）", value=DEFAULT_KPD, precision=3)
@@ -4385,6 +4547,7 @@ def build_ui():
         #   display: num_facilities, month, day, num_faces = 4
         #   demand_source_state (1): 選択中の需要タブ（industrial / datacenter）
         #   dc_components: len(DC_INPUT_KEYS) = 15（データセンタータブの入力＋受電上限。産業用のときは無視される）
+        #   pv_enabled_input (1) ＋ wind_components: len(WIND_INPUT_KEYS) = 8（風力。W3）
         all_inputs = [
             station_input, csv_input,
             demand_csv_input,
@@ -4426,17 +4589,26 @@ def build_ui():
             dc_vals = args[tail_start + 5: tail_start + 5 + len(DC_INPUT_KEYS)]
             dc_args = dict(zip(DC_INPUT_KEYS, dc_vals))
 
+            # 末尾: 太陽光を使うか(1) ＋ 風力の入力(WIND_INPUT_KEYS と同じ並び)
+            wind_start = tail_start + 5 + len(DC_INPUT_KEYS)
+            pv_enabled = args[wind_start]
+            try:
+                wind_args = build_wind_args(*args[wind_start + 1: wind_start + 1 + len(WIND_INPUT_KEYS)])
+            except ValueError as e:
+                return None, None, None, None, f"エラー: {e}", "", None
+
             return run_simulation(
                 *base, fac_args, face_args,
                 num_facilities=num_fac, num_faces=num_f,
                 display_month=month_val, display_day=day_val,
                 demand_source=demand_source, dc_args=dc_args,
+                pv_enabled=bool(pv_enabled), wind_args=wind_args,
             )
 
         all_inputs_with_display = all_inputs + [
             num_facilities_input, month_input, day_input, num_faces_input,
             demand_source_state,
-        ] + dc_components
+        ] + dc_components + [pv_enabled_input] + wind_components
 
         run_btn.click(
             fn=on_click,
