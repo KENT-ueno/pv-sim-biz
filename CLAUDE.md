@@ -348,8 +348,10 @@ demand(t) = IT定格容量 × IT負荷率(年平均) × 形状(t) × PUE × 0.5 
 - **未着手**: 気温連動PUE（**先にPUEの出典調査が必要**。§9-1の見どころ3つ・PUEグラフ・冷却電力量がこれに依存）／
   DC固有の経済性（IRR・NPV・CFなど。投資回収・リース/PPA・CO2削減量は共通機能で提供済み）／IT負荷のCSV／
   時間帯別料金・他エリアのタリフ・エリア別CO2係数
-- **運用**: DCのMCPツールの Codex / Claude Code での実機検証（手順は `docs/dc_agent_verification.md`。
-  プロトコル層は検証済み）。fip・gh の `capacity_factor_pct` が文字列で返る問題の横展開（各リポジトリ）
+- **運用**: DCのMCPツールの実機検証は **Codex で全シナリオ一致（2026-09-20）**。Claude Code は未実施（手順は
+  `docs/dc_agent_verification.md`）。fip・gh の `capacity_factor_pct` が文字列で返る問題の横展開（各リポジトリで対応中）
+- **検討候補（Codexの指摘）**: MCPに特定日の日別・30分カーブを返すツールが無い。Gradio UIの時系列を外部で使うには、
+  日付指定の時系列取得ツール、または本計算結果への時系列の同梱が要る（レスポンスの大きさとの兼ね合い。未決定）
 
 ### 作業上の厳守事項
 
