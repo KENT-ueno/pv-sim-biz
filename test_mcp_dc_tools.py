@@ -305,26 +305,42 @@ check("産業用の出力に grid_cap / datacenter の節が混ざらない", "g
 check("産業用の出力のキー構成が従来どおり",
       list(ind.keys()) == ["assumptions", "annual", "electricity_cost", "investment", "business",
                            "microgrid", "caveats", "validation_warnings"], str(list(ind.keys())))
-def _numpy_leaks(o, path=""):
-    """出力に numpy のスカラー/配列が混ざっていないか（混ざるとMCP経由で数値が文字列になる）"""
+def _non_json(o, path=""):
+    """出力にJSON標準以外の型（numpy・辞書キーを含む）が混ざっていないか。
+    混ざると、MCP経由で数値が文字列になる（例: numpy.float64 → "11.5"）。"""
     out = []
     if isinstance(o, dict):
         for k, v in o.items():
-            out += _numpy_leaks(v, f"{path}/{k}")
-    elif isinstance(o, (list, tuple)):
+            if type(k) not in (str, int, float, bool):   # json.dumps が受け付ける辞書キー（numpyのキーは不可）
+                out.append(f"{path}/<key {k!r}: {type(k).__name__}>")
+            out += _non_json(v, f"{path}/{k}")
+    elif type(o) is list:
         for i, v in enumerate(o):
-            out += _numpy_leaks(v, f"{path}[{i}]")
-    elif isinstance(o, (np.generic, np.ndarray)):
-        out.append(path)
+            out += _non_json(v, f"{path}[{i}]")
+    elif o is None or type(o) in (str, int, float, bool):
+        pass
+    else:
+        out.append(f"{path}: {type(o).__name__}")
     return out
 
 
-check("MCP出力にnumpy型が混ざらない（産業用: capacity_factor_pct がfloat）", _numpy_leaks(ind) == [], str(_numpy_leaks(ind)))
-check("MCP出力にnumpy型が混ざらない（DC: 蓄電池なし・LP+上限・診断）",
-      _numpy_leaks(s0) == [] and _numpy_leaks(s1) == [] and _numpy_leaks(s2) == [] and _numpy_leaks(e) == [],
-      str([_numpy_leaks(s0), _numpy_leaks(s1), _numpy_leaks(s2), _numpy_leaks(e)]))
-check("estimate_pv_generation の capacity_factor_pct もfloat",
-      _numpy_leaks(mcp_tools.estimate_pv_generation(station_no="44132", faces=[{"ppeak_kw": 500.0, "tilt_deg": 30.0, "azimuth_deg": 180.0, "pcs_limit_kw": 500.0}])) == [])
+# _jsonable 自体の単体検査（値は変えず、型だけをJSON標準にする）
+_src = {"f": np.float64(11.5), "i": np.int64(3), "b": np.bool_(True), "a": np.array([1.5, 2.5]),
+        "t": (np.float32(1.0), 2), "nest": {np.int64(7): [np.float64(0.25)]}, "n": None, "s": "x"}
+_out = mcp_tools._jsonable(_src)
+check("_jsonable: numpy のスカラー・配列・辞書キー・タプルをJSON標準の型に変換", _non_json(_out) == [], str(_non_json(_out)))
+check("_jsonable: 値は変わらない", _out["f"] == 11.5 and _out["i"] == 3 and _out["b"] is True and _out["a"] == [1.5, 2.5]
+      and _out["t"] == [1.0, 2] and _out["nest"] == {7: [0.25]} and _out["n"] is None and _out["s"] == "x")
+check("_jsonable: NaN/inf はそのまま通す（値は変えない）", np.isnan(mcp_tools._jsonable(np.float64("nan"))) and mcp_tools._jsonable(float("inf")) == float("inf"))
+check("MCP出力がJSON標準の型だけ（産業用）", _non_json(ind) == [], str(_non_json(ind)))
+check("MCP出力がJSON標準の型だけ（DC: 蓄電池なし・LP+上限・診断・需要見積り）",
+      _non_json(s0) == [] and _non_json(s1) == [] and _non_json(s2) == [] and _non_json(e) == [],
+      str([_non_json(s0), _non_json(s1), _non_json(s2), _non_json(e)]))
+check("estimate_pv_generation / list_stations / validate もJSON標準の型だけ",
+      _non_json(mcp_tools.estimate_pv_generation(station_no="44132", faces=[{"ppeak_kw": 500.0, "tilt_deg": 30.0, "azimuth_deg": 180.0, "pcs_limit_kw": 500.0}])) == []
+      and _non_json(mcp_tools.list_stations()) == [] and _non_json(v) == [])
+check("公開ツールの成功系の戻り値を _jsonable で返している（app.pyに登録された7ツールの return を機械的に確認）",
+      open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "mcp_tools.py"), encoding="utf-8").read().count("return _jsonable(") == 8)
 check("産業用の validate は facilities 必須のまま",
       not mcp_tools.validate_industrial_params(facilities=[])["valid"])
 

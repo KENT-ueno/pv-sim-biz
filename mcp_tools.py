@@ -44,6 +44,24 @@ def _get_app():
     return app
 
 
+def _jsonable(o):
+    """戻り値をJSON標準の型に揃える（公開ツールの return で通す）。
+
+    numpy のスカラー（numpy.float64 など）が混ざると、GradioのMCP応答では数値でなく文字列
+    （"11.5"）になる。round() の入力が numpy 由来だと結果も numpy のままなので、個別のキャストではなく
+    返す直前にここで1か所で正規化する。値は変えない（型だけ）。
+    """
+    if isinstance(o, dict):
+        return {_jsonable(k): _jsonable(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return [_jsonable(v) for v in o]
+    if isinstance(o, np.generic):
+        return o.item()
+    if isinstance(o, np.ndarray):
+        return o.tolist()
+    return o
+
+
 # ============================================================
 # 定数
 # ============================================================
@@ -821,7 +839,7 @@ def _run_industrial_simulation(p: dict, demand_override=None, grid_cap_kw=None):
         "assumptions": p,
         "annual": {
             "generation_kwh": round(result["annual"]),
-            "capacity_factor_pct": float(round(result["annual"] / (total_ppeak * 8760) * 100, 2)) if total_ppeak > 0 else None,
+            "capacity_factor_pct": round(result["annual"] / (total_ppeak * 8760) * 100, 2) if total_ppeak > 0 else None,
             "face_generation_kwh": [round(v) for v in result["face_annual"]],
             "demand_kwh": round(sc_result["annual_demand"]),
             "self_consumption_kwh": round(sc_result["annual_self"]),
@@ -888,14 +906,14 @@ def list_stations() -> dict:
         "SELECT point_no, point_name, lat, lon FROM points ORDER BY point_no"
     ).fetchall()
     conn.close()
-    return {
+    return _jsonable({
         "stations": [
             {"station_no": str(no), "name": name,
              "latitude": float(lat), "longitude": float(lon)}
             for no, name, lat, lon in rows
         ],
         "count": len(rows),
-    }
+    })
 
 
 def estimate_pv_generation(
@@ -927,16 +945,16 @@ def estimate_pv_generation(
             app.DEFAULT_ALPHA, app.DEFAULT_DELTA_T,
         )
         total_pv_kw = sum(f["ppeak_kw"] for f in normalized_faces)
-        return {
+        return _jsonable({
             "station_no": str(station_no),
             "station_name": name,
             "total_pv_kw": total_pv_kw,
             "annual_generation_kwh": round(g["annual"]),
-            "capacity_factor_pct": float(round(g["annual"] / (total_pv_kw * 8760) * 100, 2)) if total_pv_kw > 0 else None,
+            "capacity_factor_pct": round(g["annual"] / (total_pv_kw * 8760) * 100, 2) if total_pv_kw > 0 else None,
             "face_generation_kwh": [round(v) for v in g["face_annual"]],
             "monthly_generation_kwh": {str(m): round(g["monthly"].get(m, 0)) for m in range(1, 13)},
             "note": "JIS C 8907準拠（標準補正係数使用、片面パネル）。需要・蓄電池・電気料金・経済性は含まない",
-        }
+        })
     except Exception as e:
         return {"error": str(e)}
 
@@ -1072,7 +1090,7 @@ def validate_industrial_params(
         runtime = "1-3秒" if not battery_enabled or battery_mode == "rule_based" else "5-20秒（LP最適化）"
         if bifacial_enabled:
             runtime += "。両面パネル計算のため数秒程度余分にかかる場合があります"
-        return {
+        return _jsonable({
             "valid": len(errors) == 0,
             "normalized_params": params,
             "warnings": warnings,
@@ -1080,7 +1098,7 @@ def validate_industrial_params(
             "estimated_runtime_seconds": runtime,
             "next_step": "normalized_params をユーザーに提示して確認後、"
                          "simulate_industrial_pv を同じ引数で呼び出す",
-        }
+        })
     except Exception as e:
         return {"valid": False, "errors": [str(e)], "warnings": []}
 
@@ -1185,7 +1203,7 @@ def simulate_industrial_pv(
     try:
         out = _run_industrial_simulation(v["normalized_params"])
         out["validation_warnings"] = v.get("warnings", [])
-        return out
+        return _jsonable(out)
     except Exception as e:
         return {"error": str(e)}
 
@@ -1437,7 +1455,7 @@ def estimate_dc_demand(
         monthly = {str(mo): round(float(demand[month_idx == mo].sum())) for mo in range(1, 13)}
         dc_out = dict(dc)
         dc_out.pop("grid_cap"), dc_out.pop("grid_cap_kw")
-        return {
+        return _jsonable({
             "datacenter": _dc_summary(dc_info),
             "monthly_facility_kwh": monthly,
             "average_daily_profile_kw": [round(float(v), 1) for v in demand.mean(axis=0) * 2.0],
@@ -1445,7 +1463,7 @@ def estimate_dc_demand(
             "assumptions": dc_out,
             "warnings": warnings,
             "caveats": _dc_caveats(dc, capacity_mode == "size_preset"),
-        }
+        })
     except Exception as e:
         return {"error": str(e)}
 
@@ -1642,14 +1660,14 @@ def validate_dc_params(
                                             else "10秒〜2分（LP最適化＋受電上限）")
         if bifacial_enabled:
             runtime += "。両面パネル計算のため数秒程度余分にかかる場合があります"
-        return {
+        return _jsonable({
             "valid": len(errors) == 0,
             "normalized_params": params,
             "warnings": warnings,
             "errors": errors,
             "estimated_runtime_seconds": runtime,
             "next_step": "normalized_params をユーザーに提示して確認後、simulate_dc を同じ引数で呼び出す",
-        }
+        })
     except Exception as e:
         return {"valid": False, "errors": [str(e)], "warnings": []}
 
@@ -1776,7 +1794,7 @@ def simulate_dc(
                 "max_charge_kw": p["battery_max_charge_kw"],
                 "max_discharge_kw": p["battery_max_discharge_kw"],
             }
-            return {
+            return _jsonable({
                 "grid_cap_infeasible": True,
                 "reason": ("受電上限を守れないことが必要条件の診断で確定（LPは実行していない）"
                            if e.status == "infeasible" else
@@ -1789,7 +1807,7 @@ def simulate_dc(
                              "IT負荷（容量・負荷率）を下げる、のいずれかで再検証する",
                 "caveats": caveats,
                 "validation_warnings": v.get("warnings", []),
-            }
+            })
         ann = out["annual"]
         if p["battery_enabled"] and ann["battery_charge_kwh"] == 0 and ann["battery_discharge_kwh"] == 0:
             caveats.append(
@@ -1800,6 +1818,6 @@ def simulate_dc(
         result.update(out)
         result["caveats"] = list(out["caveats"]) + caveats
         result["validation_warnings"] = v.get("warnings", [])
-        return result
+        return _jsonable(result)
     except Exception as e:
         return {"error": str(e)}
