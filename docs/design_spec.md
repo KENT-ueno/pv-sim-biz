@@ -60,7 +60,7 @@
    組織プラン向けで、個人のPROは列に無い）。PRO課金しても5本目の同時稼働は別途詰める必要がある。
 
 **→ 判断はPhase 4（デプロイ）で行う。Phase 0〜3はローカル開発のみで進むため影響を受けない。**
-選択肢の比較は §13 を参照。
+選択肢の比較は **付録A**（解決済み。独立Spaceを作らず biz に統合した）を参照。
 
 ---
 
@@ -842,6 +842,19 @@ IT_load(t) = IT_base(t) + IT_flex(t)
 | **4** | MCP化＋README/ドキュメント整備 | 本番schemaエンドポイントが200を返し、Claude Code / Codex 双方から実測一致 |
 | **5〜** | 将来: JEPX市場連動、需要側柔軟性（§7）、液冷・排熱（将来構想へ接続） | — |
 
+### DCCNのPhase番号と、bizへの統合後の「段階」の対応（2026-09-20）
+
+`CLAUDE.md` の実装状況表は、biz統合後の「段階1〜5」で書かれている。上の表（DCCN時代のPhase 0〜5）との対応:
+
+| DCCN Phase | 内容 | biz統合後の状況 |
+|---|---|---|
+| 0 | 計算層の移植、タリフ、DC需要（PUE一定） | 段階1 ✅（commit e783cf9） |
+| 1 | DC需要モデル（IT負荷×PUE(T)）、PUE曲線・月別PUEグラフ | 段階2・3 ✅ は**PUE一定のみ**。**気温連動PUEとPUEグラフは未着手**（出典未確定。§13） |
+| 2 | PV＋蓄電池最適化、受電上限制約、料金接続 | 段階5 ✅（受電上限）。PV・蓄電池・料金は産業用の既存機能を共通利用 |
+| 3 | 経済性（CAPEX/OPEX/IRR/NPV）とCO2 | 投資回収年数・リース/PPA・CO2削減量は**共通機能で提供済み**。DC固有のIRR/NPV・年次キャッシュフロー・CO2削減単価は未着手 |
+| 4 | MCP化＋README/ドキュメント整備 | 段階4 ✅（3ツール、計7ツール）。README更新済み。Codex/Claude Codeでの実機検証は**手順書あり・未実施**（`dc_agent_verification.md`） |
+| 5〜 | JEPX連動、需要側柔軟性、液冷・排熱 | **保留**（需要側柔軟性は decision_log 第8段階。受電増強との比較は第10段階で不採用） |
+
 ### Phase 0 実装で判明した事実（2026-09-06）
 
 1. **`radiation.db` は 50地点。設計書初版の「77地点」は誤りだった。**
@@ -903,7 +916,76 @@ IT_load(t) = IT_base(t) + IT_flex(t)
 
 ## 13. 未確定事項（実装前に決めること）
 
-- [ ] **公開手段の決定（Phase 4で判断。2026-09-14にHF仕様変更を確認して選択肢を再整理）**
+> 2026-09-20 整理。未解決（`[ ]`）のうち**中核は「PUEデフォルト値の出典」**（気温連動PUEの前提）。残りは未着手の拡張
+> （他エリアのタリフ・時間帯別料金メニュー・系統CO2係数・IT負荷のCSV）で、いずれも現状は手入力や既存機能で代替できる。
+> 保留・不採用を決めた項目は `[x]` にしてある。公開手段の検討記録（旧・先頭の大きな項目）は **付録A** に移した。
+
+- [x] ~~**公開手段の決定**~~ → **解決済み（2026-09-14）: 独立Spaceを作らず、`pv-sim-biz` にデータセンターモードとして統合した**
+      （案A〜Eはいずれも別Spaceを前提としていたが、統合案がそれらの問題を解消した。経緯は `decision_log.md` 第3〜4段階）。
+      2026-09-19 に本番（`main`）へ反映済み。案A〜E・ロリポップの調査・Pyodideの実測は履歴として **付録A** に移した
+- [ ] **PUEデフォルト値の出典確認**: JDCC・環境省/経産省のDC実態調査でPUE実績と突合
+      （§5-4のデフォルトは現状「物理的に妥当なオーダー」でしかない）。**本設計書で唯一、
+      出典が固まっていない中核パラメータ。Phase 1（気温連動PUE実装）の着手前に調べる**
+- [x] ~~特別高圧の料金デフォルト~~ → **北海道電力エリアのタリフとして実装済み**（§6-4）。
+      東京電力EP流用の初版計画から変更。他エリアは `TARIFFS` にテーブル追加で拡張する
+- [ ] **他エリアのタリフ追加**: パイロット版（北海道電力）完成後に東北・東京・…を追加する。
+      テーブル追加のみで計算コードの変更は不要な構造にしてある（§6-4）
+- [ ] **時間帯別料金メニューの扱い**: 北海道電力の一般料金は年間単一単価であり、
+      これが蓄電池の価値をゼロにする構造的要因になっている（§11「Phase 0で判明した事実」2）。
+      時間帯別（夜間安）メニューを追加すると蓄電池の評価が大きく変わるため、
+      Phase 2（受電上限制約）と並ぶ優先度で検討する価値がある
+- [ ] **系統CO2排出係数**: エリア別か全国平均か、年度をどこに固定するか
+- [x] 受電増強コスト（§7-1）の扱い → **決定済み: §7-1の比較機能は作らない**（ユーザー判断 2026-09-19。decision_log 第10段階）。
+      理由: `SUBSTATION_COST_PER_KVA`（27,500円/kVA）は出典が記録になく、**高圧の単価で特高の単価ではない可能性が高い**
+      （ユーザー指摘）。22・33kV→66kV（10,000kW境界）の単価は存在しない。系統側工事負担金・空き容量待ちは
+      単価で表せない。単価が確定しない以上、単価を使った比較は結論が単価に支配されて意味をなさない。
+      受電上限（§7）の診断（必要な蓄電池の下限の目安）までを「シミュレーションできる」範囲とする
+- [ ] **IT負荷のCSVアップロード形式**: bizの `load_custom_demand_csv()` を流用するか、
+      IT負荷専用（kW直接指定）にするか
+- [x] ~~Space名を `pv-sim-dc` で確定してよいか~~ → **不要**（独立Spaceを作らず `pv-sim-biz` に統合したため。上記）
+- [x] ~~受電上限で実行不可能になったときの診断メッセージの具体文言と、「必要な追加PV/BESS容量の目安」の算出~~
+      → 実装済み（2026-09-19）。§7「実装メモ」の3条件診断（energy/power/capacity）。必要量は蓄電池の
+      **下限の目安**（PV/BESSの追加量そのものを探索する方式は採らなかった）
+- [x] **需要側の調整（IT負荷のシフト）** → **決定済み: 保留**（ユーザー判断 2026-09-19。§7「需要側柔軟性」の位置づけのまま、
+      DCCN Phase 5・将来項目）。蓄電池と需要調整が競合し、根拠のある値のない変数（割合・物理上限・遅延許容）が
+      増えて「何でもあり」になるため。再開するなら、蓄電池を優先し「必要な柔軟負荷割合」を出力として返す形を先に検討し、
+      実装の前に目的を確認する（decision_log 第8段階）
+
+---
+
+## 14. 参考
+
+- DCの負荷実測・負荷曲線生成の公開データ（2026-09-18調査。詳細は `docs/dc_load_data_sources.md`、
+  設計書 §5-6 に一次資料からの引用あり）:
+  - NLR（旧NREL）*HPC Facility Power Usage Effectiveness (PUE) Data*
+    https://data.nlr.gov/submissions/300 ／ DOI: https://doi.org/10.7799/3015212
+  - NLR（旧NREL）*HPC Eagle Node Power Data* https://data.nlr.gov/submissions/288
+  - CEC *Data Center Methodology Memo — Supporting Document for the 2025 IEPR Forecast*
+    https://www.energy.ca.gov/sites/default/files/2026-04/Data_Center_Methodology_Memo_ada.pdf
+  - CEC *CED 2025 Data Center Forecast - Supplemental Hourly Load Profile Analysis*
+    https://www.energy.ca.gov/media/12647
+  - LBNL *Data Center and Industrial Electrical Load Shape Maker*
+    https://github.com/LBNL-DataCenter-CoE/shape_maker
+  - DOE *Sup3rLoad Dataset* https://catalog.data.gov/dataset/sup3rload-dataset
+- NREL End-Use Load Profiles (ComStock/ResStock):
+  https://data.openei.org/s3_viewer?bucket=oedi-data-lake&prefix=nrel-pds-building-stock%2F
+  （**DataCenterは含まれない**ことを2026-09-06に実査確認。§5-1）
+- JIS C 8907:2005: https://kikakurui.com/c8/C8907-2005-01.html
+- pvlib: https://pvlib-python.readthedocs.io/
+- NEDO METPV-20: 日射量データベース（`radiation.db` の出典）
+- 既存3プロジェクトのMCP接続ガイド: `pv-sim-fip/docs/mcp_guide.md`
+- 既存3プロジェクトの活用例プロンプト集: `pv-sim-fip/docs/example_prompts.md`
+- Phase 4 エージェント統合設計書: `pv-sim-fip/docs/agent_design.md`
+
+---
+
+## 付録A. 公開手段の検討記録（2026-09-14。解決済み・履歴）
+
+> **この検討は解決済み。** 独立Spaceを作らず、`pv-sim-biz` にデータセンターモードとして統合した（`decision_log.md` 第3〜4段階）。
+> 以下は、統合に決める前の案A〜E・各サービスの調査・Pyodide（Gradio-lite）の実測の記録で、
+> 「HF無料アカウントでGradio Spaceを新規作成できない」制約への対応を再検討する場合の参考として残す。
+
+**公開手段の決定（Phase 4で判断。2026-09-14にHF仕様変更を確認して選択肢を再整理）**
       §1-1のとおり、無料アカウントでは**Gradio Spaceを新規作成できなくなった**。
       Phase 0〜3はローカル開発のみで進むため影響はないが、Phase 4で下記から選ぶ必要がある。
 
@@ -953,7 +1035,7 @@ MCPを足す追加コストが小さいため。
 **成立の絶対条件: DC計算を scipy ベースで「1本だけ」書くこと。**
 静的UI側（ブラウザ）とMCP側（biz上のサーバー）で別実装にすると、
 **同じモデルの数値が食い違う**。シミュレータとしてこれは致命的。
-幸い scipy/HiGHS はブラウザでもサーバーでも動くため（§13「案Cの実測検証」）、
+幸い scipy/HiGHS はブラウザでもサーバーでも動くため（付録A「案Cの実測検証」）、
 **単一実装・2箇所ホスト**が成立する。PuLPは使わない。
 
 **このルートを後押しする論点: ロードマップとの相性**
@@ -1035,56 +1117,3 @@ storage-limits・spaces-overview のいずれにも無く、実質的な制約�
 
 **副次的な利点**: 静的Spaceはスリープしない。現行のCPU Basic Space（fip/gh/biz）は
 48時間未使用でスリープし初回アクセスが遅くなるが、静的版は常時即応になる。
-- [ ] **PUEデフォルト値の出典確認**: JDCC・環境省/経産省のDC実態調査でPUE実績と突合
-      （§5-4のデフォルトは現状「物理的に妥当なオーダー」でしかない）。**本設計書で唯一、
-      出典が固まっていない中核パラメータ。Phase 1（気温連動PUE実装）の着手前に調べる**
-- [x] ~~特別高圧の料金デフォルト~~ → **北海道電力エリアのタリフとして実装済み**（§6-4）。
-      東京電力EP流用の初版計画から変更。他エリアは `TARIFFS` にテーブル追加で拡張する
-- [ ] **他エリアのタリフ追加**: パイロット版（北海道電力）完成後に東北・東京・…を追加する。
-      テーブル追加のみで計算コードの変更は不要な構造にしてある（§6-4）
-- [ ] **時間帯別料金メニューの扱い**: 北海道電力の一般料金は年間単一単価であり、
-      これが蓄電池の価値をゼロにする構造的要因になっている（§11「Phase 0で判明した事実」2）。
-      時間帯別（夜間安）メニューを追加すると蓄電池の評価が大きく変わるため、
-      Phase 2（受電上限制約）と並ぶ優先度で検討する価値がある
-- [ ] **系統CO2排出係数**: エリア別か全国平均か、年度をどこに固定するか
-- [ ] 受電増強コスト（§7-1）の扱い: **§7-1の比較機能は作らない**（ユーザー判断 2026-09-19。decision_log 第10段階）。
-      理由: `SUBSTATION_COST_PER_KVA`（27,500円/kVA）は出典が記録になく、**高圧の単価で特高の単価ではない可能性が高い**
-      （ユーザー指摘）。22・33kV→66kV（10,000kW境界）の単価は存在しない。系統側工事負担金・空き容量待ちは
-      単価で表せない。単価が確定しない以上、単価を使った比較は結論が単価に支配されて意味をなさない。
-      受電上限（§7）の診断（必要な蓄電池の下限の目安）までを「シミュレーションできる」範囲とする
-- [ ] **IT負荷のCSVアップロード形式**: bizの `load_custom_demand_csv()` を流用するか、
-      IT負荷専用（kW直接指定）にするか
-- [ ] Space名を `pv-sim-dc` で確定してよいか（DCCNという別系統の名前にするか）
-- [x] ~~受電上限で実行不可能になったときの診断メッセージの具体文言と、「必要な追加PV/BESS容量の目安」の算出~~
-      → 実装済み（2026-09-19）。§7「実装メモ」の3条件診断（energy/power/capacity）。必要量は蓄電池の
-      **下限の目安**（PV/BESSの追加量そのものを探索する方式は採らなかった）
-- [ ] **需要側の調整（IT負荷のシフト）**: **保留**（ユーザー判断 2026-09-19。§7「需要側柔軟性」の位置づけのまま、
-      DCCN Phase 5・将来項目）。蓄電池と需要調整が競合し、根拠のある値のない変数（割合・物理上限・遅延許容）が
-      増えて「何でもあり」になるため。再開するなら、蓄電池を優先し「必要な柔軟負荷割合」を出力として返す形を先に検討し、
-      実装の前に目的を確認する（decision_log 第8段階）
-
----
-
-## 14. 参考
-
-- DCの負荷実測・負荷曲線生成の公開データ（2026-09-18調査。詳細は `docs/dc_load_data_sources.md`、
-  設計書 §5-6 に一次資料からの引用あり）:
-  - NLR（旧NREL）*HPC Facility Power Usage Effectiveness (PUE) Data*
-    https://data.nlr.gov/submissions/300 ／ DOI: https://doi.org/10.7799/3015212
-  - NLR（旧NREL）*HPC Eagle Node Power Data* https://data.nlr.gov/submissions/288
-  - CEC *Data Center Methodology Memo — Supporting Document for the 2025 IEPR Forecast*
-    https://www.energy.ca.gov/sites/default/files/2026-04/Data_Center_Methodology_Memo_ada.pdf
-  - CEC *CED 2025 Data Center Forecast - Supplemental Hourly Load Profile Analysis*
-    https://www.energy.ca.gov/media/12647
-  - LBNL *Data Center and Industrial Electrical Load Shape Maker*
-    https://github.com/LBNL-DataCenter-CoE/shape_maker
-  - DOE *Sup3rLoad Dataset* https://catalog.data.gov/dataset/sup3rload-dataset
-- NREL End-Use Load Profiles (ComStock/ResStock):
-  https://data.openei.org/s3_viewer?bucket=oedi-data-lake&prefix=nrel-pds-building-stock%2F
-  （**DataCenterは含まれない**ことを2026-09-06に実査確認。§5-1）
-- JIS C 8907:2005: https://kikakurui.com/c8/C8907-2005-01.html
-- pvlib: https://pvlib-python.readthedocs.io/
-- NEDO METPV-20: 日射量データベース（`radiation.db` の出典）
-- 既存3プロジェクトのMCP接続ガイド: `pv-sim-fip/docs/mcp_guide.md`
-- 既存3プロジェクトの活用例プロンプト集: `pv-sim-fip/docs/example_prompts.md`
-- Phase 4 エージェント統合設計書: `pv-sim-fip/docs/agent_design.md`
