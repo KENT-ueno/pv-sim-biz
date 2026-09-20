@@ -238,7 +238,8 @@ bizへの統合案（＝§1-1の再検討）が構造的に欠けていた。** 
 まず個別に `float()` へ変換して修正し（`f86f617`）、その後、公開ツール7つの成功系の `return` を `_jsonable()` で包む方式に一本化した
 （機構を1つに絞ると差分が小さく、grepで確認でき、今後の変更でも再発しない。デコレータ方式はGradioがシグネチャ・docstringから
 MCPスキーマを作るため避けた。公開7ツールのシグネチャ・docstringは変更前と同一）。テストは「JSON標準の型だけ」の検査に拡張した。**pv-sim-gh・pv-sim-fip も本番で同じ症状**
-（`estimate_pv_generation`）を確認（各リポジトリで別途対応）。
+（`estimate_pv_generation`。gh は `payback_years` も）を確認し、**両リポジトリでも `_jsonable()` に統一して修正済み・本番確認済み**
+（gh `3abba28`／fip `f2a50f9`。修正前後の出力は gh 23条件・fip 33条件で完全一致）。
 
 **判断**
 - 実エージェント（Codex / Claude Code）での検証は、こちらから実行できないため**手順書**（`docs/dc_agent_verification.md`）にした。
