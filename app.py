@@ -2715,21 +2715,29 @@ def _calc_irr(cashflows, tol=1e-8, max_iter=100):
     def npv(r):
         return sum(cf / (1 + r) ** t for t, cf in enumerate(cashflows))
 
+    # 符号が変わらない（全期間の収支が正でない）キャッシュフローにIRRは存在しない。
+    # このとき ニュートン法が巨大なrに発散して (1+r)**t がオーバーフローするため、先に打ち切る
+    if not any(cf > 0 for cf in cashflows):
+        return None
+
     # ニュートン法（r ≤ -1 に発散したら打ち切って二分法へ）
     r = 0.10
-    for _ in range(max_iter):
-        v = npv(r)
-        dv = sum(-t * cf / (1 + r) ** (t + 1) for t, cf in enumerate(cashflows))
-        if abs(dv) < 1e-15:
-            break
-        r_new = r - v / dv
-        if r_new <= -0.999:
-            break
-        if abs(r_new - r) < tol:
-            return r_new
-        r = r_new
-    if abs(npv(r)) < 1:
-        return r
+    try:
+        for _ in range(max_iter):
+            v = npv(r)
+            dv = sum(-t * cf / (1 + r) ** (t + 1) for t, cf in enumerate(cashflows))
+            if abs(dv) < 1e-15:
+                break
+            r_new = r - v / dv
+            if r_new <= -0.999:
+                break
+            if abs(r_new - r) < tol:
+                return r_new
+            r = r_new
+        if abs(npv(r)) < 1:
+            return r
+    except OverflowError:
+        pass  # 発散した。二分法へ
 
     # 二分法フォールバック（[-0.99, 10]で符号が変わる場合のみ）
     lo, hi = -0.99, 10.0
@@ -2822,10 +2830,6 @@ def run_simulation(
         # --- 風力（オフサイトPPA）: 需要地と同じエリアの形状から発電量と支払額を解決する ---
         wind_info = None
         if wind_args and wind_args.get("enabled"):
-            if mg_enabled:
-                # MGでは風力を網内供給として扱う（収益・費用の置き方が違う）。設計は wind_design_spec §5-4（W2b）
-                return None, None, None, None, ("エラー: 風力とマイクログリッドの併用は未対応です"
-                                                "（MGをOFFにしてください）"), "", None
             try:
                 wind_info = resolve_wind(
                     wind_args, None if csv_file is not None else point_no,
@@ -3343,14 +3347,19 @@ def run_simulation(
         biz_model = business_model if business_model else "自己所有"
         ppa_price = None  # MG収益計算で参照
         # 風力を併用するときは、リース料・PPA単価の対象を「太陽光＋蓄電池の設備」に限る。
-        # 需要家メリットは風力PPA支払を引いた値（annual_merit）。PPA単価の分母は、自家消費量を発電量比で
-        # 太陽光分に按分する（自家消費した電力が太陽光由来か風力由来かは分けられないため）
-        merit_label = "電気代削減" if wind_info is None else "電気代削減−風力PPA支払"
+        # 需要家メリットは風力の費用（PPA支払・届いた分の託送等）を引いた値（annual_merit）。
+        # PPA単価の分母は、自家消費量から風力の配達量を引いた敷地内の太陽光・蓄電池分
+        # （自家消費 ＝ 敷地内の太陽光・蓄電池分 ＋ 風力の配達量。蓄電池なしなら厳密に成り立つ）
+        merit_label = "電気代削減" if wind_info is None else "電気代削減−風力の費用"
         pv_self_kwh = sc_result['annual_self'] if sc_result is not None else 0.0
         if wind_info is not None and sc_result is not None:
-            _pv_gen = float(result["annual"])
-            _all_gen = _pv_gen + wind_info["annual_kwh"]
-            pv_self_kwh = pv_self_kwh * (_pv_gen / _all_gen) if _all_gen > 0 else 0.0
+            pv_self_kwh = max(0.0, pv_self_kwh - wind_info.get("delivered_kwh", 0.0))
+        # 風力の調達費用（PPA支払＋届いた分の託送の従量分・再エネ賦課金・小売手数料）。MGの費用・PPA単価の逆算に使う
+        wind_cost_total = 0.0
+        if wind_info is not None:
+            wind_cost_total = (wind_info["payment_yen"] + wind_info.get("delivered_kwh", 0.0)
+                               * (wind_info["wheeling_yen"] + rate_params["renewable_surcharge"]
+                                  + wind_info["retail_fee_yen"]))
         if biz_model in ("リース", "PPA") and net_investment > 0:
             n_years = int(contract_years) if contract_years is not None else DEFAULT_CONTRACT_YEARS
             r = (target_irr if target_irr is not None else DEFAULT_TARGET_IRR) / 100.0
@@ -3397,18 +3406,35 @@ def run_simulation(
                     result_text += f"  電気代削減効果なし → 提案不可\n"
 
             elif biz_model == "PPA":
-                if sc_result is not None and pv_self_kwh > 0:
-                    ppa_price = annual_lease / pv_self_kwh
+                # MG＋風力: 風力の調達費用も網内の需要家が負担するので、単価は
+                #   （投資の回収 ＋ 風力の調達費用）÷ 網内に供給した全量 で逆算する。
+                # それ以外（風力を併用しても、MGでなければ）は 投資の回収 ÷ 敷地内の太陽光・蓄電池分
+                mg_wind = bool(mg_enabled and wind_info is not None)
+                ppa_denom = sc_result['annual_self'] if (mg_wind and sc_result is not None) else pv_self_kwh
+                if sc_result is not None and ppa_denom > 0:
+                    ppa_required = annual_lease + (wind_cost_total if mg_wind else 0.0)
+                    ppa_price = ppa_required / ppa_denom
                     result_text += f"  必要PPA単価: {ppa_price:.2f} 円/kWh\n"
-                    result_text += f"  年間自家消費量: {pv_self_kwh:,.1f} kWh/年\n"
-                    if wind_info is not None:
-                        result_text += "    （風力を併用しているため、太陽光分は自家消費量を発電量比で按分した値）\n"
+                    result_text += f"  年間自家消費量: {ppa_denom:,.1f} kWh/年\n"
+                    if mg_wind:
+                        result_text += (f"    （網内に供給した全量。投資の回収 {annual_lease:,.0f} 円/年 ＋ 風力の調達費用 "
+                                        f"{wind_cost_total:,.0f} 円/年 を割った単価）\n")
+                    elif wind_info is not None:
+                        result_text += "    （風力の配達分を除いた、敷地内の太陽光・蓄電池分）\n"
                     result_text += f"\n【需要家メリット（{n_years}年間）】\n"
-                    ppa_annual_cost = ppa_price * pv_self_kwh
-                    customer_annual = annual_merit - ppa_annual_cost
+                    ppa_annual_cost = ppa_price * ppa_denom
+                    if mg_wind:
+                        # 需要家は風力の費用をPPA単価に含めて払うので、電気代削減は風力の費用を除いた額で並べる
+                        merit_shown = annual_merit + wind_cost_total
+                        result_text += f"  電気代削減（風力の費用を除く）: {merit_shown:,.0f} 円/年\n"
+                        result_text += (f"  PPA支払: {ppa_annual_cost:,.0f} 円/年（{ppa_price:.2f}円/kWh。"
+                                        "投資の回収＋風力の調達費用）\n")
+                    else:
+                        merit_shown = annual_merit
+                        result_text += f"  {merit_label}: {annual_merit:,.0f} 円/年\n"
+                        result_text += f"  PPA支払: {ppa_annual_cost:,.0f} 円/年（{ppa_price:.2f}円/kWh）\n"
+                    customer_annual = merit_shown - ppa_annual_cost
                     customer_total = customer_annual * n_years
-                    result_text += f"  {merit_label}: {annual_merit:,.0f} 円/年\n"
-                    result_text += f"  PPA支払: {ppa_annual_cost:,.0f} 円/年（{ppa_price:.2f}円/kWh）\n"
                     result_text += f"  需要家年間メリット: {customer_annual:,.0f} 円/年\n"
                     result_text += f"  需要家{n_years}年間合計: {customer_total:,.0f} 円\n"
                     if customer_annual >= 0:
@@ -3457,9 +3483,12 @@ def run_simulation(
                 mg_sell_price = avg_energy_price
                 mg_price_label = f"電力量単価加重平均 {avg_energy_price:.2f}円/kWh"
 
+            # 網内に供給した全量（敷地内の太陽光・蓄電池分＋風力の配達量）を網内単価で売る。
+            # 風力は送配電網で届くので、契約電力（基本料金）は下がらず（basic_saving は受電点基準の cost_after から自動で決まる）、
+            # 調達費用（PPA支払＋届いた分の託送・賦課金・手数料）がMG事業者の費用になる
             pv_revenue = sc_result['annual_self'] * mg_sell_price
             mg_annual_revenue = pv_revenue + basic_saving
-            mg_annual_cashflow = mg_annual_revenue - mg_annual_opex
+            mg_annual_cashflow = mg_annual_revenue - mg_annual_opex - wind_cost_total
 
             result_text += f"\n══ マイクログリッド事業 ══\n"
             result_text += f"【初期投資】\n"
@@ -3467,7 +3496,8 @@ def run_simulation(
             result_text += f"  自営線: {mg_dist:.1f} km × {mg_cost_km:,.0f} 円/km = {mg_line_cost:,.0f} 円\n"
             result_text += f"  MG投資合計: {mg_total_investment:,.0f} 円\n"
             result_text += f"【年間収支】\n"
-            result_text += f"  PV売電収入（網内）: {pv_revenue:,.0f} 円/年（{mg_price_label}）\n"
+            result_text += (f"  {'PV売電収入（網内）' if wind_info is None else '網内売電収入（PV・風力の供給分）'}"
+                            f": {pv_revenue:,.0f} 円/年（{mg_price_label}）\n")
             if individual_demands and len(individual_demands) > 1:
                 result_text += f"  基本料金差額（束ねメリット含む）: {basic_saving:,.0f} 円/年\n"
                 result_text += f"    個別契約時基本料金合計: {individual_basic_total:,.0f} 円/年\n"
@@ -3476,6 +3506,12 @@ def run_simulation(
                 result_text += f"  基本料金差額: {basic_saving:,.0f} 円/年\n"
             result_text += f"  年間収益合計: {mg_annual_revenue:,.0f} 円/年\n"
             result_text += f"  年間運営コスト: {mg_annual_opex:,.0f} 円/年（投資額の{mg_opex_r*100:.1f}%）\n"
+            if wind_info is not None:
+                w_dl = wind_info.get("delivered_kwh", 0.0)
+                result_text += (f"  風力の調達費用: {wind_cost_total:,.0f} 円/年"
+                                f"（PPA支払 {wind_info['payment_yen']:,.0f} ＋ 届いた {w_dl:,.1f} kWh の託送・賦課金・手数料 "
+                                f"{wind_cost_total - wind_info['payment_yen']:,.0f}）\n")
+                result_text += "    ※ 契約電力（基本料金）は風力では下がらないため、束ねメリットは太陽光・蓄電池の効果のみ\n"
             result_text += f"  年間キャッシュフロー: {mg_annual_cashflow:,.0f} 円/年\n"
 
             # P-IRR計算（numpy IRRがないのでニュートン法で求める）

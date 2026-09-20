@@ -341,7 +341,8 @@ check("PPA単価が負ならエラー", o[4].startswith("エラー") and "PPA単
 o = run(wind_args=wind("capacity", ppa_price=0.0))
 check("PPA単価0円は許容（支払0）", not o[4].startswith("エラー") and "PPA支払: 0 円/年" in o[4])
 o = run(wind_args=wind("coverage"), mg_enabled=True)
-check("風力とMGの併用は明示エラー（W2b まで）", o[4].startswith("エラー") and "マイクログリッド" in o[4])
+check("風力とMGの併用が動く（W2b。詳細は節9）",
+      not o[4].startswith("エラー") and "マイクログリッド事業" in o[4] and "風力の調達費用" in o[4], errdetail(o))
 try:
     app.resolve_wind(wind("coverage"), None, 1e6)
     check("CSVアップロード（地点なし）はエラー", False)
@@ -378,17 +379,20 @@ check("リース料は風力の有無で変わらない（対象はPV設備の�
 net_w = num(lease_w[4], "年間経済メリット:", after="【風力込みの年間経済メリット】")
 cust = num(lease_w[4], "需要家年間メリット:")
 check("需要家年間メリット = 風力込み年間経済メリット − リース料", abs(cust - (net_w - l1)) < 1.5, f"{cust} vs {net_w - l1:.0f}")
-check("需要家メリットの見出しは『電気代削減−風力PPA支払』", "電気代削減−風力PPA支払:" in lease_w[4])
+check("需要家メリットの見出しは『電気代削減−風力の費用』（PPA支払と、届いた分の託送等を引いた値）",
+      "電気代削減−風力の費用:" in lease_w[4])
 check("風力なしのリースの見出しは従来どおり『電気代削減』", "  電気代削減: " in lease_no[4])
 ppa_w = run(business_model="PPA", wind_args=wind("coverage"))
 ppa_price = num(ppa_w[4], "必要PPA単価:")
 self_pv = num(ppa_w[4], "年間自家消費量:")
-check("PPA単価 × 太陽光分の自家消費量（按分） = 必要リース料", abs(ppa_price * self_pv - l1) < 0.02 * l1 / 100 + 50,
+check("PPA単価 × 敷地内の太陽光・蓄電池分の自家消費量 = 必要リース料", abs(ppa_price * self_pv - l1) < 0.02 * l1 / 100 + 50,
       f"{ppa_price * self_pv:.0f} vs {l1:.0f}")
-share = float(st["gen_pv"].sum()) / float((st["gen_pv"] + st["gen_wind"]).sum())
-check("太陽光分の自家消費量 = 全自家消費量 × 太陽光の発電量比", abs(self_pv - sc["annual_self"] * share) < 0.1,
-      f"{self_pv} vs {sc['annual_self'] * share:.1f}")
-check("按分した旨の注記", "発電量比で按分" in ppa_w[4] or "発電量比で按分した値" in ppa_w[4])
+# 自家消費 ＝ 敷地内の太陽光・蓄電池分 ＋ 風力の配達量（蓄電池なしなら厳密）。W2 の発電量比の按分は、この実測に置き換えた
+pv_only_self = float(np.minimum(st["gen_pv"], demand).sum())
+check("太陽光分の自家消費量 = 全自家消費量 − 風力の配達量（= Σmin(太陽光, 需要)。蓄電池なし）",
+      abs(self_pv - (sc["annual_self"] - info["delivered_kwh"])) < 0.1 and abs(self_pv - pv_only_self) < 0.1,
+      f"{self_pv} vs {sc['annual_self'] - info['delivered_kwh']:.1f} / {pv_only_self:.1f}")
+check("風力の配達分を除いた旨の注記", "風力の配達分を除いた" in ppa_w[4])
 
 # ============================================================
 print("\n【8. データセンター・蓄電池LPとの組み合わせ／併用できない機能の明示エラー】")
@@ -417,6 +421,79 @@ cs = run(bat_enabled=True, bat_mode="最適容量探索", bat_max_charge=100.0, 
 check("風力と最適容量探索の併用は明示エラー", cs[4].startswith("エラー") and "最適容量探索" in cs[4], errdetail(cs))
 cs0 = run(bat_enabled=False, bat_mode="最適容量探索", wind_args=wind("coverage"))
 check("蓄電池OFFなら（モードが残っていても）エラーにしない", not cs0[4].startswith("エラー"), errdetail(cs0))
+
+# ============================================================
+print("\n【9. マイクログリッド（モードB）との組み合わせ（W2b）】")
+# MGの既定: 自営線 2km × 3,000万円/km、運営コストは投資額の2%、P-IRR期間20年。施設は1つ（束ねメリットの独立計算を単純にするため）
+MG_TOTAL = 150.0 * 158000 + 2.0 * 30000000     # PV（風力は設備を持たない）＋自営線
+MG_OPEX = MG_TOTAL * 0.02
+mg_w = run(wind_args=wind("coverage"), mg_enabled=True)
+mg_pv = run(mg_enabled=True)
+mt = mg_w[4]
+stm = mg_w[6]
+dm, pvm, wm, scm, infm = stm["demand_30min"], stm["gen_pv"], stm["gen_wind"], stm["sc_result"], stm["wind_info"]
+check("MG + 風力が動く", not mt.startswith("エラー"), errdetail(mg_w))
+# 受電点の基準で独立に再計算（蓄電池なし）
+Rm = np.maximum(0, dm - pvm)
+dlm = Rm - np.maximum(0, dm - pvm - wm)
+basic_saving = app.calc_electricity_cost(dm, md, **RATE)["annual_basic"] - app.calc_electricity_cost(Rm, md, **RATE)["annual_basic"]
+avg_price = 19.93 * 0.25 + 18.77 * 0.75               # 網内単価（PPA以外は電力量単価の加重平均）
+wind_cost = infm["payment_yen"] + float(dlm.sum()) * (2.15 + sur + 3.0)
+cf_expected = scm["annual_self"] * avg_price + basic_saving - MG_OPEX - wind_cost
+cf_got = num(mt, "年間キャッシュフロー:")
+check("年間キャッシュフロー = 網内売電 ＋ 束ね − 運営 − 風力の調達費用（独立に再計算）",
+      cf_got is not None and abs(cf_got - cf_expected) < 1.5, f"{cf_got} vs {cf_expected:.0f}")
+check("風力の調達費用の表示 = PPA支払 ＋ 届いた分の託送・賦課金・手数料", abs(num(mt, "風力の調達費用:") - wind_cost) < 1.5,
+      f"{num(mt, '風力の調達費用:')} vs {wind_cost:.0f}")
+irr_raw = app._calc_irr([-MG_TOTAL] + [cf_expected] * 20)
+if irr_raw is None:
+    # 既定のMG（自営線6,000万円）に、需要の100%相当の風力（PPA支払・託送等が売電収入を上回る）を足すと赤字になる
+    check("キャッシュフローが負なら P-IRR は『算出不可』と表示する", "算出不可" in mt and cf_expected < 0, f"cf={cf_expected:.0f}")
+else:
+    irr_got = num(mt, "P-IRR:", after="【P-IRR（")
+    check("P-IRR = 独立に再計算したキャッシュフローのIRR", irr_got is not None and abs(irr_got - irr_raw * 100) < 0.01,
+          f"{irr_got} vs {irr_raw * 100:.2f}")
+check("束ねメリット（基本料金差額）は風力の有無で変わらない（風力では契約電力が下がらない）",
+      num(mt, "基本料金差額:") == num(mg_pv[4], "基本料金差額:"), f"{num(mt, '基本料金差額:')} vs {num(mg_pv[4], '基本料金差額:')}")
+check("束ねメリット = 個別契約の基本料金 − 受電点基準のMG基本料金（再計算）", abs(num(mt, "基本料金差額:") - basic_saving) < 1.5)
+check("MGの初期投資に風力を含めない（MG投資合計 = PV＋自営線）", f"MG投資合計: {MG_TOTAL:,.0f} 円" in mt)
+mg_x = run(wind_args=wind("coverage", wheeling_yen=3.15), mg_enabled=True)
+check("託送を+1円/kWh → MGの年間キャッシュフローが 配達量×1円 だけ減る",
+      abs((cf_got - num(mg_x[4], "年間キャッシュフロー:")) - float(dlm.sum())) < 1.5)
+check("風力なしのMGには風力の行がない（従来の出力）", "風力" not in mg_pv[4])
+
+# PPA（MG）: 単価は（投資の回収＋風力の調達費用）÷ 網内に供給した全量。P-IRRは目標（10%）を下回らない
+crf = 0.10 * 1.10 ** 15 / (1.10 ** 15 - 1)
+lease_mg = MG_TOTAL * crf + MG_OPEX
+mg_ppa = run(business_model="PPA", wind_args=wind("coverage"), mg_enabled=True)
+pt = mg_ppa[4]
+ppa_paid = num(pt, "PPA支払:", after="【需要家メリット（")   # 風力の節の「PPA支払」ではなく、需要家メリットの節の値
+check("MG+PPA: PPA支払 = 投資の回収 ＋ 風力の調達費用（単価×全量）", abs(ppa_paid - (lease_mg + wind_cost)) < 1.5,
+      f"{ppa_paid} vs {lease_mg + wind_cost:.0f}")
+check("MG+PPA: 年間キャッシュフロー = 投資の回収 ＋ 束ね − 運営（風力の費用は単価で回収される）",
+      abs(num(pt, "年間キャッシュフロー:") - (MG_TOTAL * crf + basic_saving)) < 2.0,
+      f"{num(pt, '年間キャッシュフロー:')} vs {MG_TOTAL * crf + basic_saving:.0f}")
+check("MG+PPA: P-IRRは目標10%を下回らない（束ねメリット分だけ上回る）", num(pt, "P-IRR:", after="【P-IRR（") >= 10.0 - 0.01,
+      str(num(pt, "P-IRR:", after="【P-IRR（")))
+check("MG+PPA: 需要家年間メリット = 風力込みの年間メリット − 投資の回収分",
+      abs(num(pt, "需要家年間メリット:") - ((merit_pre - payment) - lease_mg)) < 2.0,
+      f"{num(pt, '需要家年間メリット:')} vs {(merit_pre - payment) - lease_mg:.0f}")
+mg_ls = run(business_model="リース", wind_args=wind("coverage"), mg_enabled=True)
+check("MG+リース: リース料は風力の有無で変わらない ＋ 需要家メリットは風力込み − リース料",
+      abs(num(mg_ls[4], "必要リース料:") - lease_mg) < 1.5
+      and abs(num(mg_ls[4], "需要家年間メリット:") - ((merit_pre - payment) - lease_mg)) < 2.0)
+
+# IRR: 全期間の収支が負だと符号が変わらずIRRは存在しない。以前はニュートン法が発散して OverflowError が画面のエラーになった
+check("_calc_irr: 全期間が負のキャッシュフローは例外を出さず None", app._calc_irr([-1e8] + [-3e6] * 20) is None
+      and app._calc_irr([-1e8] + [-1e7] * 20) is None and app._calc_irr([0.0] * 5) is None)
+check("_calc_irr: 通常のキャッシュフローは従来どおり（10年で元本回収なら0%）",
+      abs(app._calc_irr([-1000.0] + [100.0] * 10)) < 1e-6 and abs(app._calc_irr([-1000.0] + [200.0] * 10) - 0.1514) < 1e-3)
+
+# 複数施設: 束ねメリットの行が出て、完了する
+mg2 = run(wind_args=wind("coverage"), mg_enabled=True, num_facilities=2,
+          facility_args=fac_args([("役所・自治体庁舎", 4500, 1), ("公立小学校", 6900, 2)]))
+check("MG + 風力 + 複数施設が動く（束ねメリットの内訳が出る）",
+      not mg2[4].startswith("エラー") and "個別契約時基本料金合計" in mg2[4], errdetail(mg2))
 
 print("\n" + "=" * 70)
 print(f"結果: PASS {n_pass} / FAIL {n_fail}")
