@@ -43,6 +43,7 @@ A web-based simulator for **industrial-scale solar PV + battery storage systems*
 - **Optimal battery sizing** — Two-stage approach: (1) one-shot LP with battery capacity as a decision variable for fast optimum, (2) grid search across capacity range to visualize the cost/IRR/payback curves.
 - **CO₂ reduction calculation** — Default emission factor 0.000431 t-CO₂/kWh (Japan grid average).
 - **Data center mode** — Demand is generated from IT load × PUE (constant, air-cooled) instead of building presets. Capacity by scale preset (edge / small / medium / hyperscale — *provisional tiers*), direct IT kW, or racks × density; load shape from a CEC-derived commercial-DC profile, flat (AI training) or diurnal. Optional **grid receiving cap** (stay within 6.6 kV < 2,000 kW / 22·33 kV < 10,000 kW): enforced by the battery LP, and if the cap cannot be met the tool explains why and gives a lower-bound estimate of the battery needed.
+- **Wind power (offsite PPA)** — Add wind as a second generation source (solar only / wind only / both), for **Hokkaido and Tohoku only** (the demand site must be in the same area; cross-area wheeling is not modeled). Wind output = contract capacity × capacity factor × shape, where the shape is the 2025 half-hourly actual wind output of the area's transmission operator (normalized to mean 1.0) and the capacity factor (29.1%) and PPA price (¥11.96/kWh) come from the METI procurement-price committee. Wind is treated as an **offsite** source delivered over the grid: the delivered energy still incurs the **wheeling energy charge, renewable surcharge and retailer fee**, the **contract demand does not fall**, and only onsite solar surplus can be sold. The headline outputs are the **volume-based vs hourly (24/7) matching rates**, which show how much wind and battery are needed to get close to 24/7. Works with the industrial/microgrid modes (incl. P-IRR) and the data center mode (not with the grid receiving cap). Solar (Typical Meteorological Year) and wind (2025 actuals) are different datasets, so day-level coincidence is not reflected.
 
 ### 日本語
 
@@ -58,6 +59,7 @@ A web-based simulator for **industrial-scale solar PV + battery storage systems*
 - **最適容量探索** — 2段階アプローチ：(1) 蓄電池容量を決定変数に含めたLP一体化で高速に最適解を取得、(2) 容量範囲のグリッドサーチで コスト削減・P-IRR・投資回収年数のカーブを可視化。
 - **CO2削減量算出** — 排出係数デフォルト 0.000431 t-CO2/kWh（全国平均）。
 - **データセンターモード** — 施設プリセットの代わりに「IT負荷×PUE（一定値・空冷前提）」から需要を生成。容量は規模プリセット（エッジ／小規模／中規模／ハイパースケール。**区分は暫定値**）・IT容量の直接入力・ラック数×密度から指定し、負荷の形状はCEC由来の商用DC形状・定常（AI学習）・日変動から選択。**系統受電上限**（高圧6.6kV＝2,000kW未満／22・33kV＝10,000kW未満に収める）を指定でき、蓄電池の最適充放電（LP）で強制します。守れない場合は理由と、必要な蓄電池の下限の目安を表示します。
+- **風力発電（オフサイトPPA）** — 太陽光に加えて風力を第2の発電源として使えます（太陽光のみ／風力のみ／併用）。**北海道・東北のみ**（需要地も同じエリアに限り、越境託送はモデル化していません）。風力＝契約容量×設備利用率×形状で、形状は各エリアの一般送配電事業者が公表する2025年の風力発電実績（30分値。年平均=1.0に正規化）、設備利用率（29.1%）とPPA単価（11.96円/kWh）は調達価格等算定委員会の資料を出典にしています。風力は送配電網で届く**オフサイト電源**として扱い、届いた分にも**託送の電力量料金・再エネ賦課金・小売手数料**がかかり、**契約電力（基本料金）は下がらず**、売電できるのは敷地内の太陽光の余剰だけです。主役の出力は**量ベース達成率と時間一致率（24/7）**で、風力と蓄電池をどれだけ足すと24/7に近づくかを見られます。産業用・マイクログリッド（P-IRRを含む）とデータセンターで使えます（系統受電上限との併用は不可）。太陽光（平年値）と風力（2025年実績）は別のデータのため、日単位の同時性は反映されません。
 
 ---
 
@@ -118,6 +120,8 @@ This Space exposes its calculations as an [MCP](https://modelcontextprotocol.io/
 
 **Data center tools:** `estimate_dc_demand` / `validate_dc_params` → `simulate_dc`（データセンター用。受電上限を守れない条件では、エラーではなく理由と必要量の目安を返します）
 
+**Wind tools (Hokkaido / Tohoku only):** `list_wind_areas` / `estimate_wind_generation`。`validate_industrial_params` / `simulate_industrial_pv` / `validate_dc_params` / `simulate_dc` には任意引数 `wind`（`{"capacity_kw": 1000}` または `{"coverage_pct": 100}` ほか）と `pv_enabled` があり、省略すると従来と同じ結果です（風力を併用すると結果に `wind` 節と24/7の一致率が加わります）
+
 ```bash
 # Claude Code
 claude mcp add --scope user --transport http pv-sim-biz https://hachinai-pv-sim-biz.hf.space/gradio_api/mcp/
@@ -136,6 +140,8 @@ pv-sim-biz/
 ├── mcp_tools.py                # MCP tool definitions (validate/simulate API layer)
 ├── radiation.db                # NEDO METPV-20 weather DB (Git LFS)
 ├── comstock_*.csv              # 6 industrial demand presets
+├── wind_shape.csv              # Wind output shape (Hokkaido/Tohoku, 2025 half-hourly, mean 1.0)
+├── tools/build_wind_shape.py   # Dev script that builds wind_shape.csv (not needed at runtime)
 ├── requirements.txt
 ├── README.md                   # This file
 ├── LICENSE                     # MIT
@@ -144,9 +150,13 @@ pv-sim-biz/
 │   ├── design_spec.md          # Data center mode: design spec (canonical)
 │   ├── decision_log.md         # Data center mode: decision history
 │   ├── dc_load_data_sources.md # Data center load data: source survey
-│   └── hokkaido_power_voltage_tariff.md  # Hokkaido Electric voltage/tariff sources
+│   ├── hokkaido_power_voltage_tariff.md  # Hokkaido Electric voltage/tariff sources
+│   ├── wind_design_spec.md     # Wind power (offsite PPA): design spec (canonical)
+│   └── wind_agent_verification.md  # Wind MCP tools: agent verification procedure
 ├── test_mcp_tools.py / test_mcp_dc_tools.py   # MCP tool tests (industrial / data center)
 ├── test_dc_mode.py / test_grid_cap.py         # Data center demand, UI wiring, grid cap
+├── test_wind_shape.py / test_wind_mode.py     # Wind: data & calculation layer / run_simulation integration
+├── test_wind_ui.py / test_mcp_wind_tools.py   # Wind: UI wiring / MCP tools
 ├── prompt_verify_battery_bug.md      # Battery LP verification request
 ├── test_verify_battery_bug.py        # Battery LP pass-through bug check
 └── test_verify_battery_bug_result.txt
@@ -179,6 +189,10 @@ pv-sim-biz/
 - **PuLP** — Python LP modeler: https://coin-or.github.io/pulp/
 - **CEC 2025 IEPR** — *Data Center Methodology Memo* (source of the commercial data-center load shape used in data center mode): https://www.energy.ca.gov/media/12647
 - **LBNL Data Center and Industrial Electrical Load Shape Maker** — definitions of the flat profile and short-cycle noise bands: https://github.com/LBNL-DataCenter-CoE/shape_maker
+- **調達価格等算定委員会（資源エネルギー庁）** — 陸上風力（新設）の設備利用率の想定値29.1%、入札の平均落札価格11.96円/kWh（第112回、2026年1月）
+- **一般送配電事業者「エリア需給実績」（北海道電力ネットワーク・東北電力ネットワーク）** — 風力発電実績・風力出力制御量（30分値）。風力の形状の出典
+- **託送料金（北海道電力ネットワーク・東北電力ネットワーク）** — 高圧・特別高圧の電力量料金単価（標準接続送電、2025年10月〜）
+- **自然エネルギー財団「コーポレートPPA 日本の最新動向」** — フィジカルPPAの費用構造（託送・賦課金・小売手数料）。小売手数料の推定値の出典
 
 ---
 
