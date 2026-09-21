@@ -425,6 +425,11 @@ if cs_ok:
     opt_cap = num(cs_o[4], "最適蓄電池容量:")
     check("  最適容量が数値で出る（有限・0以上）", opt_cap is not None and opt_cap >= 0, str(opt_cap))
     check("  段階2のグリッドサーチが完了する", "段階2: グリッドサーチ】探索完了" in cs_o[4] and cs_o[3] is not None)
+    # 最適容量探索モードでは、上部の設備投資に入力欄の容量（別モードの値が残りうる）の蓄電池を数えない。
+    # 上部の需給・料金は蓄電池なしで計算しているので、費用だけ乗ると回収年数が数十〜百年に見える（W2d のUI確認で発見）
+    top = cs_o[4][cs_o[4].find("初期投資・投資回収"):cs_o[4].find("CO2削減量")]
+    check("  最適容量探索: 上部の設備投資に蓄電池の費用を入れない（太陽光のみ = 150kW × 158,000円）",
+          "設備投資合計: 23,700,000 円" in top and "kWh × " not in top and "蓄電池: 含めません" in top, top[:160])
     merit1 = num(cs_o[4], "年間コスト削減:", after="最適蓄電池容量探索")
     # 結果テキストの最適容量は小数1桁なので、同じ条件で段階1のLPを直接解いて正確な最適容量を得る
     st_c = cs_o[6]
@@ -436,6 +441,9 @@ if cs_ok:
     # 同じ容量で通常のLP（風力あり）を実行し、年間経済メリット（PPA支払後）と段階1の値が一致することを確認する
     lp_same = run(wind_args=wind("coverage"), bat_enabled=True, bat_mode="最適充放電（LP）", bat_capacity=float(cap_exact),
                   bat_max_charge=100.0, bat_max_discharge=100.0)
+    top2 = lp_same[4][lp_same[4].find("初期投資・投資回収"):lp_same[4].find("CO2削減量")]
+    check("  最適充放電（LP）モードでは従来どおり蓄電池の費用を数える（最適容量探索の修正の副作用がない）",
+          "蓄電池: " in top2 and "kWh × " in top2 and "蓄電池: 含めません" not in top2, top2[:160])
     merit2 = num(lp_same[4], "年間経済メリット:", after="風力込みの年間経済メリット")
     check("  段階1の年間コスト削減（風力PPA支払後）= 最適容量で通常LPを解いた年間経済メリット",
           merit1 is not None and merit2 is not None and abs(merit1 - merit2) <= 1.0 + 1e-6 * abs(merit2),

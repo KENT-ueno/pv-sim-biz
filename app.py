@@ -3466,7 +3466,9 @@ def run_simulation(
         bat_unit = bat_cost_per_kwh if bat_cost_per_kwh is not None else BATTERY_COST_PER_KWH
         pv_investment = total_ppeak * pv_unit
         bat_investment = 0
-        if bat_enabled and bat_capacity and bat_capacity > 0:
+        # 最適容量探索モードでは、上部の需給・料金は蓄電池なしで計算している（蓄電池は下の探索で別に評価する）。
+        # 入力欄の容量（別モードで入れた値が残りうる）で費用だけ数えると、動かしていない蓄電池の費用が乗ってしまう
+        if bat_enabled and bat_capacity and bat_capacity > 0 and battery_mode_label != "最適容量探索":
             bat_investment = bat_capacity * bat_unit
         total_investment = pv_investment + bat_investment
 
@@ -3494,6 +3496,9 @@ def run_simulation(
         result_text += f"  PV: {total_ppeak:.1f} kW × {pv_unit:,.0f} 円/kW = {pv_investment:,.0f} 円\n"
         if bat_investment > 0:
             result_text += f"  蓄電池: {bat_capacity:.1f} kWh × {bat_unit:,.0f} 円/kWh = {bat_investment:,.0f} 円\n"
+        elif bat_enabled and battery_mode_label == "最適容量探索":
+            result_text += ("  蓄電池: 含めません（最適容量探索モードでは、この節は蓄電池なしの試算です。"
+                            "蓄電池込みの投資額・回収年数は下の「最適蓄電池容量探索」を参照）\n")
         if substation_cost > 0:
             result_text += f"  特別高圧工事費: {cost_before['contract_power_kw']:.0f} kVA × {sub_unit:,.0f} 円/kVA = {substation_cost:,.0f} 円\n"
         result_text += f"  設備投資合計: {total_investment:,.0f} 円\n"
