@@ -1,6 +1,6 @@
 # 風力発電（オフサイトPPA）機能 設計計画
 
-**状態:** 承認済み（2026-09-20）。**W0・W1・W2・W2c・W2b・W3・W4 完了**（W4は未コミット）、W5 以降は未着手。
+**状態:** 承認済み（2026-09-20）。**W0・W1・W2・W2c・W2b・W3・W4・W5 完了**（W5は未コミット）。残りは W2d・W6（候補）。
 W2c＝ユーザー指摘（託送料金の反映漏れ）による経済性の作り直し（§5-4）
 **想定分担:** 本書＝設計（Opus）／実装＝別セッション（Sonnet）
 **前提となる調査:** `docs/decision_log.md` 第13段階（風力データ調査）
@@ -442,7 +442,7 @@ def run_simulation(..., demand_source=DEMAND_SOURCE_INDUSTRIAL, dc_args=None,
 | **W2d**（候補） | LPに「風力の配達量」変数を足し、受電上限・最適容量探索・LPの目的関数を受電点基準にする | 受電上限を守る。LPの実行時間が許容内 |
 | **W3** ✅ | UI（チェックボックス・アコーディオン・グラフ・注記） | `test_wind_ui.py` PASS 46（UI配線・変換・表示切替・グラフの内訳）。変異10件を検出。風力OFFは70項目バイト一致。ブラウザで動作確認済み。**Firefoxでのユーザー確認は未** |
 | **W4** ✅ | MCPツール2本追加（`list_wind_areas` / `estimate_wind_generation`）＋`simulate_*` / `validate_*` に `wind`・`pv_enabled` | `test_mcp_wind_tools.py` PASS 74（UIと数値一致・入力検証・型）。省略時は従来の出力とバイト同一（12ケース）。変異15件を検出。プロトコル層で型確認済み。**Codex・Claude Code での実機検証は未** |
-| **W5** | 文書（`design_spec.md` に風力の節、`decision_log.md` に判断、`CLAUDE.md` の要約とテスト一覧、`architecture.md`） | 設計の正典が docs/ に揃う |
+| **W5** ✅ | 文書（README・`architecture.md` §14・`design_spec.md` からの参照・`decision_log.md`・`CLAUDE.md`・実機検証の手順書 `wind_agent_verification.md`） | 設計の正典が docs/ に揃う。**実機検証は本番反映後** |
 | **W6**（候補） | オフサイト太陽光（発電所の場所の日射で発電量を作り、オフサイト電源のリストに加える） | §5-4「将来」。Xを用意できたエリア内に限る |
 
 ### 厳守事項（既存の規約から）

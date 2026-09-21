@@ -39,8 +39,11 @@ The application supports two business modes within a single UI:
 ```
 pv-sim-biz/
 ├── app.py                # Standalone main application
+├── mcp_tools.py          # MCP tool definitions (validate/simulate API layer)
 ├── radiation.db          # NEDO METPV-20 weather DB (50 sites, 10 elements, Git LFS)
 ├── comstock_*.csv        # 6 industrial demand presets (per-m² intensity)
+├── wind_shape.csv        # Wind output shape, Hokkaido/Tohoku (2025 half-hourly, mean 1.0)
+├── tools/build_wind_shape.py  # Dev script that builds wind_shape.csv (not needed at runtime)
 ├── requirements.txt
 ├── README.md             # HF Spaces metadata + project description
 ├── LICENSE               # MIT
@@ -322,6 +325,8 @@ If future extensions add per-time-slot purchase prices, VPP/ancillary revenue, o
 - **Tariff library**: Multi-region tariff support (Kansai EP, Chubu EP, Kyushu EP, etc.)
 - **Solver options**: Optional HiGHS solver for faster LP solves
 - **Sensitivity analysis**: Tornado charts for input parameter sensitivity on P-IRR
+- **Wind + grid receiving cap / optimal battery sizing** (W2d): add a "delivered wind" variable to the LP so that the grid cap and the sizing economics are evaluated at the receiving point
+- **Offsite solar** (W6): the offsite-source list is already multi-source; add a generation site's weather to it
 
 ---
 
@@ -332,3 +337,57 @@ If future extensions add per-time-slot purchase prices, VPP/ancillary revenue, o
 - **NEDO METPV-20** — Japanese solar irradiance database
 - **NREL ComStock EULP** — https://comstock.nrel.gov/page/datasets
 - **PuLP** — https://coin-or.github.io/pulp/
+
+---
+
+## 14. Wind Power (Offsite PPA) / 風力発電（オフサイトPPA）
+
+設計の正典は [`wind_design_spec.md`](wind_design_spec.md)、経緯は `decision_log.md` 第13段階。ここでは実装の要点だけを記す。
+
+### 14.1 Model / モデル
+
+```
+wind(t) [kW] = min( capacity × capacity factor × shape(t), capacity )
+```
+
+- **水準と形状の分離**（データセンターの需要モデルと同じ）。形状は `wind_shape.csv`（北海道・東北。一般送配電事業者の「エリア需給実績」2025年の
+  `風力発電実績 + 風力出力制御量` ＝出力制御前を年平均1.0に正規化）。設備利用率29.1%・PPA単価11.96円/kWhは調達価格等算定委員会（第112回）
+- **METPV-20の風速は使わない**: 日射との日内相関が+0.78で、ハブ高への外挿指数の仮定（0.10〜0.30）で設備利用率が3倍動き、仮定が答えを決めてしまうため
+- 対象エリアは北海道・東北のみ。需要地（観測地点）も同じエリアに限る（`WIND_STATION_AREA`。東北は「東北6県＋新潟」で8地点）
+
+### 14.2 Offsite billing / オフサイトの料金計算
+
+風力は送配電網で届くので、敷地内の太陽光とは経済性が違う（`offsite_receiving` / `offsite_cost_after`）。
+
+```
+受電量        R(t) = max(0, 需要 + 充電 − 放電 − 敷地内の太陽光)     ← 契約電力・受電上限の基準
+小売から買う量      = 運転結果の系統購入 import_(t)
+風力の配達量  D(t) = clip(R − import_, 0, 風力発電量)
+導入後の電気代 = 基本料金(R の最大) + 電力量料金(小売から買う量) + Σ D × (託送の電力量料金 + 再エネ賦課金 + 小売手数料)
+風力PPA支払    = 風力の年間発電量 × PPA単価         （pay-as-produced。無駄になった分も支払う）
+```
+
+- **契約電力は風力では下がらない**（受電点の最大は届いた風力も含む）。売電・出力抑制の対象は敷地内の太陽光の余剰だけ
+- 蓄電池の**運転**は太陽光＋風力を合わせた発電で行い（風力の余剰を貯めて凪の時間に使う）、**料金だけ**受電点基準で計算し直す
+- 託送の電力量料金は一次資料（北海道電力NW・東北電力NW、2025年10月〜、税込表示）。小売手数料は自然エネルギー財団の推定値
+- マイクログリッド（W2b）: 収益＝網内に供給した全量×網内単価＋束ねメリット、費用＝運営コスト＋風力の調達費用。
+  PPA（MG）の単価は（投資の回収＋風力の調達費用）÷ 網内に供給した全量で逆算
+
+### 14.3 Outputs / 出力
+
+主役は **量ベース達成率**（年間の発電量 ÷ 年間の需要量）と **時間一致率**（1 − 系統購入/需要。24/7の実力）。両者の差が
+「年間では足りていてもその時間には足りていない分」。蓄電池なしの参考（太陽光のみ／風力のみ／合計）と月別の表を出す。
+
+### 14.4 Not supported together / 併用できないもの
+
+蓄電池LP・最適容量探索は風力を敷地内の発電と同じに扱って最適化するため、受電点基準の制約や経済性を評価できない。次は**明示エラー**にする:
+データセンターの系統受電上限、最適容量探索（解決は W2d: LPに「風力の配達量」の変数を足す）。
+
+### 14.5 Files / ファイル
+
+| ファイル | 役割 |
+|---|---|
+| `app.py` | `WIND_AREA_META` / `resolve_wind` / `build_wind_30min` / `offsite_receiving` / `offsite_cost_after` / `format_247` / UI |
+| `mcp_tools.py` | `list_wind_areas` / `estimate_wind_generation` と、`simulate_*` / `validate_*` の `wind`・`pv_enabled` |
+| `wind_shape.csv`, `tools/build_wind_shape.py` | 形状データと、その生成スクリプト |
+| `test_wind_shape.py` / `test_wind_mode.py` / `test_wind_ui.py` / `test_mcp_wind_tools.py` | 計算層 / `run_simulation` 統合 / UI配線 / MCPツール |

@@ -833,6 +833,9 @@ IT_load(t) = IT_base(t) + IT_flex(t)
 
 ## 11. 開発フェーズ
 
+> **風力発電（オフサイトPPA）の追加**（2026-09-20〜）は別書 [`wind_design_spec.md`](wind_design_spec.md) が正典。
+> データセンターにも風力を併用できる（系統受電上限とは併用不可）。判断の経緯は `decision_log.md` 第13段階。
+
 | Phase | 内容 | 完了条件 |
 |---|---|---|
 | **0** ✅ | リポジトリ準備。bizから計算ロジックを移植し §4-2 を削除、`radiation.db` 配置、北海道電力タリフ、DC需要（PUE一定）、UI骨組み。**HF Space作成はローカル完成後に延期**（2026-09-06 ユーザー判断。§13の枠確保判断もPhase 4まで不要になった） | ✅ `python app.py` 起動確認済み／`test_dc_smoke.py` 全PASS |

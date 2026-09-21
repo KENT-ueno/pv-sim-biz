@@ -315,6 +315,8 @@ PUEを一定値に簡略化してUI上の差異が縮小したことから、本
 | `docs/decision_log.md` | **判断の変遷**。なぜ独立Spaceをやめたか、案A〜Eの比較と却下理由 |
 | `docs/dc_load_data_sources.md` | DC負荷データ6候補の調査と一次資料での検証記録 |
 | `docs/hokkaido_power_voltage_tariff.md` | 北海道電力の受電電圧・タリフの一次ソース |
+| `docs/wind_design_spec.md` | **風力発電（オフサイトPPA）の設計の正典**。ペルソナと問い・データ方針・費用構造・作業段階 |
+| `docs/wind_agent_verification.md` | 風力MCPツールの Codex / Claude Code 実機検証の手順書（期待値つき。実施は未） |
 
 ### 需要モデルの核心（設計書 §5-7）
 
@@ -462,8 +464,8 @@ demand(t) = IT定格容量 × IT負荷率(年平均) × 形状(t) × PUE × 0.5 
 | W2c | 経済性を受電点基準に作り直し（託送・賦課金・手数料・契約電力は下がらない）。ユーザー指摘による | ✅ 完了・コミット済み |
 | W2b | MG（モードB）への反映（風力の調達費用・PPA単価の逆算・P-IRR。`_calc_irr` の発散バグも修正） | ✅ 完了・コミット済み |
 | W3 | UI（風力の設定欄・太陽光を使うチェック・エリア表示・グラフの積み上げ）。任意入力は空欄＝既定のテキスト欄 | ✅ 完了・コミット済み（日別グラフはユーザーが確認済み。月別の積み上げの見た目は未確認） |
-| W4 | MCPツール（`list_wind_areas` / `estimate_wind_generation` ＋ `simulate_*` / `validate_*` に `wind`・`pv_enabled`。計9ツール） | ✅ 完了（未コミット。Codex・Claude Code での実機検証は未） |
-| W5 | 文書の仕上げ | 未着手 |
+| W4 | MCPツール（`list_wind_areas` / `estimate_wind_generation` ＋ `simulate_*` / `validate_*` に `wind`・`pv_enabled`。計9ツール） | ✅ 完了・コミット済み（Codex・Claude Code での実機検証は未） |
+| W5 | 文書の仕上げ（README・architecture・設計書の参照・実機検証の手順書） | ✅ 完了（未コミット）。**実機検証（Codex・Claude Code）は本番反映後に実施** |
 
 ---
 
