@@ -465,7 +465,14 @@ demand(t) = IT定格容量 × IT負荷率(年平均) × 形状(t) × PUE × 0.5 
 | W2b | MG（モードB）への反映（風力の調達費用・PPA単価の逆算・P-IRR。`_calc_irr` の発散バグも修正） | ✅ 完了・コミット済み |
 | W3 | UI（風力の設定欄・太陽光を使うチェック・エリア表示・グラフの積み上げ）。任意入力は空欄＝既定のテキスト欄 | ✅ 完了・コミット済み（日別グラフはユーザーが確認済み。月別の積み上げの見た目は未確認） |
 | W4 | MCPツール（`list_wind_areas` / `estimate_wind_generation` ＋ `simulate_*` / `validate_*` に `wind`・`pv_enabled`。計9ツール） | ✅ 完了・コミット済み（Codex・Claude Code での実機検証は未） |
-| W5 | 文書の仕上げ（README・architecture・設計書の参照・実機検証の手順書） | ✅ 完了（未コミット）。**実機検証（Codex・Claude Code）は本番反映後に実施** |
+| W5 | 文書の仕上げ（README・architecture・設計書の参照・実機検証の手順書） | ✅ 完了・**本番反映済み**。実機検証（Codex・Claude Code）は未実施 |
+
+**本番反映の記録（2026-09-21、`main` = d8b7ece。HF Space と GitHub に push）:** W0〜W5 を `main` に fast-forward。
+本番の確認: MCP（プロトコル層）で公開ツール9つ・`wind`/`pv_enabled` のスキーマ・風力の結果がローカルの期待値と一致（仙台10,000kW=21,549,600kWh、
+産業用+風力の配達量117,454kWh・メリット1,952,675円、DC+風力の配達量3,896,720kWh）・入力エラー2種・数値が数値のまま。
+**`wind` を省略した既存ツール（`simulate_industrial_pv` / `simulate_dc`）の出力は風力追加前とバイト同一。**
+本番UIでも、風力の設定欄・調達エリア表示・DCタブでの風力あり計算（風力2,549,160kWh）を確認。コンソールのエラーは既知の404が1件のみ。
+**未実施:** Codex・Claude Code からの自然言語での実機検証（手順は `docs/wind_agent_verification.md`）。pv-sim-gh 側の `.gitignore`（`65baf9b`）は未push。
 
 ---
 
