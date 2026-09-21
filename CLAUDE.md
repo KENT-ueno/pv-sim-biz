@@ -477,7 +477,11 @@ demand(t) = IT定格容量 × IT負荷率(年平均) × 形状(t) × PUE × 0.5 
 産業用+風力の配達量117,454kWh・メリット1,952,675円、DC+風力の配達量3,896,720kWh）・入力エラー2種・数値が数値のまま。
 **`wind` を省略した既存ツール（`simulate_industrial_pv` / `simulate_dc`）の出力は風力追加前とバイト同一。**
 本番UIでも、風力の設定欄・調達エリア表示・DCタブでの風力あり計算（風力2,549,160kWh）を確認。コンソールのエラーは既知の404が1件のみ。
-**未実施:** Codex・Claude Code からの自然言語での実機検証（手順は `docs/wind_agent_verification.md`）。pv-sim-gh 側の `.gitignore`（`65baf9b`）は未push。
+**未実施:** Codex・Claude Code からの自然言語での実機検証（手順は `docs/wind_agent_verification.md`）。pv-sim-gh 側の `.gitignore`（`65baf9b`）は push 済み（gh のMCPは4ツールで確認）。
+
+**W2d の本番反映の記録（2026-09-21、`main` = d57e235。HF Space と GitHub に push）:** W2d（蓄電池LPを受電点の基準で解く）を `main` に fast-forward。
+本番の確認（MCP プロトコル層）: 公開ツールは9つのまま。風力×受電上限（DC）の `validate_dc_params` は valid=true（受電量に対する上限の警告つき）。
+`simulate_dc`（札幌・IT1,000kW・定常・PV3,000kW・風力60%）の3ケースがローカルの直接呼び出しと主要な数値まで一致: LP＋上限9,999kW＝`enforced`・導入後ピーク1,051.1kW・風力の配達量4,566,593kWh・年間経済メリット62,040,389円・時間一致率74.9%（本番で約14秒）／ルールベース＋上限1,999kW＝`not_enforced`・導入後ピーク1,764.5kW（受電量の最大）／上限300kW＝`grid_cap_infeasible`。出力は標準の型だけ。**`wind` を省略した既存ツールの出力は風力追加前とバイト同一**、産業用＋風力（蓄電池なし。S3）も従来の期待値と一致。**未実施:** UIのブラウザ確認、Codex・Claude Code からの実機検証（S6 は W2d でエラーから計算に変わった）。
 
 ---
 
