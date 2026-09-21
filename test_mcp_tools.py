@@ -270,6 +270,29 @@ v_mg_err = mcp_tools.validate_industrial_params(
 check("MG範囲外パラメータでvalid=False", not v_mg_err["valid"])
 check("MGエラーが複数件", len(v_mg_err["errors"]) >= 2, v_mg_err["errors"])
 
+# 異常系: faces / facilities の未知のキー（黙って無視すると、既定値（方位角180°など）で計算して誤った数字を返すため明示エラーにする）
+print("\n【未知のキー】")
+FAC_OK = [{"building_type": "office", "floor_area_m2": 4500.0, "building_count": 1}]
+FACE_OK = {"ppeak_kw": 150.0, "tilt_deg": 30.0, "azimuth_deg": 180.0}
+v_k1 = mcp_tools.validate_industrial_params(station_no="34392", faces=[{"capacity_kw": 150.0, "tilt": 30, "azimuth": 0}], facilities=FAC_OK)
+check("faces の別名キー（capacity_kw / tilt / azimuth）は valid=False", not v_k1["valid"])
+txt1 = " ".join(v_k1["errors"])
+check("  正しいキーの候補を示す（ppeak_kw / tilt_deg / azimuth_deg）",
+      "'ppeak_kw'" in txt1 and "'tilt_deg'" in txt1 and "'azimuth_deg'" in txt1, txt1[:120])
+check("  方位角の向きの補足（北=0,南=180）は要素ごとに1回だけ", txt1.count("南=180") == 1, str(txt1.count("南=180")))
+v_k2 = mcp_tools.validate_industrial_params(station_no="34392", faces=[dict(FACE_OK, azimth_deg=0)], facilities=FAC_OK)
+check("綴りの誤り（azimth_deg）も、近いキー（azimuth_deg）を候補にして valid=False",
+      not v_k2["valid"] and "'azimuth_deg'" in " ".join(v_k2["errors"]))
+v_k3 = mcp_tools.validate_industrial_params(station_no="34392", faces=[FACE_OK],
+                                            facilities=[{"type": "office", "area": 4500.0, "count": 1}])
+check("facilities の別名キー（type / area / count）は valid=False で、building_type / floor_area_m2 / building_count を示す",
+      not v_k3["valid"] and all(k in " ".join(v_k3["errors"]) for k in ("'building_type'", "'floor_area_m2'", "'building_count'")))
+check("正しいキーだけなら valid=True（従来どおり）", mcp_tools.validate_industrial_params(station_no="34392", faces=[FACE_OK], facilities=FAC_OK)["valid"])
+s_k = mcp_tools.simulate_industrial_pv(station_no="34392", faces=[{"capacity_kw": 150.0}], facilities=FAC_OK)
+check("simulate_industrial_pv も未知のキーは計算せずエラー（既定値で黙って計算しない）", "error" in s_k and "ppeak_kw" in str(s_k))
+e_k = mcp_tools.estimate_pv_generation(station_no="34392", faces=[{"ppeak_kw": 150.0, "azimuth": 0}])
+check("estimate_pv_generation も同様", "error" in e_k and "azimuth_deg" in str(e_k))
+
 # ------------------------------------------------------------
 print("\n" + "=" * 70)
 print(f"結果: PASS {n_pass} / FAIL {n_fail}")

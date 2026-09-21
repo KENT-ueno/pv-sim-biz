@@ -173,6 +173,49 @@ def _resolve_station(station_no: str):
     return lat, lon, ghi_df, temp_df, row[0]
 
 
+# 辞書の要素で許すキーと、よくある誤りの別名 → 正しいキー（未知のキーを黙って無視すると、既定値で計算して誤った数字を返すため）
+_FACE_KEYS = ("ppeak_kw", "tilt_deg", "azimuth_deg", "pcs_limit_kw")
+_FACE_ALIASES = {
+    "capacity_kw": "ppeak_kw", "capacity": "ppeak_kw", "power_kw": "ppeak_kw", "kw": "ppeak_kw", "kwp": "ppeak_kw",
+    "peak_kw": "ppeak_kw", "pv_kw": "ppeak_kw", "ppeak": "ppeak_kw",
+    "tilt": "tilt_deg", "angle": "tilt_deg", "slope": "tilt_deg", "tilt_angle": "tilt_deg",
+    "azimuth": "azimuth_deg", "azimuth_angle": "azimuth_deg", "orientation": "azimuth_deg", "direction": "azimuth_deg",
+    "pcs_kw": "pcs_limit_kw", "pcs_limit": "pcs_limit_kw", "pcs": "pcs_limit_kw", "pcs_limit_kw ": "pcs_limit_kw",
+}
+_FACILITY_KEYS = ("building_type", "floor_area_m2", "building_count")
+_FACILITY_ALIASES = {
+    "type": "building_type", "facility_type": "building_type", "kind": "building_type", "building": "building_type",
+    "area": "floor_area_m2", "floor_area": "floor_area_m2", "area_m2": "floor_area_m2", "m2": "floor_area_m2",
+    "floor_area_sqm": "floor_area_m2",
+    "count": "building_count", "num": "building_count", "buildings": "building_count", "n_buildings": "building_count",
+}
+
+
+def _unknown_key_errors(where, obj, allowed, aliases, note=""):
+    """辞書 obj の未知のキーを、正しいキーの候補つきのエラー文にする（無ければ空リスト）。
+
+    未知のキーを黙って無視すると、既定値（例: 方位角180°）で計算して誤った数字を返すため、明示エラーにする。
+    候補は、よくある誤りの別名表 → なければ綴りの近いキー（difflib）の順で探す。
+    """
+    import difflib
+    errs = []
+    for k in obj:
+        if k in allowed:
+            continue
+        hint = aliases.get(k) or aliases.get(str(k).strip().lower())
+        if hint is None:
+            close = difflib.get_close_matches(str(k), allowed, n=1, cutoff=0.6)
+            hint = close[0] if close else None
+        msg = f"{where} に未知のキー {k!r} があります"
+        if hint:
+            msg += f"。{hint!r} の誤りではありませんか"
+        msg += f"（使えるキー: {list(allowed)}）"
+        errs.append(msg)
+    if errs and note:
+        errs[-1] += note   # 補足は要素ごとに1回だけ
+    return errs
+
+
 def _normalize_faces(faces):
     """faces（list[dict]）を検証し、calculate_generation用のface dictリストに変換する。
 
@@ -192,6 +235,11 @@ def _normalize_faces(faces):
     for i, f in enumerate(faces):
         if not isinstance(f, dict):
             errors.append(f"faces[{i}] はオブジェクト（辞書）で指定してください")
+            continue
+        unknown = _unknown_key_errors(f"faces[{i}]", f, _FACE_KEYS, _FACE_ALIASES,
+                                      note="。方位角は 北=0,東=90,南=180,西=270 の数値（azimuth_deg）")
+        if unknown:
+            errors.extend(unknown)
             continue
         ppeak = f.get("ppeak_kw")
         if ppeak is None or not (0 < ppeak <= MAX_PPEAK_KW):
@@ -248,6 +296,10 @@ def _normalize_facilities(facilities):
     for i, fac in enumerate(facilities):
         if not isinstance(fac, dict):
             errors.append(f"facilities[{i}] はオブジェクト（辞書）で指定してください")
+            continue
+        unknown = _unknown_key_errors(f"facilities[{i}]", fac, _FACILITY_KEYS, _FACILITY_ALIASES)
+        if unknown:
+            errors.extend(unknown)
             continue
         btype_key = fac.get("building_type")
         if btype_key not in BUILDING_TYPE_MAP:
