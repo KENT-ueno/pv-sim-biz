@@ -325,7 +325,6 @@ If future extensions add per-time-slot purchase prices, VPP/ancillary revenue, o
 - **Tariff library**: Multi-region tariff support (Kansai EP, Chubu EP, Kyushu EP, etc.)
 - **Solver options**: Optional HiGHS solver for faster LP solves
 - **Sensitivity analysis**: Tornado charts for input parameter sensitivity on P-IRR
-- **Wind + grid receiving cap / optimal battery sizing** (W2d): add a "delivered wind" variable to the LP so that the grid cap and the sizing economics are evaluated at the receiving point
 - **Offsite solar** (W6): the offsite-source list is already multi-source; add a generation site's weather to it
 
 ---
@@ -378,10 +377,20 @@ wind(t) [kW] = min( capacity × capacity factor × shape(t), capacity )
 主役は **量ベース達成率**（年間の発電量 ÷ 年間の需要量）と **時間一致率**（1 − 系統購入/需要。24/7の実力）。両者の差が
 「年間では足りていてもその時間には足りていない分」。蓄電池なしの参考（太陽光のみ／風力のみ／合計）と月別の表を出す。
 
-### 14.4 Not supported together / 併用できないもの
+### 14.4 Battery LP at the receiving point / 蓄電池LPを受電点の基準で解く（W2d）
 
-蓄電池LP・最適容量探索は風力を敷地内の発電と同じに扱って最適化するため、受電点基準の制約や経済性を評価できない。次は**明示エラー**にする:
-データセンターの系統受電上限、最適容量探索（解決は W2d: LPに「風力の配達量」の変数を足す）。
+風力（送配電網で届くオフサイト電源）があるとき、蓄電池LP（最適充放電・最適容量探索）は**受電点の基準**で解く。
+`optimize_battery` / `optimize_battery_capacity` の `offsite` 引数（`offsite_lp_spec` の戻り値。省略で従来のLPとビット同一）:
+
+- `generation_30min` には敷地内の太陽光だけを渡す。変数は受電量 R（契約電力・受電上限の基準）と、風力の配達分 w（w ≤ R、w ≤ 風力発電量）
+- 収支: R + PV + 放電 = 需要 + 充電 + 売電 + 抑制。売電・抑制はそのコマの太陽光の余剰以下（風力は売電できない）
+- 目的: 基本料金×max(R) ＋ Σ((R−w)×小売単価 ＋ w×(託送＋賦課金＋手数料)) − 売電。風力PPA支払は定数なのでLPに入れず、最適容量探索の年間メリットから引く
+- 受電上限は R の上限。風力は上限を守る助けにならないので、`diagnose_grid_cap` は太陽光だけで診断する
+- 受電点では買電と売電が相殺される。売電単価が風力の配達単価を上回ると、LPが「風力を受電して太陽光を売る」運転を選んでしまうので、
+  **LP内の売電単価だけ**を抑え（`offsite_lp_sell_price`）、実際の収入は返ってきた運転を実際の単価で評価し直す
+- ルールベース・蓄電池なしは従来どおり太陽光＋風力の合計で運転し、料金だけ受電点の基準で計算し直す
+
+併用できない機能は、現在ない（DCの受電上限・最適容量探索・MGとも併用できる）。詳細は `docs/wind_design_spec.md` §5-4。
 
 ### 14.5 Files / ファイル
 
