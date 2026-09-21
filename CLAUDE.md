@@ -360,7 +360,7 @@ demand(t) = IT定格容量 × IT負荷率(年平均) × 形状(t) × PUE × 0.5 
 - **既存の産業用・MGの機能は一切削除しない。** DCは需要タイプの追加であって置き換えではない
 - **移植した計算層は追加のみ**で既存コードパスに触れていない。この性質を保つこと
 - **変更後は必ず既存テストを全部回す**（回帰の有無を確認）:
-  `test_fable5_fixes.py`（PASS 24）／`test_mcp_tools.py`（PASS 45）／`test_verify_battery_bug.py`／
+  `test_fable5_fixes.py`（PASS 24）／`test_mcp_tools.py`（PASS 53。未知のキーの明示エラーを含む）／`test_verify_battery_bug.py`／
   `test_dc_mode.py`（PASS 48。DC需要・分岐・UI配線）／`test_azimuth_input.py`（PASS 19。方位角欄の解釈）／
   `test_grid_cap.py`（PASS 75。受電上限・診断・LP。診断の健全性は乱数60ケースで診断⇔LPの実行可否が完全一致）／
   `test_mcp_dc_tools.py`（PASS 126。DCのMCPツール。UI（run_simulation）との数値一致・受電上限の各状態・入力検証・出力がJSON標準の型だけ）／
