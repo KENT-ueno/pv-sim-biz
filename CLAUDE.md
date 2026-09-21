@@ -366,7 +366,7 @@ demand(t) = IT定格容量 × IT負荷率(年平均) × 形状(t) × PUE × 0.5 
   `test_mcp_dc_tools.py`（PASS 126。DCのMCPツール。UI（run_simulation）との数値一致・受電上限の各状態・入力検証・出力がJSON標準の型だけ）／
   `test_wind_shape.py`（PASS 86。風力の形状データ・地点→エリア対応・計算層）／
   `test_wind_mode.py`（PASS 124。風力の `run_simulation` 統合。受電点基準の料金・託送・売電の帰属・MG（W2b）を、別経路で再計算した値と照合。約40秒）／
-  `test_wind_lp.py`（PASS 99。風力を受電点の基準で解くLP。scipy.linprogの独立実装との最適値一致・不変条件・FIT裁定なし。約2分）／
+  `test_wind_lp.py`（PASS 101。風力を受電点の基準で解くLP。scipy.linprogの独立実装との最適値一致・不変条件・FIT裁定なし。約2分）／
   `test_wind_ui.py`（PASS 46。風力のUI。「計算」ボタンの関数をUIの入力の並びどおりに呼ぶ配線テスト、入力の変換、表示切替、グラフの内訳。約8秒）／
   `test_mcp_wind_tools.py`（PASS 82。風力のMCPツール。UI（run_simulation）との数値一致・入力検証・出力がJSON標準の型だけ。約25秒）
 - **MCPの計算は `run_simulation` を呼ばず、`_run_industrial_simulation` が独立に持っている。** UIの経済性を変えたら、MCP側にも移す（風力は `offsite_receiving` 等をUIと共有して二重実装を避けた）。`wind` を省略したときの出力は従来とバイト同一でなければならない
