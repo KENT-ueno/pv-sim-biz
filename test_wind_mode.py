@@ -242,20 +242,29 @@ for label, over in (("ルールベース", dict(bat_enabled=True, bat_capacity=2
     scb, Db, pvb, wb = stb["sc_result"], stb["demand_30min"], stb["gen_pv"], stb["gen_wind"]
     off = app.offsite_receiving(pvb, [stb["wind_info"]], Db, scb)
     chb, disb = scb["battery_charge"], scb["battery_discharge"]
-    resid = scb["import_"] + pvb + wb + disb - (Db + chb + scb["export"] + scb["curtailment"])
+    if label == "LP":
+        # LPは受電点の基準で解く（W2d）: 収支は 受電量 R + 太陽光 + 放電 = 需要 + 充電 + 売電 + 抑制（風力は R の一部）
+        resid = scb["offsite_receive"] + pvb + disb - (Db + chb + scb["export"] + scb["curtailment"])
+    else:
+        # ルールベースは太陽光＋風力の合計で運転する
+        resid = scb["import_"] + pvb + wb + disb - (Db + chb + scb["export"] + scb["curtailment"])
     check(f"{label}: 運転のエネルギー収支が成り立つ（残差 1e-4 kWh 以内）", float(np.abs(resid).max()) < 1e-4,
           f"{float(np.abs(resid).max()):.1e}")
     check(f"{label}: 受電量 R ≧ 小売購入、配達量は 0〜風力発電量", bool((off["receive"] >= scb["import_"] - 1e-9).all()
           and (off["delivered"] >= 0).all() and (off["delivered"] <= wb + 1e-9).all()))
-    check(f"{label}: 太陽光の余剰 ＋ 無駄になった風力 = 運転結果（プール）の余剰（売電＋抑制）",
-          abs(float(off["pv_surplus"].sum() + off["wasted_by_source"][0].sum())
-              - float((scb["export"] + scb["curtailment"]).sum())) < 0.5)
+    if label == "LP":
+        check("LP: 太陽光の余剰 = LPの売電＋抑制（風力は売電・抑制の対象外）",
+              abs(float(off["pv_surplus"].sum()) - float((scb["export"] + scb["curtailment"]).sum())) < 1e-6)
+    else:
+        check(f"{label}: 太陽光の余剰 ＋ 無駄になった風力 = 運転結果（プール）の余剰（売電＋抑制）",
+              abs(float(off["pv_surplus"].sum() + off["wasted_by_source"][0].sum())
+                  - float((scb["export"] + scb["curtailment"]).sum())) < 0.5)
     check(f"{label}: 完了して受電点基準の料金が出る", "風力では下がりません" in ob[4] and not ob[4].startswith("エラー"))
 lpw = run(wind_args=wind("coverage"), bat_enabled=True, bat_mode="最適充放電（LP）", bat_capacity=100.0,
           bat_max_charge=50.0, bat_max_discharge=50.0)
-check("LP+風力: LPは風力を敷地内と同じに扱う旨の注記を出し、最適化年間コストは出さない",
-      "敷地内の発電と同じに扱って最適化" in lpw[4]
-      and "最適化年間コスト:" not in lpw[4] and "最適化ピークデマンド:" not in lpw[4])
+check("LP+風力: LPは受電点の基準で解く旨の注記と、最適化のピーク・コストを出す（W2d）",
+      "受電点の基準で行います" in lpw[4] and "最適化ピークデマンド（受電点）:" in lpw[4]
+      and "最適化年間コスト:" in lpw[4] and "敷地内の発電と同じに扱って最適化" not in lpw[4])
 
 # ============================================================
 print("\n【4. 24/7指標】")
@@ -402,7 +411,7 @@ check("太陽光分の自家消費量 = 全自家消費量 − 風力の配達�
 check("風力の配達分を除いた旨の注記", "風力の配達分を除いた" in ppa_w[4])
 
 # ============================================================
-print("\n【8. データセンター・蓄電池LPとの組み合わせ／併用できない機能の明示エラー】")
+print("\n【8. データセンター・蓄電池LP・受電上限・最適容量探索との組み合わせ】")
 dc_kw = dict(demand_source=app.DEMAND_SOURCE_DATACENTER, station_choice="14163 (SAPPORO)",
              face_args=face_args([(3000.0, "南", 180.0, 30, 0)]))
 dc_no = run(dc_args=dict(DC, grid_cap_mode=app.GRID_CAP_NONE), **dc_kw)
@@ -414,18 +423,20 @@ check("DC: 契約種別が特別高圧なら託送は北海道・特高の1.02�
       run(dc_args=dict(DC, grid_cap_mode=app.GRID_CAP_NONE), wind_args=wind("coverage"), contract_type="特別高圧",
           **dc_kw)[6]["wind_info"]["wheeling_yen"] == 1.02)
 
-# 併用できないもの（受電点基準でLPが最適化されていない）は、黙って誤った数字を出さず明示エラー
+# 受電上限・最適容量探索との併用（W2d。LPを受電点の基準で解く）。詳細な検証は test_wind_lp.py
 gc = run(dc_args=dict(DC, grid_cap_mode=app.GRID_CAP_EHV33), wind_args=wind("coverage", coverage_pct=60.0),
          bat_enabled=True, bat_mode="最適充放電（LP）", bat_capacity=3000.0, bat_max_charge=1500.0,
          bat_max_discharge=1500.0, **dc_kw)
-check("風力と系統受電上限（DC）の併用は明示エラー", gc[4].startswith("エラー") and "受電上限" in gc[4], errdetail(gc))
+check("風力と系統受電上限（DC）の併用が動く（W2d。従来は明示エラー）", not gc[4].startswith("エラー") and gc[6] is not None and "強制しています" in gc[4],
+      errdetail(gc))
 gc2 = run(dc_args=dict(DC, grid_cap_mode=app.GRID_CAP_NONE), wind_args=wind("coverage", coverage_pct=60.0),
           bat_enabled=True, bat_mode="最適充放電（LP）", bat_capacity=3000.0, bat_max_charge=1500.0,
           bat_max_discharge=1500.0, **dc_kw)
-check("受電上限を『制限なし』にすればDC + 風力 + LPは動く", not gc2[4].startswith("エラー"), errdetail(gc2))
+check("受電上限を『制限なし』にしてもDC + 風力 + LPは動く", not gc2[4].startswith("エラー"), errdetail(gc2))
 cs = run(bat_enabled=True, bat_mode="最適容量探索", bat_max_charge=100.0, bat_max_discharge=100.0,
          wind_args=wind("coverage"))
-check("風力と最適容量探索の併用は明示エラー", cs[4].startswith("エラー") and "最適容量探索" in cs[4], errdetail(cs))
+check("風力と最適容量探索の併用が動く（W2d。従来は明示エラー）",
+      not cs[4].startswith("エラー") and "最適蓄電池容量" in cs[4] and "最適容量探索エラー" not in cs[4], errdetail(cs))
 cs0 = run(bat_enabled=False, bat_mode="最適容量探索", wind_args=wind("coverage"))
 check("蓄電池OFFなら（モードが残っていても）エラーにしない", not cs0[4].startswith("エラー"), errdetail(cs0))
 

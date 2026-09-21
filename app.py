@@ -1165,7 +1165,9 @@ def matching_rates(gen_30min, demand_30min):
 def offsite_receiving(pv_gen, sources, demand_30min, sc_result):
     """オフサイト電源を含む運転結果を、受電点（需要地と系統の接続点）の基準に組み替える。
 
-    蓄電池の運転（収支）は、太陽光とオフサイト電源を合わせた発電で計算済み（sc_result）。ここでは料金の計算に要る量を再構成する。
+    蓄電池の運転（収支）は、ルールベース・蓄電池なしでは太陽光とオフサイト電源を合わせた発電で計算済み（sc_result）。
+    ここでは料金の計算に要る量を再構成する。蓄電池LPを受電点の基準で解いた結果（offsite_receive を持つ）は、
+    LPが決めた受電量・売電・出力抑制をそのまま使う。
     オフサイト電源は送配電網で届くので、需要家は届いた電気も受電点で系統から受ける:
         受電量 R(t) = max(0, 需要 + 充電 − 放電 − 敷地内の太陽光)          ← 契約電力・受電上限の基準
         小売から買う量 = sc_result["import_"]（オフサイトで賄えなかった残り）
@@ -1178,7 +1180,14 @@ def offsite_receiving(pv_gen, sources, demand_30min, sc_result):
     ch = sc_result.get("battery_charge", zeros)
     dis = sc_result.get("battery_discharge", zeros)
     retail = sc_result["import_"]
-    receive = np.maximum(np.maximum(0.0, demand_30min + ch - dis - pv_gen), retail)  # LPの数値誤差でRが下回らないように
+    if "offsite_receive" in sc_result:
+        # 蓄電池LPを受電点の基準で解いた結果（optimize_battery の offsite）。受電量・売電・出力抑制はLPの値をそのまま使う
+        # （太陽光を売電しながら風力を受電するような運転がありえるため、収支から逆算しない）
+        receive = np.maximum(sc_result["offsite_receive"], retail)
+        pv_surplus = sc_result["export"] + sc_result["curtailment"]
+    else:
+        receive = np.maximum(np.maximum(0.0, demand_30min + ch - dis - pv_gen), retail)  # LPの数値誤差でRが下回らないように
+        pv_surplus = np.maximum(0.0, pv_gen + dis - demand_30min - ch)
     total = sum(s["gen_30min"] for s in sources)
     delivered = np.clip(receive - retail, 0.0, total)
     share = np.divide(1.0, total, out=np.zeros_like(total), where=total > 0)
@@ -1189,8 +1198,41 @@ def offsite_receiving(pv_gen, sources, demand_30min, sc_result):
         "delivered": delivered,
         "delivered_by_source": delivered_by_source,
         "wasted_by_source": [s["gen_30min"] - d for s, d in zip(sources, delivered_by_source)],
-        "pv_surplus": np.maximum(0.0, pv_gen + dis - demand_30min - ch),
+        "pv_surplus": pv_surplus,
     }
+
+
+def offsite_lp_sell_price(sell_price, unit_price, w_unit):
+    """オフサイト電源ありのLPで、目的関数に使う売電単価 [円/kWh]（実際の売電単価とは別）。
+
+    受電点は買電と売電を相殺して1つの向きの流れになる（買いながら売ることはできない）。LPの変数では
+    受電量Rと売電Eを同じコマで同時に正にできてしまい、売電単価が風力の配達分の単価（託送＋賦課金＋手数料）
+    や小売の電力量単価を上回ると「風力を受電して太陽光を売る」裁定が生じる（相殺すれば成立しない運転）。
+    売電単価をそれらより低く抑えれば、同時に正にする運転は損になり、LPは相殺された運転を選ぶ
+    （売電単価≦受電の限界単価のとき、受電量と売電量の関数は凸で、LPが厳密に解ける）。
+    等号だと同値のコマで同時に正になりうるので、0.01円/kWh だけ下げて厳密に損にする。
+    実際の売電収入・電気代は、返ってきた運転を実際の単価で評価し直す（optimize_battery の opt_annual_cost）。
+    """
+    return max(0.0, min(float(sell_price), float(w_unit) - 0.01, float(np.min(unit_price)) - 0.01))
+
+
+def offsite_lp_spec(sources, payment_yen=None):
+    """オフサイト電源のリストから、蓄電池LP（optimize_battery / optimize_battery_capacity）に渡す仕様を作る。
+
+    gen_30min      : オフサイト電源の発電量の合計 [kWh/30分]
+    unit_extra_yen : 配達分に課す託送の電力量料金＋小売手数料 [円/kWh]（再エネ賦課金はLP側で電気料金の設定から足す）。
+                     電源が複数のときは年間発電量で重み付けした平均（現状の電源は風力だけ）
+    sources        : offsite_receiving / offsite_cost_after に渡す元のリスト
+    payment_yen    : オフサイトPPAの支払（発電した全量×単価の合計）。容量最適化の年間メリットから引く定数
+    """
+    total = sum(s["gen_30min"] for s in sources)
+    annual = [float(np.sum(s["gen_30min"])) for s in sources]
+    denom = sum(annual)
+    unit = (sum(a * (s["wheeling_yen"] + s["retail_fee_yen"]) for a, s in zip(annual, sources)) / denom
+            if denom > 0 else 0.0)
+    if payment_yen is None:
+        payment_yen = sum(s.get("payment_yen", 0.0) for s in sources)
+    return {"gen_30min": total, "unit_extra_yen": unit, "sources": sources, "payment_yen": payment_yen}
 
 
 def offsite_cost_after(off, sources, month_day, rate_params):
@@ -1457,7 +1499,7 @@ def optimize_battery(generation_30min, demand_30min, month_day,
                      basic_charge_per_kw, energy_charge_summer,
                      energy_charge_other, power_factor_pct,
                      fuel_adjustment, renewable_surcharge,
-                     sell_price, no_export=False, grid_import_cap_kw=None):
+                     sell_price, no_export=False, grid_import_cap_kw=None, offsite=None):
     """蓄電池の最適充放電スケジュールをLP（線形計画法）で求める。
 
     目的関数: 年間電気代（基本料金＋電力量料金−売電収入）の最小化
@@ -1468,6 +1510,13 @@ def optimize_battery(generation_30min, demand_30min, month_day,
         始まる人工的な実行不可能を避けるため「初期SOC＝年末SOC（変数）」の周期条件にする。
         上限を守れないときは GridCapInfeasibleError を送出する。
         None のときは従来のLP（初期SOC=SOC下限固定）とビット単位で同一。
+    offsite: オフサイト電源（風力）のLP用の仕様（offsite_lp_spec の戻り値）。None なら従来のLPとビット単位で同一。
+        指定すると受電点の基準で最適化する（設計書 wind §5-4・W2d）:
+          ・generation_30min には敷地内の太陽光だけを渡す（風力は含めない）
+          ・grid_import 変数は「受電量 R」（契約電力・受電上限の基準）になる。そのうち風力の配達分 w
+            （0 ≤ w ≤ 風力の発電量、w ≤ R）には託送・賦課金・手数料の単価、残り R−w には小売の電力量単価を課す
+          ・売電・出力抑制は敷地内の太陽光の余剰だけ（風力は売電できない）
+        戻り値の import_ は小売から買う量（R−w）。受電量 R は offsite_receive、配達分は offsite_delivered
     """
     if not HAS_PULP:
         raise RuntimeError("PuLPがインストールされていません。pip install PuLP を実行してください。")
@@ -1504,6 +1553,11 @@ def optimize_battery(generation_30min, demand_30min, month_day,
     discharge = [pulp.LpVariable(f"dc_{t}", lowBound=0, upBound=max_discharge_per_slot) for t in range(T)]
     # 系統購入。受電上限があれば変数の上限にする（peak_demand ≥ 購入/dt なので契約電力も上限以下になる）
     grid_import = [pulp.LpVariable(f"gi_{t}", lowBound=0, upBound=cap_kwh_slot) for t in range(T)]
+    if offsite is not None:
+        # オフサイト電源: grid_import は受電量 R（受電上限・ピークの基準）。風力の配達分 w は R に含まれ、発電量以下
+        w_flat = offsite["gen_30min"].flatten()
+        w_unit = offsite["unit_extra_yen"] + renewable_surcharge  # 配達分の託送＋手数料＋再エネ賦課金 [円/kWh]
+        delivered = [pulp.LpVariable(f"wd_{t}", lowBound=0, upBound=float(w_flat[t])) for t in range(T)]
     if no_export:
         grid_export = [pulp.LpVariable(f"ge_{t}", lowBound=0, upBound=0) for t in range(T)]
     else:
@@ -1521,19 +1575,33 @@ def optimize_battery(generation_30min, demand_30min, month_day,
     # 目的関数: 基本料金 + 電力量料金 - 売電収入
     pf_factor = (185 - power_factor_pct) / 100.0
     annual_basic = basic_charge_per_kw * peak_demand * 12 * pf_factor  # 年間基本料金
-    annual_energy = pulp.lpSum([grid_import[t] * unit_price[t] for t in range(T)])
+    if offsite is None:
+        annual_energy = pulp.lpSum([grid_import[t] * unit_price[t] for t in range(T)])
+    else:
+        # 受電量 R のうち、小売から買う分 R−w は電力量単価、風力の配達分 w は託送等の単価
+        annual_energy = pulp.lpSum([grid_import[t] * unit_price[t] - delivered[t] * (unit_price[t] - w_unit)
+                                    for t in range(T)])
     sell_price_val = sell_price if sell_price is not None else 0
-    annual_sell = pulp.lpSum([grid_export[t] * sell_price_val for t in range(T)])
+    # オフサイトあり: 買電と売電の相殺を保つため、LP内の売電単価を抑える（offsite_lp_sell_price）。実際の値は後で評価し直す
+    sell_lp = sell_price_val if offsite is None else offsite_lp_sell_price(sell_price_val, unit_price, w_unit)
+    annual_sell = pulp.lpSum([grid_export[t] * sell_lp for t in range(T)])
     prob += annual_basic + annual_energy - annual_sell
 
     # 制約条件
     for t in range(T):
-        # エネルギーバランス: 系統購入 + PV発電 + 放電 = 需要 + 充電 + 系統売電 + 出力抑制
+        # エネルギーバランス: 系統購入（オフサイトあり: 受電量）+ PV発電 + 放電 = 需要 + 充電 + 系統売電 + 出力抑制
         prob += grid_import[t] + gen_flat[t] + discharge[t] == dem_flat[t] + charge[t] + grid_export[t] + curtailment[t]
 
-        # 売電・出力抑制はPV発電＋放電からのみ（系統買電の即売り＝パススルー禁止。
-        # この制約がないと売電単価>買電単価のときLPがUnboundedになる）
-        prob += grid_export[t] + curtailment[t] <= gen_flat[t] + discharge[t]
+        if offsite is None:
+            # 売電・出力抑制はPV発電＋放電からのみ（系統買電の即売り＝パススルー禁止。
+            # この制約がないと売電単価>買電単価のときLPがUnboundedになる）
+            prob += grid_export[t] + curtailment[t] <= gen_flat[t] + discharge[t]
+        else:
+            # オフサイトあり: 売電・出力抑制の対象はそのコマの太陽光の余剰だけ（風力は売電できない。
+            # 放電を含めると、風力を蓄電池に貯めて売電する裁定が生じてしまうため）
+            prob += grid_export[t] + curtailment[t] <= gen_flat[t]
+            # 風力の配達分は受電量の一部
+            prob += delivered[t] <= grid_import[t]
 
         # 同時充放電の排他制約（ソフト版）: PCS 1台は充電か放電のどちらか
         prob += charge[t] + discharge[t] <= max_power_per_slot
@@ -1568,6 +1636,13 @@ def optimize_battery(generation_30min, demand_30min, month_day,
     gi_vals = np.array([gi.varValue for gi in grid_import]).reshape(n_days, n_slots)
     ge_vals = np.array([ge.varValue for ge in grid_export]).reshape(n_days, n_slots)
     soc_vals = np.array([s.varValue for s in soc_var]).reshape(n_days, n_slots)
+    if offsite is not None:
+        # gi_vals は受電量 R。小売から買う量は R − 風力の配達分（LPの数値誤差で負にならないよう0で下げる）
+        recv_vals = gi_vals
+        deliv_vals = np.array([w.varValue for w in delivered]).reshape(n_days, n_slots)
+        gi_vals = np.maximum(recv_vals - deliv_vals, 0.0)
+        # 発電量・月別発電量は太陽光＋風力の合計で示す（オフサイトなしの並びと同じ見せ方）
+        generation_30min = generation_30min + offsite["gen_30min"]
 
     # 自家消費 = 需要 - 系統購入
     self_consumption = demand_30min - gi_vals
@@ -1602,6 +1677,9 @@ def optimize_battery(generation_30min, demand_30min, month_day,
 
     opt_peak_kw = peak_demand.varValue
     opt_cost = pulp.value(prob.objective)
+    if offsite is not None:
+        # 目的関数の売電は抑えた単価だったので、実際の売電単価で評価し直す（電気代−売電収入）
+        opt_cost -= (sell_price_val - sell_lp) * float(np.sum(ge_vals))
 
     result = {
         "self_consumption": self_consumption,
@@ -1633,6 +1711,10 @@ def optimize_battery(generation_30min, demand_30min, month_day,
     if cap_kwh_slot is not None:
         # 受電上限を制約として強制したことを結果に残す（従来の戻り値のキー構成は上限なしでは変えない）
         result["grid_import_cap_kw"] = float(grid_import_cap_kw)
+    if offsite is not None:
+        # 受電点の基準の運転（オフサイト電源を含む）。契約電力・受電上限・託送等の課金は受電量で見る
+        result["offsite_receive"] = recv_vals
+        result["offsite_delivered"] = deliv_vals
     return result
 
 
@@ -1732,11 +1814,14 @@ def optimize_battery_capacity(generation_30min, demand_30min, month_day,
                               energy_charge_other, power_factor_pct,
                               fuel_adjustment, renewable_surcharge,
                               sell_price, battery_cost_per_kwh, payback_years,
-                              no_export=False, capacity_upper=2000):
+                              no_export=False, capacity_upper=2000, offsite=None):
     """段階1: LP一体化で蓄電池の最適容量を求める。
 
     蓄電池容量を決定変数に含め、年間運用コスト＋蓄電池投資年額換算の
     合計を最小化する。P-IRR最大化の近似探索として機能する。
+
+    offsite: オフサイト電源（風力）のLP用の仕様。指定時は optimize_battery と同じ受電点の基準で解く
+    （generation_30min は太陽光のみ。風力PPAの支払は容量に依存しない定数なので目的関数に含めない）。
     """
     if not HAS_PULP:
         raise RuntimeError("PuLPがインストールされていません。")
@@ -1766,6 +1851,11 @@ def optimize_battery_capacity(generation_30min, demand_30min, month_day,
     charge = [pulp.LpVariable(f"ch_{t}", lowBound=0, upBound=max_charge_per_slot) for t in range(T)]
     discharge = [pulp.LpVariable(f"dc_{t}", lowBound=0, upBound=max_discharge_per_slot) for t in range(T)]
     grid_import = [pulp.LpVariable(f"gi_{t}", lowBound=0) for t in range(T)]
+    if offsite is not None:
+        # grid_import は受電量 R。風力の配達分 w は R に含まれ、発電量以下（optimize_battery と同じ定式化）
+        w_flat = offsite["gen_30min"].flatten()
+        w_unit = offsite["unit_extra_yen"] + renewable_surcharge
+        delivered = [pulp.LpVariable(f"wd_{t}", lowBound=0, upBound=float(w_flat[t])) for t in range(T)]
     if no_export:
         grid_export = [pulp.LpVariable(f"ge_{t}", lowBound=0, upBound=0) for t in range(T)]
     else:
@@ -1785,9 +1875,14 @@ def optimize_battery_capacity(generation_30min, demand_30min, month_day,
     # 目的関数: 年間運用コスト + 蓄電池投資年額換算
     pf_factor = (185 - power_factor_pct) / 100.0
     annual_basic = basic_charge_per_kw * peak_demand * 12 * pf_factor
-    annual_energy = pulp.lpSum([grid_import[t] * unit_price[t] for t in range(T)])
+    if offsite is None:
+        annual_energy = pulp.lpSum([grid_import[t] * unit_price[t] for t in range(T)])
+    else:
+        annual_energy = pulp.lpSum([grid_import[t] * unit_price[t] - delivered[t] * (unit_price[t] - w_unit)
+                                    for t in range(T)])
     sell_price_val = sell_price if sell_price is not None else 0
-    annual_sell = pulp.lpSum([grid_export[t] * sell_price_val for t in range(T)])
+    sell_lp = sell_price_val if offsite is None else offsite_lp_sell_price(sell_price_val, unit_price, w_unit)
+    annual_sell = pulp.lpSum([grid_export[t] * sell_lp for t in range(T)])
     # 蓄電池投資の年額換算（容量が変数）
     annual_battery_cost = capacity_var * battery_cost_per_kwh / payback_years
     prob += annual_basic + annual_energy - annual_sell + annual_battery_cost
@@ -1796,8 +1891,13 @@ def optimize_battery_capacity(generation_30min, demand_30min, month_day,
     for t in range(T):
         # エネルギーバランス: 系統購入 + PV発電 + 放電 = 需要 + 充電 + 系統売電 + 出力抑制
         prob += grid_import[t] + gen_flat[t] + discharge[t] == dem_flat[t] + charge[t] + grid_export[t] + curtailment[t]
-        # 売電・出力抑制はPV発電＋放電からのみ（パススルー禁止、Unbounded対策）
-        prob += grid_export[t] + curtailment[t] <= gen_flat[t] + discharge[t]
+        if offsite is None:
+            # 売電・出力抑制はPV発電＋放電からのみ（パススルー禁止、Unbounded対策）
+            prob += grid_export[t] + curtailment[t] <= gen_flat[t] + discharge[t]
+        else:
+            # オフサイトあり: 売電・出力抑制はそのコマの太陽光の余剰だけ（風力は売電できない）
+            prob += grid_export[t] + curtailment[t] <= gen_flat[t]
+            prob += delivered[t] <= grid_import[t]
         # 同時充放電の排他制約（ソフト版）
         prob += charge[t] + discharge[t] <= max_power_per_slot
         prob += peak_demand >= grid_import[t] / dt
@@ -1822,11 +1922,14 @@ def optimize_battery_capacity(generation_30min, demand_30min, month_day,
 
     optimal_capacity = capacity_var.varValue
     opt_peak_kw = peak_demand.varValue
+    opt_cost = pulp.value(prob.objective)
+    if offsite is not None:
+        opt_cost -= (sell_price_val - sell_lp) * float(sum(ge.varValue for ge in grid_export))
 
     return {
         "optimal_capacity_kwh": optimal_capacity,
         "opt_peak_kw": opt_peak_kw,
-        "opt_annual_cost": pulp.value(prob.objective),
+        "opt_annual_cost": opt_cost,
     }
 
 
@@ -1838,11 +1941,14 @@ def grid_search_battery_capacity(generation_30min, demand_30min, month_day,
                                  cost_before_total, payback_years,
                                  no_export=False,
                                  optimal_capacity=None, n_steps=10,
+                                 offsite=None,
                                  **rate_kwargs):
     """段階2: グリッドサーチで容量ごとの指標を計算。
 
     段階1の最適容量を基準に探索範囲を決め、各容量でLP最適化を実行。
     rate_kwargs: basic_charge_per_kw, energy_charge_summer, etc.
+    offsite: オフサイト電源（風力）の仕様（offsite_lp_spec の戻り値）。指定時は generation_30min を太陽光のみとし、
+        料金を受電点の基準（offsite_cost_after）で計算し、年間メリットから風力PPAの支払を引く
     """
     # 探索範囲を決定
     # 最低でも充放電レートの2時間分を上限とし、意味のある範囲を探索
@@ -1872,17 +1978,25 @@ def grid_search_battery_capacity(generation_30min, demand_30min, month_day,
                 soc_max_pct=soc_max_pct,
                 sell_price=sell_price,
                 no_export=no_export,
+                offsite=offsite,
                 **rate_kwargs,
             )
             # 導入後の電気料金
-            cost_after = calc_electricity_cost(
-                sc["import_"], month_day,
-                **rate_kwargs,
-            )
+            if offsite is None:
+                cost_after = calc_electricity_cost(
+                    sc["import_"], month_day,
+                    **rate_kwargs,
+                )
+            else:
+                # 受電点の基準（契約電力は受電量の最大。風力の配達分に託送等がかかる）
+                off = offsite_receiving(generation_30min, offsite["sources"], demand_30min, sc)
+                cost_after = offsite_cost_after(off, offsite["sources"], month_day, rate_kwargs)
             # 年間コスト削減
             saving = cost_before_total - cost_after["annual_total"]
             sell_rev = sc["annual_export"] * (sell_price if sell_price is not None else 0)
             annual_merit = saving + sell_rev if not no_export else saving
+            if offsite is not None:
+                annual_merit -= offsite["payment_yen"]  # 風力PPAの支払（発電した全量。容量によらない定数）
 
             # 投資額
             bat_inv = cap * battery_cost_per_kwh
@@ -2712,7 +2826,7 @@ def _grid_cap_reason_lines(diag, battery):
     return lines
 
 
-def format_grid_cap(dc_info, diag, status, sc_result=None, battery=None):
+def format_grid_cap(dc_info, diag, status, sc_result=None, battery=None, receive=None):
     """系統受電上限の結果テキスト（結果ボックスに置く節）を返す。
 
     status:
@@ -2721,6 +2835,8 @@ def format_grid_cap(dc_info, diag, status, sc_result=None, battery=None):
       "infeasible"    診断の必要条件が破れていて確実に守れない（LPは実行していない）
       "infeasible_lp" 診断の必要条件は満たすが、LPが実行不可能だった
     battery: {"enabled", "mode_label", "capacity_kwh", "max_charge_kw", "max_discharge_kw"}
+    receive: 受電量 [kWh/30分] の配列。オフサイト電源（風力）があるとき、導入後ピークはこれで測る
+        （sc_result["import_"] は小売から買う分だけで、風力の配達分を含まない）。None なら従来どおり import_
     """
     cap = diag["cap_kw"]
     before = dc_info["peak_demand_kw"]
@@ -2754,7 +2870,7 @@ def format_grid_cap(dc_info, diag, status, sc_result=None, battery=None):
                   "       実際にはこれ以上必要になる場合があります\n")
         return t
 
-    peak_after = float(np.max(sc_result["import_"])) * 2.0
+    peak_after = float(np.max(sc_result["import_"] if receive is None else receive)) * 2.0
     over = peak_after - cap
     within = over <= max(1e-6 * cap, 1e-6)
     after_txt = "上限内" if within else f"上限を {over:,.1f} kW 超過"
@@ -2926,15 +3042,6 @@ def run_simulation(
                     float(np.sum(demand_30min)), station_label=station_choice, contract_type=contract_type)
             except ValueError as e:
                 return None, None, None, None, f"エラー: {e}", "", None
-            # 蓄電池LPは、風力（オフサイト。受電点に届く）を敷地内の発電と同じに扱って最適化する。受電点基準の
-            # 制約（系統受電上限）や、最適容量探索の経済性は、その前提では正しく評価できない。未対応（設計書 §5-4）
-            if dc_info is not None and dc_info.get("grid_cap_kw"):
-                return None, None, None, None, ("エラー: 風力と系統受電上限の併用は未対応です"
-                                                "（風力は受電点に届くため、上限の判定に含める必要があります。"
-                                                "受電上限を『制限なし』にしてください）"), "", None
-            if bat_enabled and (bat_mode if bat_mode else "ルールベース") == "最適容量探索":
-                return None, None, None, None, ("エラー: 風力と最適容量探索の併用は未対応です"
-                                                "（蓄電池モードを『ルールベース』か『最適充放電（LP）』にしてください）"), "", None
 
         # --- 面設定パース（5項目: Ppeak, 方位選択, 方位角, 傾斜角, PCS出力制限） ---
         # 太陽光を使わない（pv_enabled=False）ときは面設定を読まない（空欄・不正値があってもエラーにしない）
@@ -3018,6 +3125,11 @@ def run_simulation(
         # --- 自家消費計算 / 蓄電池 ---
         no_export = (sell_mode == "逆潮流禁止（売電なし）")
         sc_result = None
+        # 蓄電池LP（最適充放電・最適容量探索）は、風力（オフサイト。送配電網で届く）を受電点の基準で扱う:
+        # 敷地内の太陽光だけを generation として渡し、風力は offsite の仕様で渡す（設計書 wind §5-4・W2d）。
+        # ルールベースは従来どおり、太陽光＋風力の合計の発電で運転する
+        offsite_spec = offsite_lp_spec([wind_info]) if wind_info is not None else None
+        gen_lp = result["total_gen_clipped"] if offsite_spec is not None else gen_total
         battery_mode_label = bat_mode if bat_mode else "ルールベース"
         # 系統受電上限（DCモードのときだけ存在。産業用には適用しない）と、診断に使う蓄電池の諸元。
         # 上限を強制できるのは最適充放電（LP）だけ。最適容量探索は上限を考慮しないため諸元は0扱い
@@ -3040,8 +3152,9 @@ def run_simulation(
                 if battery_mode_label == "最適充放電（LP）":
                     # 受電上限あり: LPを解くまでもなく確実に守れない場合は、診断を返して終える
                     if grid_cap_kw:
+                        # 受電上限は受電点（風力の配達分も含む）で見る。風力は上限を守る助けにならないので、太陽光だけで診断する
                         grid_cap_diag = diagnose_grid_cap(
-                            gen_total, demand_30min, grid_cap_kw,
+                            gen_lp, demand_30min, grid_cap_kw,
                             battery_info["capacity_kwh"], battery_info["efficiency_pct"],
                             battery_info["max_charge_kw"], battery_info["max_discharge_kw"],
                             battery_info["soc_min_pct"], battery_info["soc_max_pct"],
@@ -3054,7 +3167,7 @@ def run_simulation(
                     defaults_tmp = ELECTRICITY_RATE_EHV if is_ehv_tmp else ELECTRICITY_RATE_HV
                     try:
                         sc_result = optimize_battery(
-                            gen_total, demand_30min, result["month_day"],
+                            gen_lp, demand_30min, result["month_day"],
                             capacity_kwh=bat_capacity,
                             efficiency_pct=bat_efficiency if bat_efficiency is not None else 95,
                             max_charge_kw=bat_max_charge if bat_max_charge is not None else 2.5,
@@ -3070,6 +3183,7 @@ def run_simulation(
                             sell_price=sell_price if sell_price is not None else DEFAULT_SELL_PRICE,
                             no_export=no_export,
                             grid_import_cap_kw=grid_cap_kw,
+                            offsite=offsite_spec,
                         )
                     except GridCapInfeasibleError:
                         # 診断の必要条件は満たしたがLPが実行不可能（主に充電レート不足）
@@ -3093,21 +3207,6 @@ def run_simulation(
                     no_export=no_export,
                 )
 
-        # --- 受電上限の結果（DCモードで上限が指定されたときのみ） ---
-        # LPで強制した場合は事前診断をそのまま使う。それ以外（蓄電池なし/ルールベース/容量探索）は
-        # 上限を強制していないので、導入後ピークが上限を超えるかの判定と、必要な蓄電池の目安を出す
-        grid_cap_text = ""
-        if grid_cap_kw and sc_result is not None:
-            cap_enforced = bool(sc_result.get("grid_import_cap_kw"))
-            cap_diag = grid_cap_diag if (cap_enforced and grid_cap_diag is not None) else diagnose_grid_cap(
-                gen_total, demand_30min, grid_cap_kw,
-                battery_info["capacity_kwh"], battery_info["efficiency_pct"],
-                battery_info["max_charge_kw"], battery_info["max_discharge_kw"],
-                battery_info["soc_min_pct"], battery_info["soc_max_pct"],
-            )
-            grid_cap_text = format_grid_cap(
-                dc_info, cap_diag, "enforced" if cap_enforced else "not_enforced", sc_result, battery_info)
-
         # --- オフサイト電源（風力）を受電点の基準に組み替える ---
         # 蓄電池の運転は太陽光＋風力を合わせた発電で計算済み。料金・売電は受電点の基準で計算し直す:
         #  ・契約電力（基本料金）は受電量の最大で決まり、風力では下がらない
@@ -3126,6 +3225,23 @@ def run_simulation(
             sc_result["annual_curtailment_pooled"] = sc_result.get("annual_curtailment", 0.0)
             sc_result["annual_export"] = 0.0 if no_export else pv_surplus_kwh
             sc_result["annual_curtailment"] = pv_surplus_kwh if no_export else 0.0
+
+        # --- 受電上限の結果（DCモードで上限が指定されたときのみ） ---
+        # 風力を使うときは、受電点の基準（wind_off）に組み替えた後で判定する（受電量＝小売購入＋風力の配達分）
+        # LPで強制した場合は事前診断をそのまま使う。それ以外（蓄電池なし/ルールベース/容量探索）は
+        # 上限を強制していないので、導入後ピークが上限を超えるかの判定と、必要な蓄電池の目安を出す
+        grid_cap_text = ""
+        if grid_cap_kw and sc_result is not None:
+            cap_enforced = bool(sc_result.get("grid_import_cap_kw"))
+            cap_diag = grid_cap_diag if (cap_enforced and grid_cap_diag is not None) else diagnose_grid_cap(
+                gen_lp, demand_30min, grid_cap_kw,
+                battery_info["capacity_kwh"], battery_info["efficiency_pct"],
+                battery_info["max_charge_kw"], battery_info["max_discharge_kw"],
+                battery_info["soc_min_pct"], battery_info["soc_max_pct"],
+            )
+            grid_cap_text = format_grid_cap(
+                dc_info, cap_diag, "enforced" if cap_enforced else "not_enforced", sc_result, battery_info,
+                receive=None if wind_off is None else wind_off["receive"])
 
         # --- グラフ生成 ---
         fig_monthly = make_monthly_chart(chart_result, sc_result)
@@ -3168,7 +3284,11 @@ def run_simulation(
                                 "設備利用率が高いと形状のピークが定格を超えるため\n")
             result_text += (f"形状の出典: {wa['name']}エリア需給実績 2025年（風力発電実績＋風力出力制御量＝出力制御前）。"
                             f"エリアの出力制御 {wa['curtail_pct']:.2f}%\n")
-            result_text += "以降の需給・蓄電池・料金の計算は、太陽光と風力の合計の発電量で行います\n"
+            if offsite_spec is not None and bat_enabled and battery_mode_label == "最適充放電（LP）":
+                result_text += ("以降の蓄電池の最適化（LP）は受電点の基準で行います"
+                                "（風力は送配電網で届く電源で、受電量・契約電力・受電上限に含まれます）\n")
+            else:
+                result_text += "以降の需給・蓄電池・料金の計算は、太陽光と風力の合計の発電量で行います\n"
 
         if sc_result is not None:
             result_text += "\n── 需給バランス ──\n"
@@ -3210,9 +3330,11 @@ def run_simulation(
                     result_text += f"最適化ピークデマンド: {sc_result['opt_peak_kw']:.1f} kW\n"
                     result_text += f"最適化年間コスト: {sc_result['opt_annual_cost']:,.0f} 円\n"
                 elif sc_result.get("optimized"):
-                    result_text += ("  ※ 蓄電池LPは、風力（受電点に届く電源）を敷地内の発電と同じに扱って最適化しています。\n"
-                                    "    契約電力・電気料金は、下の受電点基準（風力の託送等を含む）で計算し直した値です。\n"
-                                    "    LPの最適化年間コスト・ピークは、その前提と合わないため表示しません\n")
+                    # 風力あり: LPは受電点の基準（ピーク＝受電量の最大、コスト＝小売＋風力配達分の託送等−売電）。
+                    # 風力PPAの支払は運転によらない定数なので、LPの目的関数には含めない
+                    result_text += f"最適化ピークデマンド（受電点）: {sc_result['opt_peak_kw']:.1f} kW\n"
+                    result_text += (f"最適化年間コスト: {sc_result['opt_annual_cost']:,.0f} 円"
+                                    "（受電点の電気代−売電収入。風力PPA支払は含まない）\n")
 
         # --- 24/7（時間単位の再エネ一致）: 風力を使うときの主指標 ---
         if wind_info is not None and sc_result is not None:
@@ -3708,12 +3830,12 @@ def run_simulation(
             # 段階1: LP一体化
             try:
                 cap_result = optimize_battery_capacity(
-                    gen_total, demand_30min, result["month_day"],
+                    gen_lp, demand_30min, result["month_day"],
                     efficiency_pct=bat_eff,
                     max_charge_kw=bat_mc, max_discharge_kw=bat_md,
                     soc_min_pct=bat_smin, soc_max_pct=bat_smax,
                     sell_price=sp, battery_cost_per_kwh=bat_unit_net, payback_years=n_yrs,
-                    no_export=no_export, **rate_p,
+                    no_export=no_export, offsite=offsite_spec, **rate_p,
                 )
                 opt_cap = cap_result["optimal_capacity_kwh"]
 
@@ -3723,19 +3845,26 @@ def run_simulation(
 
                 # 最適容量でLP最適化を実行して詳細指標を取得
                 sc_opt = optimize_battery(
-                    gen_total, demand_30min, result["month_day"],
+                    gen_lp, demand_30min, result["month_day"],
                     capacity_kwh=opt_cap,
                     efficiency_pct=bat_eff,
                     max_charge_kw=bat_mc, max_discharge_kw=bat_md,
                     soc_min_pct=bat_smin, soc_max_pct=bat_smax,
-                    sell_price=sp, no_export=no_export, **rate_p,
+                    sell_price=sp, no_export=no_export, offsite=offsite_spec, **rate_p,
                 )
-                cost_opt = calc_electricity_cost(
-                    sc_opt["import_"], result["month_day"], **rate_p,
-                )
+                if offsite_spec is None:
+                    cost_opt = calc_electricity_cost(
+                        sc_opt["import_"], result["month_day"], **rate_p,
+                    )
+                else:
+                    # 風力あり: 受電点の基準（契約電力は受電量の最大。届いた風力に託送・賦課金・手数料）
+                    off_opt = offsite_receiving(gen_lp, offsite_spec["sources"], demand_30min, sc_opt)
+                    cost_opt = offsite_cost_after(off_opt, offsite_spec["sources"], result["month_day"], rate_p)
                 saving_opt = cost_before['annual_total'] - cost_opt['annual_total']
                 sell_rev_opt = sc_opt['annual_export'] * sp if not no_export else 0
                 merit_opt = saving_opt + sell_rev_opt
+                if offsite_spec is not None:
+                    merit_opt -= offsite_spec["payment_yen"]  # 風力PPAの支払（発電した全量。容量によらない定数）
                 # 段階2グリッドサーチと同じ補助金控除後単価で投資額を計算（整合性）
                 bat_inv_opt = opt_cap * bat_unit_net
                 total_inv_opt = total_ppeak * pv_unit_net + bat_inv_opt
@@ -3753,7 +3882,7 @@ def run_simulation(
 
                 # 段階2: グリッドサーチ
                 search_results = grid_search_battery_capacity(
-                    gen_total, demand_30min, result["month_day"],
+                    gen_lp, demand_30min, result["month_day"],
                     efficiency_pct=bat_eff,
                     max_charge_kw=bat_mc, max_discharge_kw=bat_md,
                     soc_min_pct=bat_smin, soc_max_pct=bat_smax,
@@ -3767,6 +3896,7 @@ def run_simulation(
                     no_export=no_export,
                     optimal_capacity=opt_cap,
                     n_steps=10,
+                    offsite=offsite_spec,
                     **rate_p,
                 )
                 fig_capacity = make_capacity_search_chart(search_results, opt_cap)
@@ -4236,7 +4366,9 @@ def build_ui():
                         "売電できるのは敷地内の太陽光の余剰だけです。<br>"
                         "※太陽光は平年値（METPV-20）、風力は2025年の実績で別のデータのため、同じ日に凪と曇天が重なるような"
                         "日単位の同時性は反映されません（月別・時間帯別の平均的な補完関係の目安）。<br>"
-                        "※系統受電上限（データセンター）・最適容量探索とは併用できません。</small>"
+                        "※系統受電上限（データセンター）・最適容量探索とも併用できます。蓄電池「最適充放電（LP）」は受電点の基準で"
+                        "最適化し、受電上限は届く風力も含めた受電量に対する上限です（風力は上限を守る助けにならず、"
+                        "太陽光と蓄電池で守ります）。</small>"
                     )
                     wind_enabled_input = gr.Checkbox(label="風力発電を併用する", value=False)
                     with gr.Group(visible=False) as wind_settings_group:

@@ -269,11 +269,36 @@ check("simulate: 対象外の地点は error（計算しない）", "error" in r
 r = m.validate_industrial_params(pv_enabled=False, faces=[], wind={"capacity_kw": 500.0}, station_no="34392")
 check("pv_enabled=false なら faces が空でも valid（風力のみ）", r["valid"] and r["normalized_params"]["faces"] == [])
 r = m.validate_dc_params(station_no="14163", wind={"coverage_pct": 50.0}, grid_cap="hv_under_2000kw")
-check("DC: 風力と系統受電上限の併用は valid=false", r["valid"] is False and any("受電上限" in e for e in r["errors"]), str(r.get("errors"))[:80])
+check("DC: 風力と系統受電上限の併用は valid（W2d。受電量に対する上限である旨の警告つき）",
+      r["valid"] is True and any("受電量" in w for w in r["warnings"]), str(r.get("errors") or r.get("warnings"))[:80])
 r = m.validate_dc_params(station_no="14163", wind={"coverage_pct": 50.0}, grid_cap="none")
-check("DC: 受電上限なしなら valid", r["valid"], str(r.get("errors")))
-r = m.simulate_dc(station_no="14163", wind={"coverage_pct": 50.0}, grid_cap="hv_under_2000kw")
-check("simulate_dc: 併用は error", "error" in r and "受電上限" in str(r))
+check("DC: 受電上限なしなら valid（上限の警告は出ない）", r["valid"] and not any("受電量" in w for w in r["warnings"]), str(r.get("errors")))
+LPKW = dict(battery_enabled=True, battery_mode="lp_optimized", battery_capacity_kwh=3000.0, battery_max_charge_kw=1500.0,
+            battery_max_discharge_kw=1500.0, battery_soc_min_pct=20.0, battery_soc_max_pct=95.0)
+DCF = [{"ppeak_kw": 3000.0, "tilt_deg": 30.0, "azimuth_deg": 180.0}]
+r = m.simulate_dc(station_no="14163", faces=DCF, wind={"coverage_pct": 60.0}, grid_cap="ehv_under_10000kw", **LPKW)
+check("simulate_dc: 風力 + 受電上限 + LP が計算できる（W2d。従来は error）", "error" not in r and "grid_cap" in r, str(r.get("error") or r.get("errors"))[:80])
+if "grid_cap" in r:
+    gc = r["grid_cap"]
+    check("  受電上限は強制され、導入後ピーク（受電量）が上限以下", gc["status"] == "enforced" and gc["within_cap_after"] is True,
+          f"{gc['status']} {gc['peak_after_kw']}")
+    p = r["assumptions"]
+    ui = app.run_simulation(**{**UI_BASE, "station_choice": "14163 (SAPPORO)", "face_args": face_args([(3000.0, "南", 180.0, 30, 0)]),
+                               "demand_source": app.DEMAND_SOURCE_DATACENTER, "dc_args": {**m._dc_args_from_params(p["dc"])},
+                               "sell_price": 19.0, "bat_enabled": True, "bat_mode": "最適充放電（LP）", "bat_capacity": 3000.0,
+                               "bat_max_charge": 1500.0, "bat_max_discharge": 1500.0, "bat_soc_min": 20, "bat_soc_max": 95},
+                       wind_args=uw(cov=60.0))
+    check("  UIと一致: 年間経済メリット・導入後ピーク・風力の配達量",
+          ui[6] is not None
+          and abs(r["electricity_cost"]["annual_economic_merit_yen"] - num(ui[4], "年間経済メリット:", after="【風力込みの年間経済メリット】")) < 1.5
+          and abs(gc["peak_after_kw"] - num(ui[4], "導入後ピーク:")) < 0.06
+          and r["wind"]["delivered_kwh"] == round(ui[6]["wind_info"]["delivered_kwh"]),
+          f"{r['electricity_cost']['annual_economic_merit_yen']} vs {num(ui[4], '年間経済メリット:', after='【風力込みの年間経済メリット】')}")
+    check("  出力はJSON標準の型だけ", not non_json(r), str(non_json(r)[:3]))
+# 守れない上限（手入力で低すぎる）は、風力があっても診断（grid_cap_infeasible）を返す
+r = m.simulate_dc(station_no="14163", faces=DCF, wind={"coverage_pct": 60.0}, grid_cap="manual", grid_cap_kw=300.0, **LPKW)
+check("simulate_dc: 上限が低すぎるときは診断（grid_cap_infeasible）を返し、error にしない",
+      r.get("grid_cap_infeasible") is True and "error" not in r, str(r)[:100])
 
 # ============================================================
 print("\n【3. list_wind_areas / estimate_wind_generation】")

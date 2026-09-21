@@ -619,7 +619,8 @@ _WIND_CAVEATS = [
     "託送の電力量料金は一次資料（北海道電力NW・東北電力NW、2025年10月〜、税込表示）の値です。小売手数料は自然エネルギー財団の"
     "推定値（2023年度・全国平均）で公的な料金表はありません。PPA単価の既定値（11.96円/kWh）は入札の平均落札価格で、"
     "PPAの相対契約の単価そのものではありません",
-    "蓄電池は太陽光と風力を合わせた発電で運転します（LPは電気代の最小化で、24/7の一致率の最大化ではありません）",
+    "蓄電池LP（lp_optimized）は受電点の基準で最適化します（風力は受電量の一部。売電・出力抑制は太陽光の余剰だけ）。"
+    "ルールベースは太陽光と風力を合わせた発電で運転します。LPは電気代の最小化で、24/7の一致率の最大化ではありません",
 ]
 
 
@@ -782,12 +783,14 @@ def _run_industrial_simulation(p: dict, demand_override=None, grid_cap_kw=None):
     wind_info = None
     gen_pv = gen
     if wind_p:
-        if grid_cap_kw:
-            raise ValueError("風力と系統受電上限の併用は未対応です（風力は受電点に届くため、上限の判定に含める必要があります）")
         wind_info = app.resolve_wind(
             _wind_args_for_app(app, wind_p), p["station_no"], float(np.sum(demand_30min)),
             station_label=p["station_no"], contract_type=CONTRACT_TYPE_MAP[p["contract_type"]])
-        gen = gen_pv + wind_info["gen_30min"]   # 以降の運転（蓄電池・LP）は太陽光＋風力を合わせた発電で行う
+        gen = gen_pv + wind_info["gen_30min"]   # ルールベース・蓄電池なしは太陽光＋風力を合わせた発電で運転する
+    # 蓄電池LPは風力（送配電網で届く電源）を受電点の基準で扱う: 太陽光だけを generation に、風力は offsite で渡す
+    # （app.run_simulation と同じ。設計書 wind §5-4・W2d）
+    offsite_spec = app.offsite_lp_spec([wind_info]) if wind_info is not None else None
+    gen_lp = gen_pv if offsite_spec is not None else gen
 
     no_export = (p["sell_mode"] == "no_export")
     battery_active = p["battery_enabled"] and p["battery_capacity_kwh"] > 0
@@ -797,8 +800,9 @@ def _run_industrial_simulation(p: dict, demand_override=None, grid_cap_kw=None):
     # 上限を強制できるのはLPだけ。LPで確実に守れないなら、LPを解かずに診断を返す
     grid_cap_diag = None
     if grid_cap_kw:
+        # 受電上限は受電点（風力の配達分も含む）で見る。風力は上限を守る助けにならないので、太陽光だけで診断する
         grid_cap_diag = app.diagnose_grid_cap(
-            gen, demand_30min, grid_cap_kw,
+            gen_lp, demand_30min, grid_cap_kw,
             p["battery_capacity_kwh"] if battery_active else 0.0,
             p["battery_efficiency_pct"],
             p["battery_max_charge_kw"] if battery_active else 0.0,
@@ -813,7 +817,7 @@ def _run_industrial_simulation(p: dict, demand_override=None, grid_cap_kw=None):
         if battery_lp:
             try:
                 sc_result = app.optimize_battery(
-                    gen, demand_30min, month_day,
+                    gen_lp, demand_30min, month_day,
                     capacity_kwh=p["battery_capacity_kwh"],
                     efficiency_pct=p["battery_efficiency_pct"],
                     max_charge_kw=p["battery_max_charge_kw"],
@@ -829,6 +833,7 @@ def _run_industrial_simulation(p: dict, demand_override=None, grid_cap_kw=None):
                     sell_price=p["sell_price_yen_per_kwh"],
                     no_export=no_export,
                     grid_import_cap_kw=grid_cap_kw,
+                    offsite=offsite_spec,
                 )
             except app.GridCapInfeasibleError:
                 # 診断の必要条件は満たしたがLPが実行不可能（主に充電レート不足）
@@ -1106,10 +1111,12 @@ def _run_industrial_simulation(p: dict, demand_override=None, grid_cap_kw=None):
     if grid_cap_kw:
         # 上限を強制したか（LP）／強制せず判定のみか（蓄電池なし・ルールベース）でstatusが変わる
         status = "enforced" if sc_result.get("grid_import_cap_kw") else "not_enforced"
+        # 導入後ピーク: 風力あり（オフサイト）は受電量（小売購入＋風力の配達分）の最大。なしは従来どおり系統購入
+        after = wind_off["receive"] if wind_off is not None else sc_result["import_"]
         out["grid_cap"] = _grid_cap_section(
             grid_cap_kw, grid_cap_diag, status,
             peak_before_kw=float(np.max(demand_30min)) * 2.0,
-            peak_after_kw=float(np.max(sc_result["import_"])) * 2.0,
+            peak_after_kw=float(np.max(after)) * 2.0,
         )
     return out
 
@@ -1300,7 +1307,8 @@ def validate_industrial_params(
               "wheeling_yen_per_kwh"（託送の電力量料金、既定=エリア×契約種別の一次資料の値）、
               "retail_fee_yen_per_kwh"（小売手数料、既定=推定値）。**観測地点（station_no）が北海道・東北のときだけ**使える
               （風力の調達エリアは需要地と同じ。list_wind_areas 参照）。届いた風力にも託送・賦課金・手数料がかかり、契約電力は
-              下がらず、売電できるのは敷地内の太陽光の余剰だけ。**系統受電上限（DC）とは併用できない**
+              下がらず、売電できるのは敷地内の太陽光の余剰だけ。系統受電上限（DC）とも併用できる（上限は届く風力も含めた
+              受電量に対する上限。風力は上限を守る助けにならず、太陽光と蓄電池（lp_optimized）で守る）
         pv_enabled: 太陽光を使うか（既定true）。falseなら faces を使わず風力のみで計算（wind の指定が必要）
 
     Returns:
@@ -1967,7 +1975,8 @@ def validate_dc_params(
               "wheeling_yen_per_kwh"（託送の電力量料金、既定=エリア×契約種別の一次資料の値）、
               "retail_fee_yen_per_kwh"（小売手数料、既定=推定値）。**観測地点（station_no）が北海道・東北のときだけ**使える
               （風力の調達エリアは需要地と同じ。list_wind_areas 参照）。届いた風力にも託送・賦課金・手数料がかかり、契約電力は
-              下がらず、売電できるのは敷地内の太陽光の余剰だけ。**系統受電上限（DC）とは併用できない**
+              下がらず、売電できるのは敷地内の太陽光の余剰だけ。系統受電上限（DC）とも併用できる（上限は届く風力も含めた
+              受電量に対する上限。風力は上限を守る助けにならず、太陽光と蓄電池（lp_optimized）で守る）
         pv_enabled: 太陽光を使うか（既定true）。falseなら faces を使わず風力のみで計算（wind の指定が必要）
 
     Returns:
@@ -2024,8 +2033,10 @@ def validate_dc_params(
                         "（現在は extra_high_voltage）")
                 cap = dc_info["grid_cap_kw"]
                 if cap and wind is not None:
-                    errors.append("風力と系統受電上限の併用は未対応です（風力は受電点に届くため、上限の判定に含める必要があります。"
-                                  "grid_cap を none にしてください）")
+                    # 風力は受電点に届くので、受電上限は風力の配達分も含めて守る（LPは受電点の基準で最適化する）
+                    warnings.append(
+                        "風力を使うときの受電上限は、送配電網で届く風力も含めた受電量に対する上限です。"
+                        "風力は上限を守る助けにならず（太陽光と蓄電池だけで守る）、契約電力も風力では下がりません")
                 if cap:
                     if peak <= cap:
                         warnings.append(
