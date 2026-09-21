@@ -1,6 +1,6 @@
 # 風力発電（オフサイトPPA）機能 設計計画
 
-**状態:** 承認済み（2026-09-20）。**W0・W1・W2・W2c・W2b・W3 完了**（W3は未コミット）、W4 以降は未着手。
+**状態:** 承認済み（2026-09-20）。**W0・W1・W2・W2c・W2b・W3・W4 完了**（W4は未コミット）、W5 以降は未着手。
 W2c＝ユーザー指摘（託送料金の反映漏れ）による経済性の作り直し（§5-4）
 **想定分担:** 本書＝設計（Opus）／実装＝別セッション（Sonnet）
 **前提となる調査:** `docs/decision_log.md` 第13段階（風力データ調査）
@@ -411,6 +411,16 @@ def run_simulation(..., demand_source=DEMAND_SOURCE_INDUSTRIAL, dc_args=None,
 - `list_wind_areas()` — 新規。エリア一覧・母数・抑制率・月別形状を返す
 - `estimate_wind_generation(area, capacity_kw, cf_pct)` — 新規。`estimate_pv_generation` と対になる
 - `simulate_industrial_pv` / `simulate_dc` に**任意引数 `wind`（dict）と `pv_enabled`** を追加
+
+#### W4 実装メモ（2026-09-21）
+
+- **`wind` は末尾の任意引数**（`validate_industrial_params` / `simulate_industrial_pv` / `validate_dc_params` / `simulate_dc`）。省略時の出力は従来とバイト同一（12ケースで確認。`assumptions` にも `wind` / `pv_enabled` のキーを足さない）。書式は {"capacity_kw": 1000} か {"coverage_pct": 100}（どちらか1つ）＋任意の `cf_pct` / `ppa_price_yen_per_kwh` / `wheeling_yen_per_kwh` / `retail_fee_yen_per_kwh`。**既定値は検証時に解決して `normalized_params.wind` に入れる**（エージェントがユーザーに確認できるように）。未知のキー・両方指定・どちらもなし・範囲外・対象外の地点はすべて入力エラー
+- **MCPの計算は `run_simulation` を呼ばない**（`_run_industrial_simulation` が同じ計算を独立に持つ）ため、風力の経済性はUIと同じ関数（`resolve_wind` / `offsite_receiving` / `offsite_cost_after`）を呼んで移した。二重実装は避けた。UIとの数値一致をテストで確認（メリット・配達量・費用・契約電力・24/7・MGのP-IRR・PPA単価・LP・DC）
+- **`pv_enabled=false`** のときは `faces` を検証せず（空でもよい）、`wind` が必須。MCPでは面のPpeak=0は入力エラー（UIと違い、風力のみにしたいときは `pv_enabled=false` と明示する）
+- **併用できないもの**: DCの系統受電上限（`validate_dc_params` が入力エラーにする）。MGは併用できる
+- 結果に **`wind` 節**（発電・届いた量・無駄になった量・費用の内訳・24/7の一致率・月別）と、`annual.pv_generation_kwh` / `total_generation_kwh`、`electricity_cost.annual_wind_ppa_payment_yen` を足す。MGは `wind_procurement_cost_yen_per_year`。風力ありの `caveats` に、オフサイトの費用構造・同時性の限界・託送の税区分と手数料の推定・PPA単価の意味を入れた
+- **新ツール2つ**: `list_wind_areas`（エリア・地点・月別／時間帯別の形状・託送の既定値・出典）、`estimate_wind_generation`（`station_no` / `capacity_kw` / `cf_pct` → 年間・月別発電量。`estimate_pv_generation` の風力版）
+- **プロトコル層の確認（2026-09-21、サーバー起動＋MCPクライアント）**: `tools/list` は9ツール、`simulate_*` のスキーマに `wind` / `pv_enabled`。`tools/call` の結果は数値が数値のまま（`int` / `float`）で、引用符付きの数値文字列はなし。**Gradio のMCPは結果を Python リテラル表記の文字列で返す**（`{'a': 1}`）ので、クライアントは `json.loads` でなく `ast.literal_eval` で読む。`simulate_*` は docstring に `Args:` 節がなくスキーマの引数説明が空のため、ツール説明の段落に `wind` の書式を書いた
 - **成功系の `return` は `_jsonable()` で包む**（プロジェクト規約）。変更後は
   プロトコル層（`tools/call`）で型まで確認する（numpy型が文字列になる既知の罠）
 
@@ -431,7 +441,7 @@ def run_simulation(..., demand_source=DEMAND_SOURCE_INDUSTRIAL, dc_args=None,
 | **W2b** ✅ | MG（モードB）への反映（風力の調達費用を年間費用に、PPA単価の逆算に、P-IRR・CFに反映） | 受電点基準で独立に再計算した収益・費用・P-IRRと一致（`test_wind_mode.py` PASS 122）。風力OFFは70項目バイト一致のまま。**変異テストで検出を確認** |
 | **W2d**（候補） | LPに「風力の配達量」変数を足し、受電上限・最適容量探索・LPの目的関数を受電点基準にする | 受電上限を守る。LPの実行時間が許容内 |
 | **W3** ✅ | UI（チェックボックス・アコーディオン・グラフ・注記） | `test_wind_ui.py` PASS 46（UI配線・変換・表示切替・グラフの内訳）。変異10件を検出。風力OFFは70項目バイト一致。ブラウザで動作確認済み。**Firefoxでのユーザー確認は未** |
-| **W4** | MCPツール2本追加＋2本拡張 | `test_mcp_wind_tools.py` 新規PASS。UI（`run_simulation`）と数値一致。プロトコル層で型確認 |
+| **W4** ✅ | MCPツール2本追加（`list_wind_areas` / `estimate_wind_generation`）＋`simulate_*` / `validate_*` に `wind`・`pv_enabled` | `test_mcp_wind_tools.py` PASS 74（UIと数値一致・入力検証・型）。省略時は従来の出力とバイト同一（12ケース）。変異15件を検出。プロトコル層で型確認済み。**Codex・Claude Code での実機検証は未** |
 | **W5** | 文書（`design_spec.md` に風力の節、`decision_log.md` に判断、`CLAUDE.md` の要約とテスト一覧、`architecture.md`） | 設計の正典が docs/ に揃う |
 | **W6**（候補） | オフサイト太陽光（発電所の場所の日射で発電量を作り、オフサイト電源のリストに加える） | §5-4「将来」。Xを用意できたエリア内に限る |
 
