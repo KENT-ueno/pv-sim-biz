@@ -1373,8 +1373,18 @@ def simulate_battery(generation_30min, demand_30min, month_day,
                      capacity_kwh, efficiency_pct,
                      max_charge_kw, max_discharge_kw,
                      soc_min_pct, soc_max_pct,
-                     no_export=False):
-    """蓄電池の充放電シミュレーション（30分×365日）。"""
+                     no_export=False, offsite_gen=None):
+    """蓄電池の充放電シミュレーション（30分×365日）。
+
+    offsite_gen: オフサイト電源（風力）の発電量 (365, 48)。None なら従来どおり（ビット同一）。
+        指定すると、generation_30min には敷地内の太陽光だけを渡す（風力は含めない）。蓄電池は太陽光の余剰だけを貯める。
+        不足分は 風力（送配電網で届く）→蓄電池→小売 の順に充てる:
+          太陽光で賄えない不足 D のうち、風力の配達量 = min(D, 風力の発電量)、蓄電池は風力で賄えなかった残りにだけ放電、
+          小売購入 = 残り。受電量 R（契約電力・受電上限の基準）= 風力の配達量 + 小売購入（蓄電池の放電で減る）
+        風力を貯めると受電量のピークを押し上げて契約電力が上がるため貯めない。また風力（約9円/kWh）を蓄電池で置き換えると、
+        貯めずに売れた太陽光の余剰（FIT等）を捨てるだけで損になるため、放電は風力の後にする（設計書 wind §5-4・W2e）。
+        結果に offsite_receive（R）・offsite_delivered を加え、import_ は小売購入、self_consumption は配達分を含める。
+    """
     n_days, n_slots = generation_30min.shape
     dt = 0.5
 
@@ -1393,6 +1403,9 @@ def simulate_battery(generation_30min, demand_30min, month_day,
     curtailment_arr = np.zeros((n_days, n_slots))
 
     current_soc = soc_min
+    if offsite_gen is not None:
+        offsite_receive = np.zeros((n_days, n_slots))
+        offsite_delivered = np.zeros((n_days, n_slots))
 
     for d in range(n_days):
         for s in range(n_slots):
@@ -1409,6 +1422,15 @@ def simulate_battery(generation_30min, demand_30min, month_day,
                 charge = min(surplus, max_charge_per_slot, max(0, room))
                 current_soc += charge * eff
                 surplus -= charge
+
+            delivered = 0.0
+            if offsite_gen is not None:
+                # 風力が先: 太陽光で賄えない不足 deficit に、届いた風力を充てる。
+                # 蓄電池は風力で賄えなかった残り（小売から買うはずの分）にだけ放電する。
+                # 風力（約9円/kWh）を蓄電池で置き換えると、貯めずに売れた太陽光の余剰（FIT等）を捨てるだけで損になるため
+                delivered = min(deficit, offsite_gen[d, s])
+                offsite_delivered[d, s] = delivered
+                deficit -= delivered
 
             discharge = 0.0
             if deficit > 0:
@@ -1427,13 +1449,19 @@ def simulate_battery(generation_30min, demand_30min, month_day,
             soc[d, s] = current_soc
             battery_charge[d, s] = charge
             battery_discharge[d, s] = discharge
-            self_consumption[d, s] = pv_direct + discharge
+            self_consumption[d, s] = pv_direct + discharge + delivered
             export_grid[d, s] = surplus
             import_grid[d, s] = deficit
+            if offsite_gen is not None:
+                # 送配電網から受ける量 R ＝ 風力の配達分 ＋ 小売購入（蓄電池の放電後）。契約電力・受電上限の基準
+                offsite_receive[d, s] = delivered + deficit
 
     annual_self = float(np.sum(self_consumption))
     annual_export = float(np.sum(export_grid))
     annual_import = float(np.sum(import_grid))
+    if offsite_gen is not None:
+        # 発電量は太陽光＋風力の合計で示す（オフサイトなしの並びと同じ見せ方）
+        generation_30min = generation_30min + offsite_gen
     annual_gen = float(np.sum(generation_30min))
     annual_demand = float(np.sum(demand_30min))
     annual_charge = float(np.sum(battery_charge))
@@ -1455,7 +1483,7 @@ def simulate_battery(generation_30min, demand_30min, month_day,
         monthly_export[m] = monthly_export.get(m, 0) + np.sum(export_grid[i])
         monthly_import[m] = monthly_import.get(m, 0) + np.sum(import_grid[i])
 
-    return {
+    result = {
         "self_consumption": self_consumption,
         "export": export_grid,
         "import_": import_grid,
@@ -1479,6 +1507,11 @@ def simulate_battery(generation_30min, demand_30min, month_day,
         "curtailment": curtailment_arr,
         "annual_curtailment": float(np.sum(curtailment_arr)),
     }
+    if offsite_gen is not None:
+        # 受電点の基準の運転（LPの offsite と同じキー。offsite_receiving がそのまま使う）
+        result["offsite_receive"] = offsite_receive
+        result["offsite_delivered"] = offsite_delivered
+    return result
 
 
 # ============================================================
@@ -3190,9 +3223,9 @@ def run_simulation(
                         return grid_cap_infeasible_response(
                             dc_info, contract_type, grid_cap_diag, "infeasible_lp", battery_info)
                 else:
-                    # ルールベース
+                    # ルールベース。風力あり: 蓄電池は太陽光だけで動かし、不足分を風力→小売が埋める（W2e）
                     sc_result = simulate_battery(
-                        gen_total, demand_30min, result["month_day"],
+                        gen_lp, demand_30min, result["month_day"],
                         capacity_kwh=bat_capacity,
                         efficiency_pct=bat_efficiency if bat_efficiency is not None else 95,
                         max_charge_kw=bat_max_charge if bat_max_charge is not None else 2.5,
@@ -3200,6 +3233,7 @@ def run_simulation(
                         soc_min_pct=bat_soc_min if bat_soc_min is not None else 20,
                         soc_max_pct=bat_soc_max if bat_soc_max is not None else 95,
                         no_export=no_export,
+                        offsite_gen=None if offsite_spec is None else offsite_spec["gen_30min"],
                     )
             else:
                 sc_result = calculate_self_consumption(
@@ -3287,6 +3321,9 @@ def run_simulation(
             if offsite_spec is not None and bat_enabled and battery_mode_label == "最適充放電（LP）":
                 result_text += ("以降の蓄電池の最適化（LP）は受電点の基準で行います"
                                 "（風力は送配電網で届く電源で、受電量・契約電力・受電上限に含まれます）\n")
+            elif offsite_spec is not None and bat_enabled and battery_mode_label == "ルールベース":
+                result_text += ("以降の蓄電池（ルールベース）は太陽光の余剰だけを貯め、太陽光と蓄電池で賄えない分を"
+                                "風力（届いた分）→小売が埋めます（風力は貯めません。風力を貯めるには最適充放電（LP）を使います）\n")
             else:
                 result_text += "以降の需給・蓄電池・料金の計算は、太陽光と風力の合計の発電量で行います\n"
 

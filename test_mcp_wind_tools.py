@@ -298,10 +298,12 @@ if "grid_cap" in r:
           and r["wind"]["delivered_kwh"] == round(ui[6]["wind_info"]["delivered_kwh"]),
           f"{r['electricity_cost']['annual_economic_merit_yen']} vs {num(ui[4], '年間経済メリット:', after='【風力込みの年間経済メリット】')}")
     check("  出力はJSON標準の型だけ", not non_json(r), str(non_json(r)[:3]))
-# ルールベース + 風力 + 受電上限: 上限は強制せず、導入後ピークは受電量（小売購入＋風力の配達分）の最大で判定する
-# （LPは受電量のピークを自ら下げるので小売購入のピークと分かれにくい。ルールベースでは分かれる）
+# ルールベース + 風力 + 受電上限: 上限は強制せず、導入後ピークは受電量（風力の配達分＋小売購入）の最大で判定する。
+# 受電量のピークと小売購入のピークが分かれる条件にする: 太陽光なし（風力のみ）・CEC実測形状（ピークが1コマに立つ）。
+# 需要が定常だと、風力が止まる夜のコマで両者が一致してしまい、測り方の違いを検出できない
+DCPC = dict(DCP, profile="cec")
 RBKW = dict(LPKW, battery_mode="rule_based")
-r_rb = m.simulate_dc(station_no="14163", faces=DCF, wind={"coverage_pct": 60.0}, grid_cap="hv_under_2000kw", **DCP, **RBKW)
+r_rb = m.simulate_dc(station_no="14163", pv_enabled=False, wind={"coverage_pct": 300.0}, grid_cap="hv_under_2000kw", **DCPC, **RBKW)
 check("simulate_dc: ルールベース + 風力 + 受電上限は計算でき、上限は強制しない（not_enforced）",
       "error" not in r_rb and r_rb.get("grid_cap", {}).get("status") == "not_enforced", str(r_rb.get("error") or r_rb.get("grid_cap"))[:80])
 if r_rb.get("grid_cap"):
@@ -310,10 +312,16 @@ if r_rb.get("grid_cap"):
                                   "demand_source": app.DEMAND_SOURCE_DATACENTER, "dc_args": {**m._dc_args_from_params(p_rb["dc"])},
                                   "sell_price": 19.0, "bat_enabled": True, "bat_mode": "ルールベース", "bat_capacity": 3000.0,
                                   "bat_max_charge": 1500.0, "bat_max_discharge": 1500.0, "bat_soc_min": 20, "bat_soc_max": 95},
-                          wind_args=uw(cov=60.0))
+                          wind_args=uw(cov=300.0), pv_enabled=False)
     check("  導入後ピークがUIと一致（受電量の最大。小売購入のピークではない）",
           ui_rb[6] is not None and abs(r_rb["grid_cap"]["peak_after_kw"] - num(ui_rb[4], "導入後ピーク:")) < 0.06,
           f"{r_rb['grid_cap']['peak_after_kw']} vs {num(ui_rb[4], '導入後ピーク:')}")
+    check("  ルールベース: 年間経済メリット・風力の配達量・24/7の時間一致率がUIと一致（W2e: 風力は貯めず、風力→蓄電池→小売の順）",
+          ui_rb[6] is not None
+          and abs(r_rb["electricity_cost"]["annual_economic_merit_yen"] - num(ui_rb[4], "年間経済メリット:", after="【風力込みの年間経済メリット】")) < 1.5
+          and r_rb["wind"]["delivered_kwh"] == round(ui_rb[6]["wind_info"]["delivered_kwh"])
+          and abs(r_rb["wind"]["matching_24_7"]["hourly_match_pct"] - float(re.search(r"時間一致率: ([\d.]+)%（系統購入", ui_rb[4]).group(1))) < 0.06,
+          f"{r_rb['electricity_cost']['annual_economic_merit_yen']} vs {num(ui_rb[4], '年間経済メリット:', after='【風力込みの年間経済メリット】')}")
     st_rb = ui_rb[6]
     retail_peak = float(st_rb["sc_result"]["import_"].max()) * 2.0
     check("  この条件では受電量のピークが小売購入のピークより大きい（確認の条件が有効）",

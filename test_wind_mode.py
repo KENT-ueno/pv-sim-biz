@@ -242,24 +242,21 @@ for label, over in (("ルールベース", dict(bat_enabled=True, bat_capacity=2
     scb, Db, pvb, wb = stb["sc_result"], stb["demand_30min"], stb["gen_pv"], stb["gen_wind"]
     off = app.offsite_receiving(pvb, [stb["wind_info"]], Db, scb)
     chb, disb = scb["battery_charge"], scb["battery_discharge"]
-    if label == "LP":
-        # LPは受電点の基準で解く（W2d）: 収支は 受電量 R + 太陽光 + 放電 = 需要 + 充電 + 売電 + 抑制（風力は R の一部）
-        resid = scb["offsite_receive"] + pvb + disb - (Db + chb + scb["export"] + scb["curtailment"])
-    else:
-        # ルールベースは太陽光＋風力の合計で運転する
-        resid = scb["import_"] + pvb + wb + disb - (Db + chb + scb["export"] + scb["curtailment"])
+    # LP（W2d）もルールベース（W2e）も受電点の基準で運転する（風力は受電量 R の一部）。
+    # 収支: 受電量 R + 太陽光 + 放電 = 需要 + 充電 + 売電 + 抑制
+    check(f"{label}: 受電点の基準の運転（offsite_receive・offsite_delivered を持つ）", "offsite_receive" in scb and "offsite_delivered" in scb)
+    resid = scb["offsite_receive"] + pvb + disb - (Db + chb + scb["export"] + scb["curtailment"])
     check(f"{label}: 運転のエネルギー収支が成り立つ（残差 1e-4 kWh 以内）", float(np.abs(resid).max()) < 1e-4,
           f"{float(np.abs(resid).max()):.1e}")
     check(f"{label}: 受電量 R ≧ 小売購入、配達量は 0〜風力発電量", bool((off["receive"] >= scb["import_"] - 1e-9).all()
           and (off["delivered"] >= 0).all() and (off["delivered"] <= wb + 1e-9).all()))
-    if label == "LP":
-        check("LP: 太陽光の余剰 = LPの売電＋抑制（風力は売電・抑制の対象外）",
-              abs(float(off["pv_surplus"].sum()) - float((scb["export"] + scb["curtailment"]).sum())) < 1e-6)
-    else:
-        check(f"{label}: 太陽光の余剰 ＋ 無駄になった風力 = 運転結果（プール）の余剰（売電＋抑制）",
-              abs(float(off["pv_surplus"].sum() + off["wasted_by_source"][0].sum())
-                  - float((scb["export"] + scb["curtailment"]).sum())) < 0.5)
+    check(f"{label}: 太陽光の余剰 = 運転の売電＋抑制（風力は売電・抑制の対象外）",
+          abs(float(off["pv_surplus"].sum()) - float((scb["export"] + scb["curtailment"]).sum())) < 1e-6)
     check(f"{label}: 完了して受電点基準の料金が出る", "風力では下がりません" in ob[4] and not ob[4].startswith("エラー"))
+rbw = run(wind_args=wind("coverage"), bat_enabled=True, bat_mode="ルールベース", bat_capacity=100.0,
+          bat_max_charge=50.0, bat_max_discharge=50.0)
+check("ルールベース+風力: 蓄電池は太陽光の余剰だけ貯め、不足は風力→蓄電池→小売の順である旨の注記を出す（W2e）",
+      "風力は貯めません" in rbw[4] and "風力（届いた分）→小売が埋めます" in rbw[4] and "受電点の基準で行います" not in rbw[4])
 lpw = run(wind_args=wind("coverage"), bat_enabled=True, bat_mode="最適充放電（LP）", bat_capacity=100.0,
           bat_max_charge=50.0, bat_max_discharge=50.0)
 check("LP+風力: LPは受電点の基準で解く旨の注記と、最適化のピーク・コストを出す（W2d）",

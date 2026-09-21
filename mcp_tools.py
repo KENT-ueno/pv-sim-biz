@@ -620,7 +620,8 @@ _WIND_CAVEATS = [
     "推定値（2023年度・全国平均）で公的な料金表はありません。PPA単価の既定値（11.96円/kWh）は入札の平均落札価格で、"
     "PPAの相対契約の単価そのものではありません",
     "蓄電池LP（lp_optimized）は受電点の基準で最適化します（風力は受電量の一部。売電・出力抑制は太陽光の余剰だけ）。"
-    "ルールベースは太陽光と風力を合わせた発電で運転します。LPは電気代の最小化で、24/7の一致率の最大化ではありません",
+    "ルールベース（rule_based）の蓄電池は太陽光の余剰だけを貯め、太陽光と蓄電池で賄えない分を風力（届いた分）→小売が埋めます"
+    "（風力は貯めません）。LPは電気代の最小化で、24/7の一致率の最大化ではありません",
 ]
 
 
@@ -839,8 +840,9 @@ def _run_industrial_simulation(p: dict, demand_override=None, grid_cap_kw=None):
                 # 診断の必要条件は満たしたがLPが実行不可能（主に充電レート不足）
                 raise _GridCapInfeasible(grid_cap_diag, "infeasible_lp")
         else:
+            # ルールベース。風力あり: 蓄電池は太陽光だけで動かし、不足分を風力→小売が埋める（W2e。UIと同じ）
             sc_result = app.simulate_battery(
-                gen, demand_30min, month_day,
+                gen_lp, demand_30min, month_day,
                 capacity_kwh=p["battery_capacity_kwh"],
                 efficiency_pct=p["battery_efficiency_pct"],
                 max_charge_kw=p["battery_max_charge_kw"],
@@ -848,6 +850,7 @@ def _run_industrial_simulation(p: dict, demand_override=None, grid_cap_kw=None):
                 soc_min_pct=p["battery_soc_min_pct"],
                 soc_max_pct=p["battery_soc_max_pct"],
                 no_export=no_export,
+                offsite_gen=None if offsite_spec is None else offsite_spec["gen_30min"],
             )
     else:
         sc_result = app.calculate_self_consumption(gen, demand_30min, month_day, no_export=no_export)

@@ -322,8 +322,8 @@ check("LP内の売電単価は配達単価より厳密に低い（同時に正�
 check("売電単価が低いとき（8.5円）はそのまま使う", app.offsite_lp_sell_price(8.5, unit_prices(), W_UNIT) == 8.5)
 
 # ============================================================
-print("\n【4. ルールベース（太陽光＋風力の合計で運転）を、LPが上回る（受電点の基準の電気代で比較）】")
-rule = app.simulate_battery(PV + WIND, DEM, MONTH_DAY, capacity_kwh=200.0, no_export=False, **BAT)
+print("\n【4. ルールベース（W2e: 風力を貯めず、風力→蓄電池→小売の順）を、LPが上回る（受電点の基準の電気代で比較）】")
+rule = app.simulate_battery(PV, DEM, MONTH_DAY, capacity_kwh=200.0, no_export=False, offsite_gen=WIND, **BAT)
 tc_rule, _, _ = true_cost(rule, PV, 8.5)
 sc8 = solve(200.0, 8.5)
 tc8, _, _ = true_cost(sc8, PV, 8.5)
@@ -331,6 +331,8 @@ check("LP ≤ ルールベース（受電点の電気代−売電収入。LPが�
 nob = app.calculate_self_consumption(PV + WIND, DEM, MONTH_DAY)
 tc_nob, _, _ = true_cost(nob, PV, 8.5)
 check("LP ≤ 蓄電池なし", tc8 <= tc_nob + 0.5, f"{tc8:,.0f} ≤ {tc_nob:,.0f}")
+check("ルールベース（W2e）≤ 蓄電池なし（風力を貯めないので、蓄電池を足しても悪くならない）", tc_rule <= tc_nob + 0.5,
+      f"{tc_rule:,.0f} ≤ {tc_nob:,.0f}")
 
 # ============================================================
 print("\n【5. offsite=None（風力なし）は従来のLPのまま】")
@@ -354,6 +356,102 @@ check("配達量 = 受電量 − 小売購入（風力の発電量以下）", np
 sc_rule = dict(import_=z + 6.0, battery_charge=z, battery_discharge=z)
 off_rule = app.offsite_receiving(z, [src_syn], z + 10.0, sc_rule)
 check("ルールベース（offsite_receive なし）は従来どおり収支から逆算する", np.allclose(off_rule["receive"], 10.0) and np.allclose(off_rule["pv_surplus"], 0.0))
+
+print("\n【5c. simulate_battery(offsite_gen)（W2e）: ルールベースは風力を貯めない。参照実装・不変条件・従来との同一性】")
+
+
+def reference_rule(pv, wind, dem, cap_kwh, ch_kw, dis_kw, eff_pct=95.0, smin=20.0, smax=95.0, no_export=False):
+    """ルールベース（風力あり）の参照実装。simulate_battery とは別に、1コマずつ素直に書く。
+    順序: 太陽光を直接使う → 太陽光の余剰で充電 → 不足に風力（届いた分）→ 風力で賄えない残りに放電 → 残りが小売購入。"""
+    eff = eff_pct / 100.0
+    lo, hi = cap_kwh * smin / 100.0, cap_kwh * smax / 100.0
+    soc = lo
+    out = {k: np.zeros(pv.shape) for k in ("ch", "dis", "w", "retail", "recv", "exp", "cur")}
+    for d in range(pv.shape[0]):
+        for s in range(pv.shape[1]):
+            g, dm, wd = pv[d, s], dem[d, s], wind[d, s]
+            direct = min(g, dm)
+            surplus, deficit = g - direct, dm - direct
+            c = 0.0
+            if surplus > 0:
+                c = min(surplus, ch_kw * 0.5, max(0.0, (hi - soc) / eff))
+                soc += c * eff
+                surplus -= c
+            w = min(deficit, wd)
+            deficit -= w
+            x = 0.0
+            if deficit > 0:
+                x = min(deficit, dis_kw * 0.5, max(0.0, (soc - lo) * eff))
+                soc -= x / eff
+                deficit -= x
+            soc = max(lo, min(hi, soc))
+            if no_export:
+                out["cur"][d, s], surplus = surplus, 0.0
+            out["ch"][d, s], out["dis"][d, s], out["w"][d, s] = c, x, w
+            out["retail"][d, s], out["exp"][d, s] = deficit, surplus
+            out["recv"][d, s] = w + deficit
+    return out
+
+
+for label, kw in (("余剰売電", dict(no_export=False)), ("逆潮流禁止", dict(no_export=True))):
+    rb = app.simulate_battery(PV, DEM, MONTH_DAY, capacity_kwh=80.0, efficiency_pct=95.0, max_charge_kw=60.0, max_discharge_kw=60.0,
+                              soc_min_pct=20.0, soc_max_pct=95.0, offsite_gen=WIND, **kw)
+    ref = reference_rule(PV, WIND, DEM, 80.0, 60.0, 60.0, **kw)
+    check(f"{label}: 充電・放電・配達・小売購入・受電量・売電・抑制が参照実装と一致",
+          all(np.allclose(a, b, atol=1e-9) for a, b in (
+              (rb["battery_charge"], ref["ch"]), (rb["battery_discharge"], ref["dis"]), (rb["offsite_delivered"], ref["w"]),
+              (rb["import_"], ref["retail"]), (rb["offsite_receive"], ref["recv"]), (rb["export"], ref["exp"]),
+              (rb["curtailment"], ref["cur"]))))
+    direct = np.minimum(PV, DEM)
+    check(f"{label}: 収支 需要 = 太陽光の直接使用 + 風力の配達 + 放電 + 小売購入",
+          np.allclose(DEM, direct + rb["offsite_delivered"] + rb["battery_discharge"] + rb["import_"], atol=1e-9))
+    check(f"{label}: 蓄電池は太陽光の余剰でだけ充電する（風力では充電しない。受電量を押し上げない）",
+          ((rb["battery_charge"] > 1e-12) <= (PV > DEM)).all() and (rb["battery_charge"] <= np.maximum(0.0, PV - DEM) + 1e-9).all())
+    check(f"{label}: 受電量 = 風力の配達分 + 小売購入", np.allclose(rb["offsite_receive"], rb["offsite_delivered"] + rb["import_"], atol=1e-9))
+    check(f"{label}: 自家消費量 = 需要 − 小売購入（風力の配達分を含む）、自家消費率の分母は太陽光＋風力の発電量",
+          np.allclose(rb["self_consumption"], DEM - rb["import_"], atol=1e-9)
+          and abs(rb["annual_self"] - (DEM.sum() - rb["annual_import"])) < 1e-6
+          and abs(rb["self_consumption_rate"] - rb["annual_self"] / (PV + WIND).sum() * 100) < 1e-9
+          and abs(sum(rb["monthly_gen"].values()) - (PV + WIND).sum()) < 1e-6)
+    check(f"{label}: 受電量は蓄電池なし（Σ max(0, 需要−太陽光)）を超えない（従来の合算運転は超えうる）",
+          (rb["offsite_receive"] <= np.maximum(0.0, DEM - PV) + 1e-9).all())
+    check(f"{label}: 放電は風力で賄えない残りの分だけ（風力の配達分を蓄電池で置き換えない）",
+          (rb["battery_discharge"] <= np.maximum(0.0, DEM - PV - WIND) + 1e-9).all())
+    check(f"{label}: 配達量 = min(太陽光で賄えない不足, 風力)（蓄電池に依存しない）",
+          np.allclose(rb["offsite_delivered"], np.minimum(np.maximum(0.0, DEM - PV), WIND), atol=1e-9))
+    off_rb = app.offsite_receiving(PV, SPEC["sources"], DEM, rb)
+    check(f"{label}: offsite_receiving は運転の受電量・配達量・太陽光の余剰をそのまま使う",
+          np.allclose(off_rb["receive"], rb["offsite_receive"]) and np.allclose(off_rb["delivered"], rb["offsite_delivered"])
+          and np.allclose(off_rb["pv_surplus"], rb["export"] + rb["curtailment"]))
+    nb = app.calculate_self_consumption(PV + WIND, DEM, MONTH_DAY)
+    check(f"{label}: 蓄電池なしの小売購入（従来の合算）以下（蓄電池は購入を減らす）",
+          rb["annual_import"] <= nb["annual_import"] + 1e-9, f"{rb['annual_import']:.2f} <= {nb['annual_import']:.2f}")
+
+# 風力が常に0なら、風力なしのルールベースと同じ運転になる
+rb0 = app.simulate_battery(PV, DEM, MONTH_DAY, capacity_kwh=80.0, efficiency_pct=95.0, max_charge_kw=60.0, max_discharge_kw=60.0,
+                           soc_min_pct=20.0, soc_max_pct=95.0, offsite_gen=np.zeros_like(WIND))
+pl = app.simulate_battery(PV, DEM, MONTH_DAY, capacity_kwh=80.0, efficiency_pct=95.0, max_charge_kw=60.0, max_discharge_kw=60.0,
+                          soc_min_pct=20.0, soc_max_pct=95.0)
+check("風力が常に0: 風力なしのルールベースと同じ運転（充電・放電・購入・売電）",
+      all(np.allclose(rb0[k], pl[k]) for k in ("battery_charge", "battery_discharge", "import_", "export")))
+check("offsite_gen を省略: 従来のキー構成（offsite_* を持たない）", "offsite_receive" not in pl and "offsite_delivered" not in pl)
+
+# 従来の合算運転が受電量のピークを押し上げうること（W2eの動機）。凪と風のコマだけの小さなデータで作る:
+# 需要10kWh/コマ・太陽光なし、コマ5だけ風力50kWh。合算運転は風力の余剰40kWhを蓄電池に貯める（充電30kWh）が、
+# 貯めるには送配電網から受ける量を 10 → 40kWh に増やすことになり、受電量（契約電力）のピークが上がる
+z1 = np.zeros((1, 48))
+d1 = z1 + 10.0
+w1 = z1.copy()
+w1[0, 5] = 50.0
+kw1 = dict(capacity_kwh=500.0, efficiency_pct=95.0, max_charge_kw=60.0, max_discharge_kw=60.0, soc_min_pct=20.0, soc_max_pct=95.0)
+pool1 = app.simulate_battery(z1 + w1, d1, [(1, 1)], **kw1)
+r_pool1 = np.maximum(np.maximum(0.0, d1 + pool1["battery_charge"] - pool1["battery_discharge"] - z1), pool1["import_"])
+rb_1 = app.simulate_battery(z1, d1, [(1, 1)], offsite_gen=w1, **kw1)
+check("従来の合算運転は風力を貯めて受電量のピークを押し上げる（10kWh → 40kWh/コマ）、W2eの運転は押し上げない",
+      abs(r_pool1.max() - 40.0) < 1e-9 and abs(rb_1["offsite_receive"].max() - 10.0) < 1e-9,
+      f"合算 {r_pool1.max()} / W2e {rb_1['offsite_receive'].max()}")
+check("  W2eの運転: 風力は貯めず（充電0）、コマ5の風力の配達は需要10kWhまで（残り40kWhは無駄）",
+      rb_1["battery_charge"].sum() == 0.0 and abs(rb_1["offsite_delivered"][0, 5] - 10.0) < 1e-9)
 
 # WIND_LP_FAST=1: run_simulation を通す節（約1.5分）を飛ばす（変異テストでLPの定式化だけを見るとき用）
 if os.environ.get("WIND_LP_FAST"):
@@ -391,18 +489,24 @@ tight_nw = run(dc_args=dict(DC, grid_cap_mode=app.GRID_CAP_MANUAL, grid_cap_kw=3
 check("上限が低すぎる条件: 風力があっても診断（守れない）を返す", tight[6] is None and "受電上限" in tight[4] and "守れません" in tight[4], tight[4][:60])
 check("  診断は風力なしと同じ（風力は上限を守る助けにならない）", tight[4].split("══ 受電上限 ══")[-1] == tight_nw[4].split("══ 受電上限 ══")[-1])
 
-# 蓄電池なし・ルールベース + 受電上限 + 風力: 上限は強制せず、受電量で超過を判定する
-rb = run(dc_args=dict(DC, grid_cap_mode=app.GRID_CAP_HV), wind_args=w60,
-         bat_enabled=True, bat_mode="ルールベース", bat_capacity=3000.0, bat_max_charge=1500.0, bat_max_discharge=1500.0, **dc_kw)
-check("ルールベース + 風力 + 受電上限: 計算でき『強制していません』の判定が出る",
-      not rb[4].startswith("エラー") and rb[6] is not None and "受電上限" in rb[4], rb[4][:60])
+# ルールベース + 受電上限 + 風力: 上限は強制せず、導入後ピークは受電量（風力の配達分＋小売購入）の最大で判定する。
+# 受電量のピークと小売購入のピークが分かれる条件にする: 太陽光なし（風力のみ）・CEC実測形状（ピークが1コマに立つ）。
+# 需要が定常だと、風力が止まる夜のコマで両者が一致してしまい、測り方の違いを検出できない
+rb = run(dc_args=dict(DC, profile_mode=app.PROFILE_CEC, grid_cap_mode=app.GRID_CAP_HV), wind_args=wind("coverage", coverage_pct=300.0),
+         bat_enabled=True, bat_mode="ルールベース", bat_capacity=3000.0, bat_max_charge=1500.0, bat_max_discharge=1500.0,
+         pv_enabled=False, **dc_kw)
+check("ルールベース + 風力 + 受電上限: 計算でき、上限は強制せず判定だけ出る（上限内なら『蓄電池なしでも上限を守れます』）",
+      not rb[4].startswith("エラー") and rb[6] is not None and "受電上限" in rb[4] and "蓄電池なしでも上限を守れます" in rb[4], rb[4][:60])
 if rb[6] is not None:
-    Rr = rb[6]["sc_result"]  # ルールベースは sc_result に offsite_receive を持たない。受電量は offsite_receiving で再構成される
     m = re.search(r"導入後ピーク: ([\d,\.]+) kW", rb[4])
     st = rb[6]
-    off_rb = app.offsite_receiving(st["gen_pv"], [st["wind_info"]], st["demand_30min"], st["sc_result"])
-    check("  導入後ピークは受電量（小売＋風力の配達分）の最大", m is not None and abs(float(m.group(1).replace(",", "")) - off_rb["receive"].max() / 0.5) < 0.06,
-          f"{m.group(1) if m else None} vs {off_rb['receive'].max() / 0.5:.1f}")
+    scr_rb = st["sc_result"]
+    check("  ルールベースの運転結果も受電点の基準（offsite_receive を持つ）", "offsite_receive" in scr_rb)
+    r_peak = scr_rb["offsite_receive"].max() / 0.5
+    retail_peak = scr_rb["import_"].max() / 0.5
+    check("  導入後ピークは受電量（風力の配達分＋小売購入）の最大", m is not None and abs(float(m.group(1).replace(",", "")) - r_peak) < 0.06,
+          f"{m.group(1) if m else None} vs {r_peak:.1f}")
+    check("  この条件では受電量のピークが小売購入のピークより大きい（確認の条件が有効）", r_peak > retail_peak + 1.0, f"{r_peak:.1f} > {retail_peak:.1f}")
 
 # LP（風力あり・上限なし）: 結果テキストの整合（LPの最適化コスト = 導入後の電気代 − 売電収入）
 o = run(wind_args=wind("coverage"), bat_enabled=True, bat_mode="最適充放電（LP）", bat_capacity=200.0,
