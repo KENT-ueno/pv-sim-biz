@@ -366,9 +366,9 @@ demand(t) = IT定格容量 × IT負荷率(年平均) × 形状(t) × PUE × 0.5 
   `test_mcp_dc_tools.py`（PASS 126。DCのMCPツール。UI（run_simulation）との数値一致・受電上限の各状態・入力検証・出力がJSON標準の型だけ）／
   `test_wind_shape.py`（PASS 86。風力の形状データ・地点→エリア対応・計算層）／
   `test_wind_mode.py`（PASS 124。風力の `run_simulation` 統合。受電点基準の料金・託送・売電の帰属・MG（W2b）を、別経路で再計算した値と照合。約40秒）／
-  `test_wind_lp.py`（PASS 95。風力を受電点の基準で解くLP。scipy.linprogの独立実装との最適値一致・不変条件・FIT裁定なし。約2分）／
+  `test_wind_lp.py`（PASS 99。風力を受電点の基準で解くLP。scipy.linprogの独立実装との最適値一致・不変条件・FIT裁定なし。約2分）／
   `test_wind_ui.py`（PASS 46。風力のUI。「計算」ボタンの関数をUIの入力の並びどおりに呼ぶ配線テスト、入力の変換、表示切替、グラフの内訳。約8秒）／
-  `test_mcp_wind_tools.py`（PASS 78。風力のMCPツール。UI（run_simulation）との数値一致・入力検証・出力がJSON標準の型だけ。約25秒）
+  `test_mcp_wind_tools.py`（PASS 82。風力のMCPツール。UI（run_simulation）との数値一致・入力検証・出力がJSON標準の型だけ。約25秒）
 - **MCPの計算は `run_simulation` を呼ばず、`_run_industrial_simulation` が独立に持っている。** UIの経済性を変えたら、MCP側にも移す（風力は `offsite_receiving` 等をUIと共有して二重実装を避けた）。`wind` を省略したときの出力は従来とバイト同一でなければならない
 - **MCPの公開ツール（`mcp_tools.py`）の成功系の `return` は `_jsonable()` で包む。** numpy型（`round()` の結果も含む）が混ざると、
   MCP経由で数値が文字列（`"11.5"`）になる。直接呼び出しやHTTPの `/call` では検出できないため、変更後は**プロトコル層（`tools/call`）で
@@ -467,7 +467,7 @@ demand(t) = IT定格容量 × IT負荷率(年平均) × 形状(t) × PUE × 0.5 
 | W2 | `run_simulation` 統合（`pv_enabled` / `wind_args`、24/7指標、自家消費型・DCの経済性） | ✅ 完了・コミット済み |
 | W2c | 経済性を受電点基準に作り直し（託送・賦課金・手数料・契約電力は下がらない）。ユーザー指摘による | ✅ 完了・コミット済み |
 | W2b | MG（モードB）への反映（風力の調達費用・PPA単価の逆算・P-IRR。`_calc_irr` の発散バグも修正） | ✅ 完了・コミット済み |
-| W2d | 蓄電池LPを受電点の基準で解く（受電上限・最適容量探索・LPの目的関数）。`test_wind_lp.py`（独立実装scipyとの一致を含む） | ✅ 完了・コミット済み（変異テストは未実施） |
+| W2d | 蓄電池LPを受電点の基準で解く（受電上限・最適容量探索・LPの目的関数）。`test_wind_lp.py`（独立実装scipyとの一致を含む） | ✅ 完了・コミット済み。変異テスト27件のうち26件を検出（残る1件は等価変異。設計書 §5-4） |
 | W3 | UI（風力の設定欄・太陽光を使うチェック・エリア表示・グラフの積み上げ）。任意入力は空欄＝既定のテキスト欄 | ✅ 完了・コミット済み（日別グラフはユーザーが確認済み。月別の積み上げの見た目は未確認） |
 | W4 | MCPツール（`list_wind_areas` / `estimate_wind_generation` ＋ `simulate_*` / `validate_*` に `wind`・`pv_enabled`。計9ツール） | ✅ 完了・コミット済み（Codex・Claude Code での実機検証は未） |
 | W5 | 文書の仕上げ（README・architecture・設計書の参照・実機検証の手順書） | ✅ 完了・**本番反映済み**。実機検証（Codex・Claude Code）は未実施 |

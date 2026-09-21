@@ -343,6 +343,18 @@ sc_z = app.optimize_battery(PV, DEM, MONTH_DAY, capacity_kwh=200.0, sell_price=8
 check("風力が常に0のオフサイトLPは、風力なしのLPと同じ最適値（同じ問題になる）",
       abs(sc_z["opt_annual_cost"] - plain["opt_annual_cost"]) < 0.5, f"{sc_z['opt_annual_cost']:.2f} vs {plain['opt_annual_cost']:.2f}")
 
+print("\n【5b. offsite_receiving: LPの結果（offsite_receive を持つ）は、受電量・売電・抑制をそのまま使う（合成データ）】")
+z = np.zeros((1, 48))
+sc_syn = dict(import_=z + 2.0, battery_charge=z, battery_discharge=z, offsite_receive=z + 5.0, export=z + 3.0, curtailment=z + 0.5)
+src_syn = dict(gen_30min=z + 4.0, wheeling_yen=2.15, retail_fee_yen=3.0)
+off_syn = app.offsite_receiving(z, [src_syn], z + 10.0, sc_syn)
+check("受電量 = LPの offsite_receive（収支からの逆算ではない）", np.allclose(off_syn["receive"], 5.0))
+check("太陽光の余剰 = LPの売電 + 抑制（同じコマで受電と売電が正でも、そのまま）", np.allclose(off_syn["pv_surplus"], 3.5), str(off_syn["pv_surplus"][0, 0]))
+check("配達量 = 受電量 − 小売購入（風力の発電量以下）", np.allclose(off_syn["delivered"], 3.0))
+sc_rule = dict(import_=z + 6.0, battery_charge=z, battery_discharge=z)
+off_rule = app.offsite_receiving(z, [src_syn], z + 10.0, sc_rule)
+check("ルールベース（offsite_receive なし）は従来どおり収支から逆算する", np.allclose(off_rule["receive"], 10.0) and np.allclose(off_rule["pv_surplus"], 0.0))
+
 # WIND_LP_FAST=1: run_simulation を通す節（約1.5分）を飛ばす（変異テストでLPの定式化だけを見るとき用）
 if os.environ.get("WIND_LP_FAST"):
     print(f"\n結果（節6・7を飛ばした高速版）: PASS {n_pass} / FAIL {n_fail}")
@@ -405,7 +417,8 @@ check("run_simulation LP + 風力（売電19円）: 最適化年間コスト = �
 check("run_simulation LP + 風力: 受電量と売電が同時に正にならない", np.minimum(scr["offsite_receive"], scr["export"] + scr["curtailment"]).max() < 1e-6)
 
 # 最適容量探索 + 風力
-cs_o = run(bat_enabled=True, bat_mode="最適容量探索", bat_max_charge=100.0, bat_max_discharge=100.0, wind_args=wind("coverage"))
+cs_o = run(bat_enabled=True, bat_mode="最適容量探索", bat_max_charge=100.0, bat_max_discharge=100.0, wind_args=wind("coverage"),
+             bat_cost_per_kwh=60000.0)   # 単価を下げて、最適容量が数十kWhになる条件にする（風力の扱いで最適容量が変わる）
 cs_ok = not cs_o[4].startswith("エラー") and "最適蓄電池容量" in cs_o[4] and "最適容量探索エラー" not in cs_o[4]
 check("最適容量探索 + 風力: 計算できる（従来は明示エラー）", cs_ok, cs_o[4][:80].replace("\n", " "))
 if cs_ok:
@@ -417,7 +430,7 @@ if cs_ok:
     st_c = cs_o[6]
     cap_exact = app.optimize_battery_capacity(
         st_c["gen_pv"], st_c["demand_30min"], st_c["month_day"], efficiency_pct=95, max_charge_kw=100.0,
-        max_discharge_kw=100.0, soc_min_pct=20, soc_max_pct=95, sell_price=19.0, battery_cost_per_kwh=200000.0,
+        max_discharge_kw=100.0, soc_min_pct=20, soc_max_pct=95, sell_price=19.0, battery_cost_per_kwh=60000.0,
         payback_years=15, no_export=False, offsite=app.offsite_lp_spec([st_c["wind_info"]]), **RATE)["optimal_capacity_kwh"]
     check("  結果テキストの最適容量 = 直接解いた段階1の最適容量（小数1桁）", abs(cap_exact - opt_cap) < 0.051, f"{cap_exact:.4f} vs {opt_cap}")
     # 同じ容量で通常のLP（風力あり）を実行し、年間経済メリット（PPA支払後）と段階1の値が一致することを確認する

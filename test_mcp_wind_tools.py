@@ -276,7 +276,10 @@ check("DC: 受電上限なしなら valid（上限の警告は出ない）", r["
 LPKW = dict(battery_enabled=True, battery_mode="lp_optimized", battery_capacity_kwh=3000.0, battery_max_charge_kw=1500.0,
             battery_max_discharge_kw=1500.0, battery_soc_min_pct=20.0, battery_soc_max_pct=95.0)
 DCF = [{"ppeak_kw": 3000.0, "tilt_deg": 30.0, "azimuth_deg": 180.0}]
-r = m.simulate_dc(station_no="14163", faces=DCF, wind={"coverage_pct": 60.0}, grid_cap="ehv_under_10000kw", **LPKW)
+# 需要は定常（平坦）にする: 風力の配達分が受電量のピークに効き、受電量と小売購入のピークが分かれる条件（導入後ピークを受電量で測る確認のため）
+DCP = dict(workload="manual", capacity_mode="it_capacity", it_capacity_kw=1000.0, it_load_factor_pct=80.0, pue=1.40,
+           profile="flat", noise_level="none")
+r = m.simulate_dc(station_no="14163", faces=DCF, wind={"coverage_pct": 60.0}, grid_cap="ehv_under_10000kw", **DCP, **LPKW)
 check("simulate_dc: 風力 + 受電上限 + LP が計算できる（W2d。従来は error）", "error" not in r and "grid_cap" in r, str(r.get("error") or r.get("errors"))[:80])
 if "grid_cap" in r:
     gc = r["grid_cap"]
@@ -295,10 +298,39 @@ if "grid_cap" in r:
           and r["wind"]["delivered_kwh"] == round(ui[6]["wind_info"]["delivered_kwh"]),
           f"{r['electricity_cost']['annual_economic_merit_yen']} vs {num(ui[4], '年間経済メリット:', after='【風力込みの年間経済メリット】')}")
     check("  出力はJSON標準の型だけ", not non_json(r), str(non_json(r)[:3]))
+# ルールベース + 風力 + 受電上限: 上限は強制せず、導入後ピークは受電量（小売購入＋風力の配達分）の最大で判定する
+# （LPは受電量のピークを自ら下げるので小売購入のピークと分かれにくい。ルールベースでは分かれる）
+RBKW = dict(LPKW, battery_mode="rule_based")
+r_rb = m.simulate_dc(station_no="14163", faces=DCF, wind={"coverage_pct": 60.0}, grid_cap="hv_under_2000kw", **DCP, **RBKW)
+check("simulate_dc: ルールベース + 風力 + 受電上限は計算でき、上限は強制しない（not_enforced）",
+      "error" not in r_rb and r_rb.get("grid_cap", {}).get("status") == "not_enforced", str(r_rb.get("error") or r_rb.get("grid_cap"))[:80])
+if r_rb.get("grid_cap"):
+    p_rb = r_rb["assumptions"]
+    ui_rb = app.run_simulation(**{**UI_BASE, "station_choice": "14163 (SAPPORO)", "face_args": face_args([(3000.0, "南", 180.0, 30, 0)]),
+                                  "demand_source": app.DEMAND_SOURCE_DATACENTER, "dc_args": {**m._dc_args_from_params(p_rb["dc"])},
+                                  "sell_price": 19.0, "bat_enabled": True, "bat_mode": "ルールベース", "bat_capacity": 3000.0,
+                                  "bat_max_charge": 1500.0, "bat_max_discharge": 1500.0, "bat_soc_min": 20, "bat_soc_max": 95},
+                          wind_args=uw(cov=60.0))
+    check("  導入後ピークがUIと一致（受電量の最大。小売購入のピークではない）",
+          ui_rb[6] is not None and abs(r_rb["grid_cap"]["peak_after_kw"] - num(ui_rb[4], "導入後ピーク:")) < 0.06,
+          f"{r_rb['grid_cap']['peak_after_kw']} vs {num(ui_rb[4], '導入後ピーク:')}")
+    st_rb = ui_rb[6]
+    retail_peak = float(st_rb["sc_result"]["import_"].max()) * 2.0
+    check("  この条件では受電量のピークが小売購入のピークより大きい（確認の条件が有効）",
+          r_rb["grid_cap"]["peak_after_kw"] > retail_peak + 1.0, f"{r_rb['grid_cap']['peak_after_kw']} > {retail_peak:.1f}")
 # 守れない上限（手入力で低すぎる）は、風力があっても診断（grid_cap_infeasible）を返す
-r = m.simulate_dc(station_no="14163", faces=DCF, wind={"coverage_pct": 60.0}, grid_cap="manual", grid_cap_kw=300.0, **LPKW)
+r = m.simulate_dc(station_no="14163", faces=DCF, wind={"coverage_pct": 60.0}, grid_cap="manual", grid_cap_kw=300.0, **DCP, **LPKW)
 check("simulate_dc: 上限が低すぎるときは診断（grid_cap_infeasible）を返し、error にしない",
       r.get("grid_cap_infeasible") is True and "error" not in r, str(r)[:100])
+r_nw = m.simulate_dc(station_no="14163", faces=DCF, grid_cap="manual", grid_cap_kw=300.0, **DCP, **LPKW)
+if r.get("grid_cap_infeasible") and r_nw.get("grid_cap_infeasible"):
+    g1, g0 = r["grid_cap"], r_nw["grid_cap"]
+    check("  診断は風力なしと同じ（風力は上限を守る助けにならない。太陽光だけで診断する）",
+          g1["exceed_energy_kwh"] == g0["exceed_energy_kwh"] and g1["exceed_slots"] == g0["exceed_slots"]
+          and g1["violations"] == g0["violations"],
+          f"{g1['exceed_energy_kwh']} vs {g0['exceed_energy_kwh']}")
+else:
+    check("  診断は風力なしと同じ", False, "両方が診断を返さなかった")
 
 # ============================================================
 print("\n【3. list_wind_areas / estimate_wind_generation】")
