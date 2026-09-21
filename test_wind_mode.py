@@ -319,6 +319,13 @@ o = run(pv_enabled=False)
 check("太陽光も風力も使わない設定はエラー", o[4].startswith("エラー") and "どちらか" in o[4])
 o = run(wind_args=wind("coverage"), face_args=face_args([(0.0, "南", 180.0, 30, 0)]))
 check("太陽光ONでも面のPpeakが0なら風力のみとして動く", not o[4].startswith("エラー"))
+# 太陽光の容量を0にして風力だけを見る使い方（UIで最も自然な操作）。『太陽光を使わない』と同じ表示になること
+check("Ppeak=0: 『太陽光発電: 使用しない』と出し、空の面別見出し・K'・太陽光のみの行は出さない",
+      "太陽光発電: 使用しない（風力のみ）" in o[4] and "面別年間発電量" not in o[4] and "K' =" not in o[4]
+      and row(o[4], "太陽光のみ")[0] is None and "太陽光=使用しない" in o[5])
+o_small = run(face_args=face_args([(0.0, "南", 180.0, 30, 0)]), wind_args=wind("capacity", capacity_kw=5.0))
+check("24/7の『差』は負のゼロ（-0.0）にならない（風力が小さく、発電を全量使い切るとき）",
+      "差: -" not in o_small[4] and "差: 0.0 ポイント" in o_small[4], re.search(r"差: [^ ]+", o_small[4]).group(0))
 o = run(face_args=face_args([(0.0, "南", 180.0, 30, 0)]))
 check("風力なしで有効な面がなければ従来のエラー", "有効な面設定がありません" in o[4])
 

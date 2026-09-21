@@ -1244,7 +1244,7 @@ def format_247(gen_pv, wind_info, demand_30min, sc_result, month_day, pv_enabled
     t += "【設定どおり（蓄電池・受電上限を含む）】\n"
     t += f"  量ベース達成率: {vol_all:.1f}%（年間の発電量 ÷ 年間の需要量）\n"
     t += f"  時間一致率: {hourly_set:.1f}%（系統購入 {float(sc_result['annual_import']):,.1f} kWh/年）\n"
-    t += (f"  差: {vol_all - hourly_set:.1f} ポイント"
+    t += (f"  差: {max(0.0, vol_all - hourly_set):.1f} ポイント"
           "（量ベース達成率と時間一致率の差。大きいほど、年間では足りていてもその時間には足りていない）\n")
     if sc_result.get("optimized"):
         t += ("  ※ 蓄電池（最適充放電LP）は電気代を最小にする運転で、時間一致率の最大化を目的にしていません。\n"
@@ -2977,6 +2977,8 @@ def run_simulation(
             if not pv_enabled:
                 return None, None, None, None, "エラー: 太陽光も風力も使わない設定です（どちらかを有効にしてください）", "", None
             return None, None, None, None, "エラー: 有効な面設定がありません（Ppeak > 0の面が必要です）", "", None
+        # 太陽光を実際に使うか（チェックONでも、有効な面（Ppeak > 0）がなければ風力のみ）。風力なしでは常に True
+        pv_used = bool(pv_enabled) and bool(faces)
 
         # --- 両面パネル: albedo時系列の準備 ---
         albedo_flat = None
@@ -3139,7 +3141,7 @@ def run_simulation(
             result_text += format_dc_summary(dc_info, contract_type) + "\n"
             if grid_cap_text:
                 result_text += grid_cap_text + "\n"
-        if not pv_enabled:
+        if not pv_used:
             result_text += "太陽光発電: 使用しない（風力のみ）\n"
         else:
             result_text += f"年間発電量{'' if wind_info is None else '（太陽光）'}: {result['annual']:.1f} kWh/年\n"
@@ -3215,7 +3217,7 @@ def run_simulation(
         # --- 24/7（時間単位の再エネ一致）: 風力を使うときの主指標 ---
         if wind_info is not None and sc_result is not None:
             result_text += format_247(result["total_gen_clipped"], wind_info, demand_30min, sc_result,
-                                      result["month_day"], bool(pv_enabled))
+                                      result["month_day"], pv_used)
 
         # --- 電気料金計算（導入前後比較） ---
         is_ehv = (contract_type == "特別高圧")
@@ -3662,7 +3664,7 @@ def run_simulation(
             debug_text += (f"風力: {wind_info['area_name']}エリア {wind_info['capacity_kw']:,.1f}kW, "
                            f"設備利用率 {wind_info['cf_pct']:.1f}%, PPA {wind_info['ppa_price']:.2f}円/kWh, "
                            f"託送(従量) {wind_info['wheeling_yen']:.2f}円/kWh, 小売手数料 {wind_info['retail_fee_yen']:.2f}円/kWh, "
-                           f"太陽光={'使用' if pv_enabled else '使用しない'}\n")
+                           f"太陽光={'使用' if pv_used else '使用しない'}\n")
         debug_text += f"月別発電量:\n"
         for m in range(1, 13):
             debug_text += f"  {m:2d}月: {result['monthly'].get(m, 0):8.1f} kWh\n"

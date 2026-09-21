@@ -363,7 +363,7 @@ demand(t) = IT定格容量 × IT負荷率(年平均) × 形状(t) × PUE × 0.5 
   `test_grid_cap.py`（PASS 75。受電上限・診断・LP。診断の健全性は乱数60ケースで診断⇔LPの実行可否が完全一致）／
   `test_mcp_dc_tools.py`（PASS 126。DCのMCPツール。UI（run_simulation）との数値一致・受電上限の各状態・入力検証・出力がJSON標準の型だけ）／
   `test_wind_shape.py`（PASS 86。風力の形状データ・地点→エリア対応・計算層）／
-  `test_wind_mode.py`（PASS 122。風力の `run_simulation` 統合。受電点基準の料金・託送・売電の帰属・MG（W2b）を、別経路で再計算した値と照合。約40秒）／
+  `test_wind_mode.py`（PASS 124。風力の `run_simulation` 統合。受電点基準の料金・託送・売電の帰属・MG（W2b）を、別経路で再計算した値と照合。約40秒）／
   `test_wind_ui.py`（PASS 46。風力のUI。「計算」ボタンの関数をUIの入力の並びどおりに呼ぶ配線テスト、入力の変換、表示切替、グラフの内訳。約8秒）
 - **MCPの公開ツール（`mcp_tools.py`）の成功系の `return` は `_jsonable()` で包む。** numpy型（`round()` の結果も含む）が混ざると、
   MCP経由で数値が文字列（`"11.5"`）になる。直接呼び出しやHTTPの `/call` では検出できないため、変更後は**プロトコル層（`tools/call`）で
