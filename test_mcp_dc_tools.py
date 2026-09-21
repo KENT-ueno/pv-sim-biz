@@ -344,8 +344,8 @@ check("MCP出力がJSON標準の型だけ（DC: 蓄電池なし・LP+上限・�
 check("estimate_pv_generation / list_stations / validate もJSON標準の型だけ",
       _non_json(mcp_tools.estimate_pv_generation(station_no="44132", faces=[{"ppeak_kw": 500.0, "tilt_deg": 30.0, "azimuth_deg": 180.0, "pcs_limit_kw": 500.0}])) == []
       and _non_json(mcp_tools.list_stations()) == [] and _non_json(v) == [])
-check("公開ツールの成功系の戻り値を _jsonable で返している（app.pyに登録された7ツールの return を機械的に確認）",
-      open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "mcp_tools.py"), encoding="utf-8").read().count("return _jsonable(") == 8)
+check("公開ツールの成功系の戻り値を _jsonable で返している（app.pyに登録された9ツールの return を機械的に確認。W4で風力の2ツールを追加）",
+      open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "mcp_tools.py"), encoding="utf-8").read().count("return _jsonable(") == 10)
 check("産業用の validate は facilities 必須のまま",
       not mcp_tools.validate_industrial_params(facilities=[])["valid"])
 

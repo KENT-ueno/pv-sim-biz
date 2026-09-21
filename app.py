@@ -4646,6 +4646,8 @@ def build_ui():
         import mcp_tools
         gr.api(mcp_tools.list_stations, api_name="list_stations")
         gr.api(mcp_tools.estimate_pv_generation, api_name="estimate_pv_generation")
+        gr.api(mcp_tools.list_wind_areas, api_name="list_wind_areas")
+        gr.api(mcp_tools.estimate_wind_generation, api_name="estimate_wind_generation")
         gr.api(mcp_tools.validate_industrial_params, api_name="validate_industrial_params")
         gr.api(mcp_tools.simulate_industrial_pv, api_name="simulate_industrial_pv")
         # データセンター（Phase 7 段階4）
