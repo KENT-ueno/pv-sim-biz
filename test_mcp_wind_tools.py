@@ -273,30 +273,39 @@ check("札幌・特高: 託送1.02・グロスマージン4.1・エリア北海�
       and vs["normalized_params"]["wind"]["retail_fee_yen_per_kwh"] == 4.1 and vs["normalized_params"]["wind"]["area"] == "北海道")
 check("wind を省略すると normalized_params に wind / pv_enabled のキーがない（従来と同じ）",
       "wind" not in m.validate_industrial_params()["normalized_params"] and "pv_enabled" not in m.validate_industrial_params()["normalized_params"])
+# station_no を明示しない bad_case は既定値（東京=44132。北海道・東北以外）で呼ばれてしまい、
+# 「北海道・東北の観測地点でのみ使えます」のエラーだけで valid=false になって、本来検証したい項目（未知のキー・
+# 範囲外の値など）のチェックが実際に発火しているかを見ないまま PASS してしまう（2026-09-22 Codexの実機検証で発見。
+# loss_rate_pct=100 が実は valid=true になっていたのに、この理由でテストが見逃していた）。
+# station_no="34392"（仙台。東北）を既定にし、各ケースの意図した項目だけが原因でエラーになることを keyword で確認する
 bad_cases = [
-    ("未知のキー", dict(wind={"capacity_kw": 500.0, "capacty": 1})),
-    ("容量とカバー率の両方", dict(wind={"capacity_kw": 500.0, "coverage_pct": 50.0})),
-    ("容量もカバー率もない", dict(wind={"cf_pct": 25.0})),
-    ("容量が0", dict(wind={"capacity_kw": 0})),
-    ("容量が文字列", dict(wind={"capacity_kw": "abc"})),
-    ("設備利用率が101", dict(wind={"capacity_kw": 500.0, "cf_pct": 101})),
-    ("PPA単価が負", dict(wind={"capacity_kw": 500.0, "ppa_price_yen_per_kwh": -1})),
-    ("託送がNaN", dict(wind={"capacity_kw": 500.0, "wheeling_yen_per_kwh": float("nan")})),
-    ("wind が辞書でない", dict(wind=[1000])),
-    ("対象外の地点（東京）", dict(station_no="44132", wind={"capacity_kw": 500.0})),
-    ("太陽光も風力もなし", dict(pv_enabled=False)),
-    ("支払の対象が不正", dict(wind={"capacity_kw": 500.0, "payment_basis": "half"})),
-    ("発電側課金の扱いが不正", dict(wind={"capacity_kw": 500.0, "gen_charge": "half"})),
-    ("損失率が100", dict(wind={"capacity_kw": 500.0, "loss_rate_pct": 100})),
-    ("損失率が負", dict(wind={"capacity_kw": 500.0, "loss_rate_pct": -1})),
-    ("発電バランシング単価が負", dict(wind={"capacity_kw": 500.0, "balancing_yen_per_kwh": -1})),
-    ("系統設備効率化割引が負", dict(wind={"capacity_kw": 500.0, "gen_charge_discount_yen_per_year": -1})),
+    ("未知のキー", dict(wind={"capacity_kw": 500.0, "capacty": 1}), "未知のキー"),
+    ("容量とカバー率の両方", dict(wind={"capacity_kw": 500.0, "coverage_pct": 50.0}), "capacity_kw か coverage_pct"),
+    ("容量もカバー率もない", dict(wind={"cf_pct": 25.0}), "capacity_kw か coverage_pct"),
+    ("容量が0", dict(wind={"capacity_kw": 0}), "capacity_kw"),
+    ("容量が文字列", dict(wind={"capacity_kw": "abc"}), "capacity_kw"),
+    ("設備利用率が101", dict(wind={"capacity_kw": 500.0, "cf_pct": 101}), "cf_pct"),
+    ("PPA単価が負", dict(wind={"capacity_kw": 500.0, "ppa_price_yen_per_kwh": -1}), "ppa_price_yen_per_kwh"),
+    ("託送がNaN", dict(wind={"capacity_kw": 500.0, "wheeling_yen_per_kwh": float("nan")}), "wheeling_yen_per_kwh"),
+    ("wind が辞書でない", dict(wind=[1000]), "辞書で指定"),
+    ("対象外の地点（東京）", dict(station_no="44132", wind={"capacity_kw": 500.0}), "北海道・東北"),
+    ("太陽光も風力もなし", dict(pv_enabled=False), "wind"),
+    ("支払の対象が不正", dict(wind={"capacity_kw": 500.0, "payment_basis": "half"}), "payment_basis"),
+    ("発電側課金の扱いが不正", dict(wind={"capacity_kw": 500.0, "gen_charge": "half"}), "gen_charge"),
+    ("損失率が100", dict(wind={"capacity_kw": 500.0, "loss_rate_pct": 100}), "loss_rate_pct"),
+    ("損失率が負", dict(wind={"capacity_kw": 500.0, "loss_rate_pct": -1}), "loss_rate_pct"),
+    ("発電バランシング単価が負", dict(wind={"capacity_kw": 500.0, "balancing_yen_per_kwh": -1}), "balancing_yen_per_kwh"),
+    ("系統設備効率化割引が負", dict(wind={"capacity_kw": 500.0, "gen_charge_discount_yen_per_year": -1}),
+     "gen_charge_discount_yen_per_year"),
     ("グロスマージンの別名と本名を両方指定", dict(wind={"capacity_kw": 500.0, "retail_fee_yen_per_kwh": 4.1,
-                                          "retail_gross_margin_yen_per_kwh": 4.1})),
+                                          "retail_gross_margin_yen_per_kwh": 4.1}), "別名"),
 ]
-for label, kw in bad_cases:
+for label, kw, keyword in bad_cases:
+    kw = dict(kw)
+    kw.setdefault("station_no", "34392")
     r = m.validate_industrial_params(**kw)
-    check(f"不正: {label} → valid=false", r["valid"] is False and len(r["errors"]) >= 1, str(r.get("errors"))[:70])
+    check(f"不正: {label} → valid=false・意図したエラーが出る（{keyword!r}）",
+          r["valid"] is False and any(keyword in e for e in r["errors"]), str(r.get("errors"))[:90])
 
 # W2f: retail_gross_margin_yen_per_kwh は別名として実際に受け付ける（誤りのヒントではなく有効な入力）
 vg = m.validate_industrial_params(station_no="34392", wind={"capacity_kw": 500.0, "retail_gross_margin_yen_per_kwh": 5.5})

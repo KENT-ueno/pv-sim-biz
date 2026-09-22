@@ -610,19 +610,23 @@ def _normalize_wind(wind, station_no, contract_type):
         if "retail_fee_yen_per_kwh" in wind:
             errors.append("wind.retail_gross_margin_yen_per_kwh と wind.retail_fee_yen_per_kwh は同じ項目の"
                           "別名です。どちらか1つだけ指定してください")
+            wind.pop("retail_gross_margin_yen_per_kwh")  # 誤りは既に報告済み。未知キーとしての重複報告を避ける
         else:
             wind["retail_fee_yen_per_kwh"] = wind.pop("retail_gross_margin_yen_per_kwh")
     errors.extend(_unknown_key_errors("wind", wind, _WIND_KEYS, _WIND_ALIASES))
 
-    def num(name, lo, hi, lo_open=True):
+    def num(name, lo, hi, lo_open=True, hi_open=False):
         v = wind.get(name)
         try:
             f = float(v)
         except (TypeError, ValueError):
             errors.append(f"wind.{name} は数値で指定してください（{v!r}）")
             return None
-        if not np.isfinite(f) or (f <= lo if lo_open else f < lo) or f > hi:
-            errors.append(f"wind.{name} は {lo}{'<' if lo_open else '≦'} x ≦ {hi} で指定してください（{f}）")
+        bad_lo = (f <= lo) if lo_open else (f < lo)
+        bad_hi = (f >= hi) if hi_open else (f > hi)
+        if not np.isfinite(f) or bad_lo or bad_hi:
+            lo_sym, hi_sym = ('<' if lo_open else '≦'), ('<' if hi_open else '≦')
+            errors.append(f"wind.{name} は {lo}{lo_sym} x {hi_sym}{hi} で指定してください（{f}）")
             return None
         return f
 
@@ -666,7 +670,9 @@ def _normalize_wind(wind, station_no, contract_type):
                                                if wind.get("gen_charge_discount_yen_per_year") is not None else None)
     out["balancing_yen_per_kwh"] = (num("balancing_yen_per_kwh", 0.0, 1000.0, lo_open=False)
                                     if wind.get("balancing_yen_per_kwh") is not None else None)
-    out["loss_rate_pct"] = (num("loss_rate_pct", 0.0, 100.0, lo_open=False)
+    # 損失率は 0 ≦ x < 100（上限は含まない。app.resolve_wind と同じ範囲。100%だと到達可能量が0になり
+    # 使用量払いの発電側単価の計算が0除算になる）
+    out["loss_rate_pct"] = (num("loss_rate_pct", 0.0, 100.0, lo_open=False, hi_open=True)
                             if wind.get("loss_rate_pct") is not None else None)
 
     if errors:
