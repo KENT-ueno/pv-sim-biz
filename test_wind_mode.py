@@ -136,8 +136,8 @@ info = st["wind_info"]
 check("エラーなく完了", not w_out[4].startswith("エラー"), errdetail(w_out))
 check("太陽光の発電量は風力の有無で変わらない（ビット同一）",
       np.array_equal(st["gen_pv"], pv_only[6]["total_gen_clipped"]))
-check("風力の発電量 = build_wind_30min（東北）", np.array_equal(
-    st["gen_wind"], app.build_wind_30min("02", info["capacity_kw"], None)["gen_30min"]))
+check("風力の発電量(到達可能量) = build_wind_30min（東北）× (1−損失率)（W2f）", np.array_equal(
+    st["gen_wind"], app.build_wind_30min("02", info["capacity_kw"], None)["gen_30min"] * (1 - info["loss_rate"])))
 check("下流に渡る発電量 = 太陽光 + 風力", np.array_equal(st["total_gen_clipped"], st["gen_pv"] + st["gen_wind"]))
 gen = st["total_gen_clipped"]
 sc = st["sc_result"]
@@ -157,7 +157,9 @@ print("\n【3. 経済性（受電点の基準・託送・風力PPA支払・投�
 md = st["month_day"]
 pv_g0, w_g0 = st["gen_pv"], st["gen_wind"]
 sur = RATE["renewable_surcharge"]
-X, Y = 2.15, 3.0   # 仙台・高圧の既定（託送の電力量料金・小売手数料）
+X, Y = 2.15, 4.1   # 仙台・高圧の既定（託送の電力量料金・小売グロスマージン。W2f）
+GEN_BASE, GEN_ENERGY = 93.04, 0.29  # 東北の発電側課金単価 [円/kW月, 円/kWh]（W2f）
+BALANCING = 1.1     # 発電バランシング単価（W2f）
 # 受電点の基準で、アプリとは別の式で再計算する（蓄電池なし・余剰売電）
 R = np.maximum(0, demand - pv_g0)                 # 受電点で系統から受ける量（風力の配達分を含む）
 retail = np.maximum(0, demand - pv_g0 - w_g0)     # 小売から買う量（風力で賄えなかった残り）
@@ -168,18 +170,23 @@ c_ret = app.calc_electricity_cost(retail, md, **RATE)
 after_total = c_R["annual_basic"] + c_ret["annual_energy_charge"] + float(deliv.sum()) * (X + sur + Y)
 pv_surplus = np.maximum(0, pv_g0 - demand)        # 売電できるのは敷地内の太陽光の余剰だけ
 merit_pre = (before["annual_total"] - after_total) + float(pv_surplus.sum()) * 19.0
-payment = info["annual_kwh"] * app.WIND_PPA_PRICE_DEFAULT
-check("既定: PPA単価11.96・託送(仙台・高圧)2.15・小売手数料3.0円/kWh",
-      (info["ppa_price"], info["wheeling_yen"], info["retail_fee_yen"]) == (11.96, 2.15, 3.0))
-check("風力PPA支払 = 年間発電量 × 単価（pay-as-produced）", abs(info["payment_yen"] - payment) < 1e-6)
+G = info["annual_kwh"]
+gen_charge = GEN_BASE * 12.0 * info["capacity_kw"] + GEN_ENERGY * G  # 発電側課金（東北。W2f）
+payment = G * app.WIND_PPA_PRICE_DEFAULT + gen_charge + G * BALANCING  # 全量払い（既定。W2f）
+check("既定: PPA単価11.96・託送(仙台・高圧)2.15・小売グロスマージン4.1円/kWh（W2f）",
+      (info["ppa_price"], info["wheeling_yen"], info["retail_fee_yen"]) == (11.96, 2.15, 4.1))
+check("風力の発電側費用 = G×PPA単価 ＋ 発電側課金 ＋ G×バランシング（全量払い。W2f）",
+      abs(info["payment_yen"] - payment) < 1e-6, f"{info['payment_yen']} vs {payment:.0f}")
 check("風力の配達量 = R − 小売購入（再計算と一致）", abs(info["delivered_kwh"] - float(deliv.sum())) < 1e-6,
       f"{info['delivered_kwh']:.1f} vs {float(deliv.sum()):.1f}")
-check("無駄になった風力 = 発電量 − 配達量", abs(info["wasted_kwh"] - (float(w_g0.sum()) - float(deliv.sum()))) < 1e-6)
+gen_equiv = float(deliv.sum()) / (1 - info["loss_rate"])  # 配達量の発電端換算（W2f）
+check("無駄になった風力(発電端) = 発電量(発電端) − 配達量の発電端換算（W2f）",
+      abs(info["wasted_kwh"] - (G - gen_equiv)) < 1e-6, f"{info['wasted_kwh']:.1f} vs {G - gen_equiv:.1f}")
 txt = w_out[4]
 got = num(txt, "年間経済メリット:", after="【風力込みの年間経済メリット】")
-check("風力込みの年間経済メリット = 受電点基準で再計算した電気代削減＋売電 − 風力PPA支払",
+check("風力込みの年間経済メリット = 受電点基準で再計算した電気代削減＋売電 − 風力の発電側費用",
       got is not None and abs(got - (merit_pre - payment)) < 1.5, f"{got} vs {merit_pre - payment:.0f}")
-check("支払前のメリットも再計算と一致", abs(num(txt, "（風力PPA支払の前）:") - merit_pre) < 1.5)
+check("支払前のメリットも再計算と一致", abs(num(txt, "（風力の発電側費用の前）:") - merit_pre) < 1.5)
 pb = num(txt, "単純投資回収年数:")
 net_inv = 150.0 * 158000
 check("投資回収年数 = 実質投資額（PVのみ。風力は含めない）÷ 風力込み年間メリット",
@@ -201,17 +208,17 @@ check("結果に『風力では下がりません』と明記", "風力では下
 
 # 単価の感度: 託送・手数料を1円/kWh上げると、メリットは配達量×1円だけ減る（賦課金は届いた分に必ずかかる）
 d1 = float(deliv.sum())
-for key, label in (("wheeling_yen", "託送の電力量料金"), ("retail_fee_yen", "小売手数料")):
-    o = run(wind_args=wind("coverage", **{key: (2.15 if key == "wheeling_yen" else 3.0) + 1.0}))
+for key, label in (("wheeling_yen", "託送の電力量料金"), ("retail_fee_yen", "小売グロスマージン")):
+    o = run(wind_args=wind("coverage", **{key: (2.15 if key == "wheeling_yen" else 4.1) + 1.0}))
     g = num(o[4], "年間経済メリット:", after="【風力込みの年間経済メリット】")
     check(f"{label}を+1円/kWh → 年間メリットが 配達量×1円 だけ減る", abs((got - g) - d1) < 1.5, f"{got - g:.1f} vs {d1:.1f}")
 o0 = run(wind_args=wind("coverage", wheeling_yen=0.0, retail_fee_yen=0.0))
 g0 = num(o0[4], "年間経済メリット:", after="【風力込みの年間経済メリット】")
 check("託送と手数料を0円にすると、年間メリットは 配達量×(託送+手数料) だけ増える（賦課金は残る）",
       abs((g0 - got) - d1 * (X + Y)) < 1.5, f"{g0 - got:.1f} vs {d1 * (X + Y):.1f}")
-check("届いた風力1kWhあたりの負担の行がある（PPA支払＋届いた分の費用 ÷ 届いた量）",
-      abs(num(txt, "届いた風力1kWhあたりの負担:") - (payment + d1 * (X + sur + Y)) / d1) < 0.01,
-      str(num(txt, "届いた風力1kWhあたりの負担:")))
+check("『合計 ／ 届いた1kWhあたり』の行 = （発電側費用＋届いた分の費用）÷ 届いた量",
+      abs(num(txt, "／ 届いた1kWhあたり") - (payment + d1 * (X + sur + Y)) / d1) < 0.01,
+      str(num(txt, "／ 届いた1kWhあたり")))
 
 # 投資回収: 風力が大きすぎて年間メリットが負になる場合は回収不可
 neg = run(wind_args=wind("capacity", capacity_kw=3000.0, ppa_price=40.0))
@@ -277,9 +284,10 @@ def rates(g):
     return vol, hourly
 
 
-for label, g in (("太陽光のみ", pv_g), ("風力のみ", w_g), ("太陽光＋風力", pv_g + w_g)):
+for label, row_label, g in (("太陽光のみ", "太陽光のみ", pv_g), ("風力のみ(到達分)", "風力(到達分)", w_g),
+                            ("太陽光＋風力", "太陽光＋風力", pv_g + w_g)):
     vol, hr = rates(g)
-    gv, gh = row(txt, label)
+    gv, gh = row(txt, row_label)
     check(f"{label}: 量ベース達成率・時間一致率が再計算と一致（蓄電池なし）",
           gv is not None and abs(gv - vol) < 0.06 and abs(gh - hr) < 0.06, f"{gv}/{gh} vs {vol:.1f}/{hr:.1f}")
 vs, hs = rates(pv_g)
@@ -313,7 +321,7 @@ check("太陽光は使用しないと表示し、面別発電量は出さない"
       "太陽光発電: 使用しない（風力のみ）" in wo[4] and "面別年間発電量" not in wo[4])
 check("太陽光の発電量はゼロ", float(np.abs(wo[6]["gen_pv"]).sum()) == 0.0)
 check("発電量 = 風力のみ", np.array_equal(wo[6]["total_gen_clipped"], wo[6]["gen_wind"]))
-check("比較表は『風力のみ』の1行", row(wo[4], "風力のみ")[0] is not None and row(wo[4], "太陽光のみ")[0] is None)
+check("比較表は『風力(到達分)』の1行", row(wo[4], "風力(到達分)")[0] is not None and row(wo[4], "太陽光のみ")[0] is None)
 check("初期投資がないので回収年数は該当しない", "投資回収年数は該当しません" in wo[4])
 check("設備投資は0円", "設備投資合計: 0 円" in wo[4] or "PV: 0.0 kW" in wo[4])
 bad_faces = face_args([(150.0, "南", "abc", 30, 0)])
@@ -352,7 +360,11 @@ check("設備利用率0ならエラー", o[4].startswith("エラー") and "設�
 o = run(wind_args=wind("capacity", ppa_price=-1.0))
 check("PPA単価が負ならエラー", o[4].startswith("エラー") and "PPA単価" in o[4])
 o = run(wind_args=wind("capacity", ppa_price=0.0))
-check("PPA単価0円は許容（支払0）", not o[4].startswith("エラー") and "PPA支払: 0 円/年" in o[4])
+check("PPA単価0円は許容（PPA発電単価の行が0円。発電側課金・バランシングは別に残る。W2f）",
+      not o[4].startswith("エラー") and "PPA発電単価: 0.00 円/kWh" in o[4], errdetail(o))
+o = run(wind_args=wind("capacity", ppa_price=0.0, gen_charge_mode=app.WIND_GEN_CHARGE_INCLUDED, balancing_yen=0.0))
+check("PPA単価0円・発電側課金を含む扱い・バランシング0円なら発電側費用は0円（W2f）",
+      not o[4].startswith("エラー") and abs(o[6]["wind_info"]["payment_yen"]) < 1e-6, errdetail(o))
 o = run(wind_args=wind("coverage"), mg_enabled=True)
 check("風力とMGの併用が動く（W2b。詳細は節9）",
       not o[4].startswith("エラー") and "マイクログリッド事業" in o[4] and "風力の調達費用" in o[4], errdetail(o))
@@ -377,7 +389,7 @@ for sta, ct, wh in (("14163 (SAPPORO)", "高圧", 2.28), ("14163 (SAPPORO)", "�
 o = run(wind_args=wind("capacity", wheeling_yen=-1.0))
 check("託送の単価が負ならエラー", o[4].startswith("エラー") and "託送" in o[4])
 o = run(wind_args=wind("capacity", retail_fee_yen=float("nan")))
-check("小売手数料がNaNならエラー", o[4].startswith("エラー") and "小売手数料" in o[4])
+check("小売グロスマージンがNaNならエラー", o[4].startswith("エラー") and "小売グロスマージン" in o[4])
 o = run(wind_args=wind("capacity", wheeling_yen=0.0, retail_fee_yen=0.0))
 check("託送0円・手数料0円は許容", not o[4].startswith("エラー"))
 check("WIND_INPUT_KEYS に託送・手数料がある", "wheeling_yen" in app.WIND_INPUT_KEYS and "retail_fee_yen" in app.WIND_INPUT_KEYS)
@@ -453,7 +465,7 @@ Rm = np.maximum(0, dm - pvm)
 dlm = Rm - np.maximum(0, dm - pvm - wm)
 basic_saving = app.calc_electricity_cost(dm, md, **RATE)["annual_basic"] - app.calc_electricity_cost(Rm, md, **RATE)["annual_basic"]
 avg_price = 19.93 * 0.25 + 18.77 * 0.75               # 網内単価（PPA以外は電力量単価の加重平均）
-wind_cost = infm["payment_yen"] + float(dlm.sum()) * (2.15 + sur + 3.0)
+wind_cost = infm["payment_yen"] + float(dlm.sum()) * (2.15 + sur + 4.1)  # Y=4.1（W2f）
 cf_expected = scm["annual_self"] * avg_price + basic_saving - MG_OPEX - wind_cost
 cf_got = num(mt, "年間キャッシュフロー:")
 check("年間キャッシュフロー = 網内売電 ＋ 束ね − 運営 − 風力の調達費用（独立に再計算）",

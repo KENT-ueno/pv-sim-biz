@@ -137,9 +137,12 @@ check("A: 風力の年間発電量・配達量・無駄になった分がUIと�
 check("A: 年間経済メリット（風力込み）がUIと一致（±1.5円）",
       abs(ma["electricity_cost"]["annual_economic_merit_yen"] - num(ut, "年間経済メリット:", after="【風力込みの年間経済メリット】")) < 1.5,
       f"{ma['electricity_cost']['annual_economic_merit_yen']} vs {num(ut, '年間経済メリット:', after='【風力込みの年間経済メリット】')}")
-check("A: 風力PPA支払・届いた分の費用がUIと一致",
-      abs(w["cost"]["ppa_payment_yen_per_year"] - num(ut, "PPA支払:")) < 1.5
-      and abs(w["cost"]["delivered_extra_cost_yen_per_year"] - num(ut, "届いた風力にかかる費用:")) < 1.5)
+gen_cost_ui = -num(ut, "風力の発電側費用:", after="【風力込みの年間経済メリット】")
+total_ui = num(ut, "合計:", after="【風力にかかる費用】")
+check("A: 風力の発電側費用・合計費用がUIと一致",
+      abs(w["cost"]["generation_side_cost_yen_per_year"] - gen_cost_ui) < 1.5
+      and abs(w["cost"]["total_yen_per_year"] - total_ui) < 1.5,
+      f"{w['cost']['generation_side_cost_yen_per_year']} vs {gen_cost_ui} / {w['cost']['total_yen_per_year']} vs {total_ui}")
 cp_ui = num(ut[ut.find("【導入後】"):], "契約電力:")
 check("A: 導入後の契約電力がUIと一致（風力では下がらない）",
       abs(ma["electricity_cost"]["contract_power_after_kw"] - cp_ui) < 0.06
@@ -158,6 +161,23 @@ check("A: 月別は12行で、月別の系統購入の合計 ≒ 年間の系統
 check("A: 太陽光の発電量は風力の有無で変わらない", ma["annual"]["pv_generation_kwh"] == mcp_sim()["annual"]["generation_kwh"])
 check("A: 売電量は太陽光の余剰だけ（風力があっても従来と同じ）", ma["annual"]["export_kwh"] == mcp_sim()["annual"]["export_kwh"] or
       ma["annual"]["export_kwh"] <= mcp_sim()["annual"]["export_kwh"] + 1)
+check("A: wind.cost に W2fの新項目（payment_basis・gen_side_charge・balancing・price_sources）がある",
+      w["cost"]["payment_basis"] == "generated" and w["cost"]["gen_charge_mode"] == "add"
+      and w["cost"]["gen_side_charge_yen_per_year"] > 0 and w["cost"]["balancing_yen_per_year"] > 0
+      and w["cost"]["price_sources"].get("ppa_price") == "A", str(w["cost"].get("price_sources")))
+check("A: loss_rate_pct・loss_kwh が返る（東北・高圧の既定5.2%）", w["loss_rate_pct"] == 5.2 and w["loss_kwh"] > 0)
+
+# A2. 使用量払い（payment_basis="used"）: MCPの年間経済メリットがUIと一致
+ma2 = mcp_sim(wind={"coverage_pct": 100.0, "payment_basis": "used"})
+ua2 = ui_sim(uw(cov=100.0, payment_basis=app.WIND_PAYMENT_BASIS_USED))
+check("A2: 使用量払い: MCPが完了し、年間経済メリットがUIと一致",
+      "error" not in ma2 and abs(ma2["electricity_cost"]["annual_economic_merit_yen"]
+                                 - num(ua2[4], "年間経済メリット:", after="【風力込みの年間経済メリット】")) < 1.5,
+      f"{ma2.get('electricity_cost', {}).get('annual_economic_merit_yen')} vs "
+      f"{num(ua2[4], '年間経済メリット:', after='【風力込みの年間経済メリット】')}")
+check("A2: 使用量払いは全量払いよりメリットが大きい（無駄になった分の支払を免れる）",
+      ma2["electricity_cost"]["annual_economic_merit_yen"] > ma["electricity_cost"]["annual_economic_merit_yen"])
+check("A2: wind.cost.payment_basis が 'used'", ma2["wind"]["cost"]["payment_basis"] == "used")
 
 # B. 蓄電池LP（受電点基準への組み替えがルールベース以外でも一致）
 mb = mcp_sim(wind={"capacity_kw": 200.0}, battery_enabled=True, battery_mode="lp_optimized", battery_capacity_kwh=200.0,
@@ -178,8 +198,11 @@ check("C: 風力のみ: 完了し、太陽光の発電量は0・初期投資は0
 check("C: 風力のみ: メリットがUIと一致・24/7の参考値に太陽光のみの行はない",
       abs(mc["electricity_cost"]["annual_economic_merit_yen"] - num(uc[4], "年間経済メリット:", after="【風力込みの年間経済メリット】")) < 1.5
       and "pv_only" not in mc["wind"]["matching_24_7"]["reference_without_battery"])
-# 年間メリットが正になる小さな風力のみ: 初期投資がないので、回収年数は 0 年ではなく『なし』（None）
-mc3 = mcp_sim(wind={"capacity_kw": 20.0}, pv_enabled=False, faces=[])
+# 年間メリットが正になる小さな風力のみ: 初期投資がないので、回収年数は 0 年ではなく『なし』（None）。
+# W2f既定（全量払い・発電側課金・バランシング）だと、この需要規模では小容量でも風力単体はメリットが負になるため、
+# メリットが確実に正になる条件（PPA・発電側課金・バランシングを0）で「投資0→回収年数None」の挙動を確認する
+mc3 = mcp_sim(wind={"capacity_kw": 20.0, "ppa_price_yen_per_kwh": 0.0, "gen_charge": "included",
+                    "balancing_yen_per_kwh": 0.0}, pv_enabled=False, faces=[])
 check("C: 風力のみ（小規模・メリットが正）: 初期投資0のため回収年数は None（0年と出さない）",
       mc3["electricity_cost"]["annual_economic_merit_yen"] > 0 and mc3["investment"]["net_investment_yen"] == 0
       and mc3["investment"]["simple_payback_years"] is None,
@@ -238,14 +261,16 @@ check("E: DC+風力: 契約種別が特別高圧なら託送は北海道・特�
 # ============================================================
 print("\n【2. 入力検証】")
 v = m.validate_industrial_params(station_no="34392", wind={"capacity_kw": 500.0})
-check("正常: valid で、既定値が解決されて normalized_params に入る（仙台・高圧）",
+check("正常: valid で、既定値が解決されて normalized_params に入る（仙台・高圧。W2fで5キー追加・グロスマージン4.1）",
       v["valid"] and v["normalized_params"]["wind"] == {
           "capacity_kw": 500.0, "cf_pct": 29.1, "ppa_price_yen_per_kwh": 11.96, "wheeling_yen_per_kwh": 2.15,
-          "retail_fee_yen_per_kwh": 3.0, "area": "東北"}, str(v.get("normalized_params", {}).get("wind")))
+          "retail_fee_yen_per_kwh": 4.1, "payment_basis": "generated", "gen_charge": "auto",
+          "gen_charge_discount_yen_per_year": None, "balancing_yen_per_kwh": None, "loss_rate_pct": None,
+          "area": "東北"}, str(v.get("normalized_params", {}).get("wind")))
 vs = m.validate_industrial_params(station_no="14163", contract_type="extra_high_voltage", wind={"coverage_pct": 80.0})
-check("札幌・特高: 託送1.02・手数料1.5・エリア北海道",
+check("札幌・特高: 託送1.02・グロスマージン4.1・エリア北海道",
       vs["valid"] and vs["normalized_params"]["wind"]["wheeling_yen_per_kwh"] == 1.02
-      and vs["normalized_params"]["wind"]["retail_fee_yen_per_kwh"] == 1.5 and vs["normalized_params"]["wind"]["area"] == "北海道")
+      and vs["normalized_params"]["wind"]["retail_fee_yen_per_kwh"] == 4.1 and vs["normalized_params"]["wind"]["area"] == "北海道")
 check("wind を省略すると normalized_params に wind / pv_enabled のキーがない（従来と同じ）",
       "wind" not in m.validate_industrial_params()["normalized_params"] and "pv_enabled" not in m.validate_industrial_params()["normalized_params"])
 bad_cases = [
@@ -260,10 +285,29 @@ bad_cases = [
     ("wind が辞書でない", dict(wind=[1000])),
     ("対象外の地点（東京）", dict(station_no="44132", wind={"capacity_kw": 500.0})),
     ("太陽光も風力もなし", dict(pv_enabled=False)),
+    ("支払の対象が不正", dict(wind={"capacity_kw": 500.0, "payment_basis": "half"})),
+    ("発電側課金の扱いが不正", dict(wind={"capacity_kw": 500.0, "gen_charge": "half"})),
+    ("損失率が100", dict(wind={"capacity_kw": 500.0, "loss_rate_pct": 100})),
+    ("損失率が負", dict(wind={"capacity_kw": 500.0, "loss_rate_pct": -1})),
+    ("発電バランシング単価が負", dict(wind={"capacity_kw": 500.0, "balancing_yen_per_kwh": -1})),
+    ("系統設備効率化割引が負", dict(wind={"capacity_kw": 500.0, "gen_charge_discount_yen_per_year": -1})),
+    ("グロスマージンの別名と本名を両方指定", dict(wind={"capacity_kw": 500.0, "retail_fee_yen_per_kwh": 4.1,
+                                          "retail_gross_margin_yen_per_kwh": 4.1})),
 ]
 for label, kw in bad_cases:
     r = m.validate_industrial_params(**kw)
     check(f"不正: {label} → valid=false", r["valid"] is False and len(r["errors"]) >= 1, str(r.get("errors"))[:70])
+
+# W2f: retail_gross_margin_yen_per_kwh は別名として実際に受け付ける（誤りのヒントではなく有効な入力）
+vg = m.validate_industrial_params(station_no="34392", wind={"capacity_kw": 500.0, "retail_gross_margin_yen_per_kwh": 5.5})
+check("別名 retail_gross_margin_yen_per_kwh が retail_fee_yen_per_kwh として使われる",
+      vg["valid"] and vg["normalized_params"]["wind"]["retail_fee_yen_per_kwh"] == 5.5,
+      str(vg.get("normalized_params", {}).get("wind")))
+# 未知キーのヒント（誤りではありませんか）に新設5キーの別名が出る
+vh = m.validate_industrial_params(station_no="34392", wind={"capacity_kw": 500.0, "gen_charge_mode": "add"})
+check("未知キー gen_charge_mode のヒントに gen_charge が出る（誤りではありませんか）",
+      vh["valid"] is False and any("gen_charge" in e and "gen_charge_mode" in e for e in vh["errors"]),
+      str(vh["errors"]))
 r = m.simulate_industrial_pv(station_no="44132", wind={"capacity_kw": 500.0})
 check("simulate: 対象外の地点は error（計算しない）", "error" in r and "北海道・東北" in str(r.get("errors")))
 r = m.validate_industrial_params(pv_enabled=False, faces=[], wind={"capacity_kw": 500.0}, station_no="34392")
@@ -357,9 +401,13 @@ check("東北: 冬に強く夏に弱い（2月 > 4×7月）・託送は高圧2.1
       tohoku["monthly_shape"][1] > 4 * tohoku["monthly_shape"][6]
       and tohoku["wheeling_yen_per_kwh"] == {"high_voltage": 2.15, "extra_high_voltage": 0.97})
 check("北海道の託送は高圧2.28／特高1.02", L["areas"][0]["wheeling_yen_per_kwh"] == {"high_voltage": 2.28, "extra_high_voltage": 1.02})
-check("既定値: 設備利用率29.1・PPA単価11.96・手数料 高圧3.0／特高1.5",
+check("既定値: 設備利用率29.1・PPA発電単価11.96・グロスマージン高圧4.1／特高4.1・バランシング1.1（W2f）",
       L["defaults"]["cf_pct"] == 29.1 and L["defaults"]["ppa_price_yen_per_kwh"] == 11.96
-      and L["defaults"]["retail_fee_yen_per_kwh"] == {"high_voltage": 3.0, "extra_high_voltage": 1.5})
+      and L["defaults"]["retail_fee_yen_per_kwh"] == {"high_voltage": 4.1, "extra_high_voltage": 4.1}
+      and L["defaults"]["balancing_yen_per_kwh"] == 1.1)
+check("東北の損失率は高圧5.2%／特高1.9%・発電側課金 93.04円/kW月＋0.29円/kWh",
+      tohoku["loss_rate_pct"] == {"high_voltage": 5.2, "extra_high_voltage": 1.9}
+      and tohoku["gen_side_charge"] == {"base_yen_per_kw_month": 93.04, "energy_yen_per_kwh": 0.29})
 check("出典が併記されている", all(k in L["defaults"] for k in ("cf_source", "ppa_price_source", "retail_fee_source", "wheeling_source")))
 
 E = m.estimate_wind_generation(station_no="34392", capacity_kw=10000.0, cf_pct=24.6)
@@ -380,8 +428,9 @@ check("estimate の値は simulate の風力の発電量と一致（同じ容量
 
 # ============================================================
 print("\n【4. 出力がJSON標準の型だけ】")
-for label, o in (("A(産業用+風力)", ma), ("B(LP)", mb), ("C(風力のみ)", mc), ("D(MG+PPA)", md), ("D2(MGリース)", me), ("E(DC)", me_dc),
-                 ("list_wind_areas", L), ("estimate_wind_generation", E), ("validate(wind)", v)):
+for label, o in (("A(産業用+風力)", ma), ("A2(使用量払い)", ma2), ("B(LP)", mb), ("C(風力のみ)", mc), ("D(MG+PPA)", md),
+                 ("D2(MGリース)", me), ("E(DC)", me_dc), ("list_wind_areas", L), ("estimate_wind_generation", E),
+                 ("validate(wind)", v)):
     bad = non_json(o)
     check(f"{label}: 標準の型だけ", not bad, str(bad[:3]))
 

@@ -341,7 +341,8 @@ If future extensions add per-time-slot purchase prices, VPP/ancillary revenue, o
 
 ## 14. Wind Power (Offsite PPA) / 風力発電（オフサイトPPA）
 
-設計の正典は [`wind_design_spec.md`](wind_design_spec.md)、経緯は `decision_log.md` 第13段階。ここでは実装の要点だけを記す。
+設計の正典は [`wind_design_spec.md`](wind_design_spec.md)、経緯は `decision_log.md` 第13段階（風力の追加）・W2f（費用構造の作り直し）。
+ここでは実装の要点だけを記す。
 
 ### 14.1 Model / モデル
 
@@ -354,23 +355,31 @@ wind(t) [kW] = min( capacity × capacity factor × shape(t), capacity )
 - **METPV-20の風速は使わない**: 日射との日内相関が+0.78で、ハブ高への外挿指数の仮定（0.10〜0.30）で設備利用率が3倍動き、仮定が答えを決めてしまうため
 - 対象エリアは北海道・東北のみ。需要地（観測地点）も同じエリアに限る（`WIND_STATION_AREA`。東北は「東北6県＋新潟」で8地点）
 
-### 14.2 Offsite billing / オフサイトの料金計算
+### 14.2 Offsite billing / オフサイトの費用構造（W2f）
 
-風力は送配電網で届くので、敷地内の太陽光とは経済性が違う（`offsite_receiving` / `offsite_cost_after`）。
+風力は送配電網で届くので、敷地内の太陽光とは経済性が違う。**費用は2階建て**（`offsite_payment` / `offsite_receiving` / `offsite_cost_after`）:
 
 ```
-受電量        R(t) = max(0, 需要 + 充電 − 放電 − 敷地内の太陽光)     ← 契約電力・受電上限の基準
-小売から買う量      = 運転結果の系統購入 import_(t)
-風力の配達量  D(t) = clip(R − import_, 0, 風力発電量)
-導入後の電気代 = 基本料金(R の最大) + 電力量料金(小売から買う量) + Σ D × (託送の電力量料金 + 再エネ賦課金 + 小売手数料)
-風力PPA支払    = 風力の年間発電量 × PPA単価         （pay-as-produced。無駄になった分も支払う）
+到達可能量(t) = 発電量(t) × (1 − 損失率)                            ← 送電ロスは量で扱う（費用項目には足さない）
+受電量  R(t)  = max(0, 需要 + 充電 − 放電 − 敷地内の太陽光)          ← 契約電力・受電上限の基準
+PPA使用量(t)  = min(R(t) − import_(t), 到達可能量(t))               ← 30分ごとに計算
+
+① 発電側の支払（offsite_payment。既定=全量払いはGベース、使用量払いは届いた量ベース）
+   全量払い   = G×PPA発電単価 + 発電側課金(加算のとき) + G×発電バランシング単価
+   使用量払い = 届いた量 ×〔(PPA発電単価 + 発電側課金÷G) ÷ (1−損失率) + 発電バランシング単価〕
+② 届いた分の費用 = 届いた量 ×（託送の電力量料金 + 再エネ賦課金 + 小売グロスマージン）
+
+導入後の電気代 = 基本料金(R の最大) + 電力量料金(小売購入) + ②        （①は電気代の外。年間経済メリットから直接引く）
 ```
 
 - **契約電力は風力では下がらない**（受電点の最大は届いた風力も含む）。売電・出力抑制の対象は敷地内の太陽光の余剰だけ
-- 蓄電池の**運転**は太陽光＋風力を合わせた発電で行い（風力の余剰を貯めて凪の時間に使う）、**料金だけ**受電点基準で計算し直す
-- 託送の電力量料金は一次資料（北海道電力NW・東北電力NW、2025年10月〜、税込表示）。小売手数料は自然エネルギー財団の推定値
-- マイクログリッド（W2b）: 収益＝網内に供給した全量×網内単価＋束ねメリット、費用＝運営コスト＋風力の調達費用。
+- 発電側課金（系統連系受電課金）・損失率・託送の電力量料金は一次資料（北海道電力NW・東北電力NW 託送供給等約款、2026-04-01実施、税込表示）。
+  発電バランシング・小売グロスマージンはJPEA報告（2024-06-03）の暫定値。項目ごとの出典区分（A〜D・U）は `PRICE_SOURCES` の台帳
+- 発電側課金の扱い（自動／加算／含む）: 「自動」はPPA発電単価が既定値のままなら加算、入力値に変えれば含む扱い
+- 蓄電池の**運転**は太陽光＋**到達可能量**の合計で行い（風力の余剰を貯めて凪の時間に使う）、**料金だけ**受電点基準で計算し直す
+- マイクログリッド（W2b）: 収益＝網内に供給した全量×網内単価＋束ねメリット、費用＝運営コスト＋風力の調達費用（①＋②）。
   PPA（MG）の単価は（投資の回収＋風力の調達費用）÷ 網内に供給した全量で逆算
+- 設計・出典の一次資料・限界の詳細は `wind_design_spec.md` §9
 
 ### 14.3 Outputs / 出力
 
@@ -384,7 +393,8 @@ wind(t) [kW] = min( capacity × capacity factor × shape(t), capacity )
 
 - `generation_30min` には敷地内の太陽光だけを渡す。変数は受電量 R（契約電力・受電上限の基準）と、風力の配達分 w（w ≤ R、w ≤ 風力発電量）
 - 収支: R + PV + 放電 = 需要 + 充電 + 売電 + 抑制。売電・抑制はそのコマの太陽光の余剰以下（風力は売電できない）
-- 目的: 基本料金×max(R) ＋ Σ((R−w)×小売単価 ＋ w×(託送＋賦課金＋手数料)) − 売電。風力PPA支払は定数なのでLPに入れず、最適容量探索の年間メリットから引く
+- 目的: 基本料金×max(R) ＋ Σ((R−w)×小売単価 ＋ w×(託送＋賦課金＋小売グロスマージン)) − 売電。①（発電側の支払）はLPの目的関数に
+  入れず（使用量払いでも must-take として `offsite_payment` で事後に評価）、最適容量探索の年間メリットから引く
 - 受電上限は R の上限。風力は上限を守る助けにならないので、`diagnose_grid_cap` は太陽光だけで診断する
 - 受電点では買電と売電が相殺される。売電単価が風力の配達単価を上回ると、LPが「風力を受電して太陽光を売る」運転を選んでしまうので、
   **LP内の売電単価だけ**を抑え（`offsite_lp_sell_price`）、実際の収入は返ってきた運転を実際の単価で評価し直す
@@ -399,7 +409,7 @@ wind(t) [kW] = min( capacity × capacity factor × shape(t), capacity )
 
 | ファイル | 役割 |
 |---|---|
-| `app.py` | `WIND_AREA_META` / `resolve_wind` / `build_wind_30min` / `offsite_receiving` / `offsite_cost_after` / `format_247` / UI |
+| `app.py` | `WIND_AREA_META` / `resolve_wind` / `build_wind_30min` / `offsite_payment` / `offsite_receiving` / `offsite_cost_after` / `format_247` / `PRICE_SOURCES` / UI |
 | `mcp_tools.py` | `list_wind_areas` / `estimate_wind_generation` と、`simulate_*` / `validate_*` の `wind`・`pv_enabled` |
 | `wind_shape.csv`, `tools/build_wind_shape.py` | 形状データと、その生成スクリプト |
-| `test_wind_shape.py` / `test_wind_mode.py` / `test_wind_ui.py` / `test_mcp_wind_tools.py` | 計算層 / `run_simulation` 統合 / UI配線 / MCPツール |
+| `test_wind_shape.py` / `test_wind_mode.py` / `test_wind_ui.py` / `test_wind_lp.py` / `test_wind_cost.py` / `test_mcp_wind_tools.py` | 計算層 / `run_simulation` 統合 / UI配線 / 蓄電池LP / W2fの費用構造 / MCPツール |

@@ -575,8 +575,22 @@ def _normalize_and_validate(
 # 風力は送配電網で届くオフサイト電源。経済性の計算（受電点の基準・託送・賦課金・手数料）は UI と同じ
 # app.offsite_receiving / app.offsite_cost_after / app.resolve_wind を再利用する（二重実装しない）。
 
+# retail_gross_margin_yen_per_kwh は retail_fee_yen_per_kwh の別名として実際に受け付ける（W2f。名前は
+# 変えず意味を小売グロスマージンにしたため）。_WIND_ALIASES は他の未知キーの「誤りではありませんか」ヒント用
 _WIND_KEYS = ("capacity_kw", "coverage_pct", "cf_pct", "ppa_price_yen_per_kwh",
-              "wheeling_yen_per_kwh", "retail_fee_yen_per_kwh")
+              "wheeling_yen_per_kwh", "retail_fee_yen_per_kwh",
+              "payment_basis", "gen_charge", "gen_charge_discount_yen_per_year",
+              "balancing_yen_per_kwh", "loss_rate_pct")
+_WIND_ALIASES = {
+    "retail_gross_margin_yen_per_kwh": "retail_fee_yen_per_kwh",
+    "gen_charge_mode": "gen_charge",
+    "loss_rate": "loss_rate_pct",
+    "balancing_yen": "balancing_yen_per_kwh",
+    "gen_charge_discount_yen": "gen_charge_discount_yen_per_year",
+    "payment_type": "payment_basis",
+}
+_PAYMENT_BASIS_FROM_MCP = {"generated": "全量払い", "used": "使用量払い"}
+_GEN_CHARGE_FROM_MCP = {"auto": "自動", "add": "加算", "included": "含む"}
 _NO_PV_FACES_STUB = [{"ppeak_kw": 1.0, "tilt_deg": 30.0, "azimuth_deg": 180.0}]  # pv_enabled=false のとき faces検証を通すだけ
 
 
@@ -591,9 +605,14 @@ def _normalize_wind(wind, station_no, contract_type):
     errors = []
     if not isinstance(wind, dict):
         return None, ["wind は辞書で指定してください（例: {\"capacity_kw\": 1000}）"]
-    unknown = sorted(set(wind) - set(_WIND_KEYS))
-    if unknown:
-        errors.append(f"wind に未知のキーがあります: {unknown}（使えるキー: {list(_WIND_KEYS)}）")
+    wind = dict(wind)  # 別名の正規化のためコピー（呼び出し側の辞書は変えない）
+    if "retail_gross_margin_yen_per_kwh" in wind:
+        if "retail_fee_yen_per_kwh" in wind:
+            errors.append("wind.retail_gross_margin_yen_per_kwh と wind.retail_fee_yen_per_kwh は同じ項目の"
+                          "別名です。どちらか1つだけ指定してください")
+        else:
+            wind["retail_fee_yen_per_kwh"] = wind.pop("retail_gross_margin_yen_per_kwh")
+    errors.extend(_unknown_key_errors("wind", wind, _WIND_KEYS, _WIND_ALIASES))
 
     def num(name, lo, hi, lo_open=True):
         v = wind.get(name)
@@ -629,6 +648,27 @@ def _normalize_wind(wind, station_no, contract_type):
         out["wheeling_yen_per_kwh"] = app.WIND_WHEELING_ENERGY_YEN.get((area, ct)) if area else None
     out["retail_fee_yen_per_kwh"] = (num("retail_fee_yen_per_kwh", 0.0, 1000.0, lo_open=False)
                                      if wind.get("retail_fee_yen_per_kwh") is not None else app.WIND_RETAIL_FEE_YEN[ct])
+
+    # --- W2f: 損失率・発電側課金・発電バランシング・支払の対象（設計は wind_design_spec.md §9） ---
+    pb = wind.get("payment_basis")
+    if pb is not None and pb not in ("generated", "used"):
+        errors.append(f"wind.payment_basis は 'generated' か 'used' で指定してください（{pb!r}）")
+        pb = None
+    out["payment_basis"] = pb or "generated"
+
+    gc = wind.get("gen_charge")
+    if gc is not None and gc not in ("auto", "add", "included"):
+        errors.append(f"wind.gen_charge は 'auto'／'add'／'included' のいずれかで指定してください（{gc!r}）")
+        gc = None
+    out["gen_charge"] = gc or "auto"
+
+    out["gen_charge_discount_yen_per_year"] = (num("gen_charge_discount_yen_per_year", 0.0, 1e12, lo_open=False)
+                                               if wind.get("gen_charge_discount_yen_per_year") is not None else None)
+    out["balancing_yen_per_kwh"] = (num("balancing_yen_per_kwh", 0.0, 1000.0, lo_open=False)
+                                    if wind.get("balancing_yen_per_kwh") is not None else None)
+    out["loss_rate_pct"] = (num("loss_rate_pct", 0.0, 100.0, lo_open=False)
+                            if wind.get("loss_rate_pct") is not None else None)
+
     if errors:
         return None, errors
     out["area"] = app.WIND_AREA_META[area]["name"]
@@ -653,24 +693,38 @@ def _apply_wind(params, warnings, errors, wind, pv_enabled, station_no, contract
 
 
 def _wind_args_for_app(app, w):
-    """正規化した wind（MCPのキー）を app.resolve_wind の wind_args にする。"""
+    """正規化した wind（MCPのキー）を app.resolve_wind の wind_args にする。
+
+    payment_basis/gen_charge は MCP側のasciiキーをUI側の日本語ラベルに変換する（resolve_wind は
+    UIのコンポーネントが送るラベル文字列を受け取る。W2f）
+    """
     return {
         "enabled": True,
         "sizing_mode": app.WIND_SIZING_CAPACITY if w.get("capacity_kw") is not None else app.WIND_SIZING_COVERAGE,
         "capacity_kw": w.get("capacity_kw"), "coverage_pct": w.get("coverage_pct"),
         "cf_pct": w["cf_pct"], "ppa_price": w["ppa_price_yen_per_kwh"],
         "wheeling_yen": w["wheeling_yen_per_kwh"], "retail_fee_yen": w["retail_fee_yen_per_kwh"],
+        "payment_basis": _PAYMENT_BASIS_FROM_MCP[w["payment_basis"]],
+        "gen_charge_mode": _GEN_CHARGE_FROM_MCP[w["gen_charge"]],
+        "gen_charge_discount_yen": w.get("gen_charge_discount_yen_per_year"),
+        "balancing_yen": w.get("balancing_yen_per_kwh"),
+        "loss_rate_pct": w.get("loss_rate_pct"),
     }
 
 
 _WIND_CAVEATS = [
-    "風力はオフサイト電源（送配電網で届く）として計算しています。届いた風力にも託送の電力量料金・再エネ賦課金・小売手数料が"
+    "風力はオフサイト電源（送配電網で届く）として計算しています。届いた風力にも託送の電力量料金・再エネ賦課金・小売グロスマージンが"
     "かかり、契約電力（基本料金）は風力では下がりません。売電・出力抑制の対象は敷地内の太陽光の余剰だけです（風力の余剰は無駄になる扱い）",
     "太陽光は平年値（METPV-20）、風力は2025年の実績で、別のデータです。同じ日に凪と曇天が重なるような日単位・30分単位の同時性は"
     "反映されません。月別・時間帯別の平均的な補完関係の目安です",
-    "託送の電力量料金は一次資料（北海道電力NW・東北電力NW、2025年10月〜、税込表示）の値です。小売手数料は自然エネルギー財団の"
-    "推定値（2023年度・全国平均）で公的な料金表はありません。PPA単価の既定値（11.96円/kWh）は入札の平均落札価格で、"
-    "PPAの相対契約の単価そのものではありません",
+    "送電ロス（損失率）の分だけ発電量より少ない量しか届きません（wasted_kwh は発電端の余剰で売電できません。"
+    "loss_kwh が送電ロス量）。託送の電力量料金・損失率・発電側課金は一次資料（北海道電力NW・東北電力NW "
+    "託送供給等約款、2026-04-01実施、税込表示）の値です。小売グロスマージン・発電バランシングはJPEA報告"
+    "（2024-06-03。R4年度・高圧・太陽光の平均）の暫定値です。PPA発電単価の既定値（11.96円/kWh）は入札の"
+    "平均落札価格で、PPAの相対契約の単価そのものではありません（発電側課金は含まない）",
+    "支払の対象（payment_basis）は既定で全量払い（発電した全量に、無駄になった分も含めて払う）。使用量払いに"
+    "すると届いた分だけの支払になりますが、余剰のリスクは小売が負う前提のため小売グロスマージンの既定値がその"
+    "リスクを織り込んだ値ではありません",
     "蓄電池LP（lp_optimized）は受電点の基準で最適化します（風力は受電量の一部。売電・出力抑制は太陽光の余剰だけ）。"
     "ルールベース（rule_based）の蓄電池は太陽光の余剰だけを貯め、太陽光と蓄電池で賄えない分を風力（届いた分）→小売が埋めます"
     "（風力は貯めません）。LPは電気代の最小化で、24/7の一致率の最大化ではありません",
@@ -679,13 +733,15 @@ _WIND_CAVEATS = [
 
 def _wind_section(app, wind_info, gen_pv, demand_30min, sc_result, month_day, rate_params, pv_used):
     """結果の wind 節（発電・配達・費用・24/7の一致率・月別）を作る。"""
-    gen_w = wind_info["gen_30min"]
+    gen_w = wind_info.get("deliverable_30min", wind_info["gen_30min"])  # 24/7・月別は到達可能量で比べる（W2f）
     gen_all = gen_pv + gen_w
     demand = float(sc_result["annual_demand"])
     sur = rate_params["renewable_surcharge"]
     dl = wind_info.get("delivered_kwh", 0.0)
+    pay = app.offsite_payment(wind_info, dl)   # 発電側の支払（PPA・発電側課金・発電バランシング。W2f）
+    gen_side_cost = pay["total"]
     extra = dl * (wind_info["wheeling_yen"] + sur + wind_info["retail_fee_yen"])
-    total_cost = wind_info["payment_yen"] + extra
+    total_cost = gen_side_cost + extra
 
     def rates(g):
         vol, hourly = app.matching_rates(g, demand_30min)
@@ -711,20 +767,37 @@ def _wind_section(app, wind_info, gen_pv, demand_30min, sc_result, month_day, ra
         "capacity_kw": round(wind_info["capacity_kw"], 1),
         "cf_pct": wind_info["cf_pct"],
         "effective_cf_pct": round(wind_info["effective_cf_pct"], 2),
-        "generation_kwh": round(wind_info["annual_kwh"]),
+        "generation_kwh": round(wind_info["annual_kwh"]),   # 発電端の全量（発電量。到達可能量ではない）
         "clipped_kwh": round(wind_info["clipped_kwh"]),
-        "delivered_kwh": round(dl),
-        "wasted_kwh": round(wind_info.get("wasted_kwh", 0.0)),
+        "loss_rate_pct": round(wind_info["loss_rate"] * 100, 2),
+        "loss_kwh": round(wind_info.get("loss_kwh", 0.0)),
+        "delivered_kwh": round(dl),  # 需要地に届いて使えた分
+        "wasted_kwh": round(wind_info.get("wasted_kwh", 0.0)),  # 発電端の余剰。売電できない（W2f）
         "cost": {
+            "payment_basis": wind_info["payment_basis"],
             "ppa_price_yen_per_kwh": wind_info["ppa_price"],
-            "ppa_payment_yen_per_year": round(wind_info["payment_yen"]),
+            "ppa_payment_yen_per_year": round(pay["ppa"]),
+            "gen_charge_mode": wind_info["gen_charge_mode"],
+            "gen_side_charge_yen_per_year": round(pay["gen_charge"]),
+            "balancing_yen_per_kwh": wind_info["balancing_yen"],
+            "balancing_yen_per_year": round(pay["balancing"]),
+            "generation_side_cost_yen_per_year": round(gen_side_cost),
             "wheeling_yen_per_kwh": wind_info["wheeling_yen"],
             "renewable_surcharge_yen_per_kwh": sur,
             "retail_fee_yen_per_kwh": wind_info["retail_fee_yen"],
+            "delivered_extra_breakdown": {
+                "wheeling_yen_per_year": round(dl * wind_info["wheeling_yen"]),
+                "renewable_surcharge_yen_per_year": round(dl * sur),
+                "retail_fee_yen_per_year": round(dl * wind_info["retail_fee_yen"]),
+            },
             "delivered_extra_cost_yen_per_year": round(extra),
             "total_yen_per_year": round(total_cost),
             "effective_yen_per_delivered_kwh": round(total_cost / dl, 2) if dl > 0 else None,
-            "note": "PPA支払は発電した全量に（無駄になった分も）、託送・賦課金・手数料は届いた分にかかる",
+            "price_sources": wind_info.get("price_sources", {}),
+            "note": "generation_side_cost（PPA発電単価・発電側課金・発電バランシング）は、支払の対象が全量払いなら"
+                    "発電量、使用量払いなら届いた量で決まる。delivered_extra は届いた分にかかる託送・賦課金・"
+                    "小売グロスマージン。price_sources は各項目の出典区分（A:公的データの代理値／B:出典あり／"
+                    "C:実績調査値・暫定／D:未算入／U:入力値）",
         },
         "matching_24_7": {
             "volume_pct": round(vol_all, 1) if vol_all is not None else None,
@@ -732,7 +805,8 @@ def _wind_section(app, wind_info, gen_pv, demand_30min, sc_result, month_day, ra
             "gap_points": round(max(0.0, vol_all - hourly_set), 1) if vol_all is not None else None,
             "reference_without_battery": reference,
             "note": "hourly_match_pct = 1 − 系統購入/需要（蓄電池・設定どおり）。volume_pct との差が、年間では足りていても"
-                    "その時間には足りていない分。reference_without_battery は蓄電池なしの参考値",
+                    "その時間には足りていない分。reference_without_battery は蓄電池なしの参考値。"
+                    "wind_only・pv_plus_wind・月別 wind_kwh は需要地点に届いた分（到達可能量）で計算",
         },
         "monthly": monthly,
     }
@@ -839,7 +913,8 @@ def _run_industrial_simulation(p: dict, demand_override=None, grid_cap_kw=None):
         wind_info = app.resolve_wind(
             _wind_args_for_app(app, wind_p), p["station_no"], float(np.sum(demand_30min)),
             station_label=p["station_no"], contract_type=CONTRACT_TYPE_MAP[p["contract_type"]])
-        gen = gen_pv + wind_info["gen_30min"]   # ルールベース・蓄電池なしは太陽光＋風力を合わせた発電で運転する
+        # ルールベース・蓄電池なしは太陽光＋風力を合わせた発電で運転する。風力は到達可能量（届く分）を使う（W2f）
+        gen = gen_pv + wind_info.get("deliverable_30min", wind_info["gen_30min"])
     # 蓄電池LPは風力（送配電網で届く電源）を受電点の基準で扱う: 太陽光だけを generation に、風力は offsite で渡す
     # （app.run_simulation と同じ。設計書 wind §5-4・W2d）
     offsite_spec = app.offsite_lp_spec([wind_info]) if wind_info is not None else None
@@ -913,7 +988,8 @@ def _run_industrial_simulation(p: dict, demand_override=None, grid_cap_kw=None):
     if wind_info is not None:
         wind_off = app.offsite_receiving(gen_pv, [wind_info], demand_30min, sc_result)
         wind_info["delivered_kwh"] = float(wind_off["delivered_by_source"][0].sum())
-        wind_info["wasted_kwh"] = float(wind_off["wasted_by_source"][0].sum())
+        wind_info["wasted_kwh"] = float(wind_off["wasted_by_source"][0].sum())  # 発電端の余剰（W2f）
+        wind_info["loss_kwh"] = float(wind_off["loss_by_source"][0].sum())  # 送電ロス量（W2f）
         pv_surplus_kwh = float(wind_off["pv_surplus"].sum())
         sc_result["annual_export_pooled"] = sc_result["annual_export"]
         sc_result["annual_curtailment_pooled"] = sc_result.get("annual_curtailment", 0.0)
@@ -957,8 +1033,11 @@ def _run_industrial_simulation(p: dict, demand_override=None, grid_cap_kw=None):
     if not no_export:
         sell_revenue = sc_result["annual_export"] * p["sell_price_yen_per_kwh"]
     annual_merit = saving + sell_revenue
+    wind_gen_side_cost = 0.0
     if wind_info is not None:
-        annual_merit -= wind_info["payment_yen"]   # 風力PPA支払（届いた分の託送等は cost_after に含まれる）
+        # 風力の発電側の支払（PPA・発電側課金・発電バランシング。W2f）。届いた分の託送等は cost_after に含まれる
+        wind_gen_side_cost = app.offsite_payment(wind_info, wind_info["delivered_kwh"])["total"]
+        annual_merit -= wind_gen_side_cost
 
     payback_years = (net_investment / annual_merit) if annual_merit > 0 else None
     if wind_info is not None and net_investment <= 0:
@@ -985,7 +1064,7 @@ def _run_industrial_simulation(p: dict, demand_override=None, grid_cap_kw=None):
     wind_cost_total = 0.0
     if wind_info is not None:
         pv_self_kwh = max(0.0, pv_self_kwh - wind_info["delivered_kwh"])
-        wind_cost_total = (wind_info["payment_yen"] + wind_info["delivered_kwh"] * (
+        wind_cost_total = (wind_gen_side_cost + wind_info["delivered_kwh"] * (
             wind_info["wheeling_yen"] + rate_params["renewable_surcharge"] + wind_info["retail_fee_yen"]))
 
     business_out = {"business_model": p["business_model"]}
@@ -1159,7 +1238,8 @@ def _run_industrial_simulation(p: dict, demand_override=None, grid_cap_kw=None):
         out["annual"]["pv_generation_kwh"] = round(result["annual"])
         out["annual"]["total_generation_kwh"] = round(result["annual"] + wind_info["annual_kwh"])
         out["annual"]["self_consumption_note"] = "self_consumption_kwh は敷地内の太陽光・蓄電池分＋届いた風力の合計"
-        out["electricity_cost"]["annual_wind_ppa_payment_yen"] = round(wind_info["payment_yen"])
+        # 発電側の支払（PPA・発電側課金・発電バランシング。W2f）。キー名は互換のため変えない
+        out["electricity_cost"]["annual_wind_ppa_payment_yen"] = round(wind_gen_side_cost)
         out["electricity_cost"]["contract_power_note_wind"] = (
             "風力（送配電網で届く）では契約電力は下がらない。contract_power_after_kw は太陽光・蓄電池の効果のみ")
         out["caveats"] = list(out["caveats"]) + _WIND_CAVEATS
@@ -1358,10 +1438,17 @@ def validate_industrial_params(
         mg_irr_period_years: P-IRR計算期間 [年]（mg_enabled時のみ有効）
         wind: 風力発電（オフサイトPPA。送配電網で届く電源）。省略で風力なし（従来と同じ結果）。辞書で指定:
               {"capacity_kw": 1000} または {"coverage_pct": 100}（どちらか1つ。coverage_pct は年間の風力発電量を
-              年間需要量の何%にするか）。任意: "cf_pct"（設備利用率[%]、既定29.1）、"ppa_price_yen_per_kwh"（PPA単価、既定11.96）、
-              "wheeling_yen_per_kwh"（託送の電力量料金、既定=エリア×契約種別の一次資料の値）、
-              "retail_fee_yen_per_kwh"（小売手数料、既定=推定値）。**観測地点（station_no）が北海道・東北のときだけ**使える
-              （風力の調達エリアは需要地と同じ。list_wind_areas 参照）。届いた風力にも託送・賦課金・手数料がかかり、契約電力は
+              年間需要量の何%にするか）。任意: "cf_pct"（設備利用率[%]、既定29.1）、"ppa_price_yen_per_kwh"（PPA発電単価、既定11.96。
+              発電側課金は含まない）、"wheeling_yen_per_kwh"（託送の電力量料金、既定=エリア×契約種別の一次資料の値）、
+              "retail_fee_yen_per_kwh"（小売グロスマージン。別名 "retail_gross_margin_yen_per_kwh"、既定=JPEA報告の暫定値）、
+              "payment_basis"（支払の対象。"generated"=全量払い[既定]／"used"=使用量払い）、
+              "gen_charge"（発電側課金の扱い。"auto"[既定。PPA単価が既定値なら加算・入力すれば含む]／"add"／"included"）、
+              "gen_charge_discount_yen_per_year"（系統設備効率化割引、既定0＝未算入）、
+              "balancing_yen_per_kwh"（発電バランシング単価、既定=JPEA報告の暫定値1.1）、
+              "loss_rate_pct"（損失率[%]、既定=エリア×契約種別の一次資料の値）。
+              **観測地点（station_no）が北海道・東北のときだけ**使える
+              （風力の調達エリアは需要地と同じ。list_wind_areas 参照）。届いた風力にも託送・賦課金・小売グロスマージンがかかり、
+              発電した電気には発電側課金・発電バランシングもかかり、送電ロス（損失率）で届く量が減る。契約電力は
               下がらず、売電できるのは敷地内の太陽光の余剰だけ。系統受電上限（DC）とも併用できる（上限は届く風力も含めた
               受電量に対する上限。風力は上限を守る助けにならず、太陽光と蓄電池（lp_optimized）で守る）
         pv_enabled: 太陽光を使うか（既定true）。falseなら faces を使わず風力のみで計算（wind の指定が必要）
@@ -1465,9 +1552,12 @@ def simulate_industrial_pv(
     風力（オフサイトPPA。送配電網で届く電源）を併用するには wind（辞書）を、風力のみにするには pv_enabled=false と
     wind を指定する（結果に wind 節と24/7の一致率が加わる）。wind の書式: {"capacity_kw": 1000}（契約容量）または
     {"coverage_pct": 100}（年間の風力発電量を年間需要量の何%にするか。どちらか1つ）。任意で "cf_pct"（設備利用率、既定29.1）、
-    "ppa_price_yen_per_kwh"（既定11.96）、"wheeling_yen_per_kwh"（託送の電力量料金、既定=エリア×契約種別）、
-    "retail_fee_yen_per_kwh"（小売手数料、既定=推定値）。**station_no が北海道・東北のときだけ**使える（list_wind_areas 参照）。
-    届いた風力にも託送・賦課金・手数料がかかり、契約電力は下がらず、売電できるのは敷地内の太陽光の余剰だけ。
+    "ppa_price_yen_per_kwh"（PPA発電単価、既定11.96）、"wheeling_yen_per_kwh"（託送の電力量料金、既定=エリア×契約種別）、
+    "retail_fee_yen_per_kwh"（小売グロスマージン、既定=JPEA報告の暫定値）、"payment_basis"（支払の対象。既定"generated"＝全量払い）、
+    "gen_charge"（発電側課金の扱い、既定"auto"）、"loss_rate_pct"（損失率、既定=エリア×契約種別）、"balancing_yen_per_kwh"（発電バランシング単価）。
+    **station_no が北海道・東北のときだけ**使える（list_wind_areas 参照）。
+    届いた風力にも託送・賦課金・小売グロスマージンがかかり、発電した電気には発電側課金・発電バランシングもかかり、
+    契約電力は下がらず、売電できるのは敷地内の太陽光の余剰だけ。
     詳細は validate_* の wind 引数。事前に estimate_wind_generation で風力単体の発電量を確認できる。
 
     Returns:
@@ -1527,8 +1617,9 @@ def list_wind_areas() -> dict:
     月別・時間帯別の傾向、対象の観測地点、託送の電力量料金の既定値を返す。
 
     Returns:
-        dict: areas（エリアごとの code/name/stations/monthly_shape/diurnal_shape/curtailment_pct/wheeling_yen_per_kwh）、
-              defaults（設備利用率・PPA単価・小売手数料の既定値と出典）、notes（限界・注意）
+        dict: areas（エリアごとの code/name/stations/monthly_shape/diurnal_shape/curtailment_pct/wheeling_yen_per_kwh/
+              loss_rate_pct/gen_side_charge）、defaults（設備利用率・PPA発電単価・小売グロスマージン・発電バランシング・
+              損失率・発電側課金の既定値と出典）、notes（限界・注意）
     """
     try:
         import sqlite3
@@ -1557,6 +1648,14 @@ def list_wind_areas() -> dict:
                     "high_voltage": app.WIND_WHEELING_ENERGY_YEN[(code, "高圧")],
                     "extra_high_voltage": app.WIND_WHEELING_ENERGY_YEN[(code, "特別高圧")],
                 },
+                "loss_rate_pct": {
+                    "high_voltage": app.LOSS_RATE_PCT[(code, "高圧")],
+                    "extra_high_voltage": app.LOSS_RATE_PCT[(code, "特別高圧")],
+                },
+                "gen_side_charge": {
+                    "base_yen_per_kw_month": app.GEN_SIDE_CHARGE_YEN[code][0],
+                    "energy_yen_per_kwh": app.GEN_SIDE_CHARGE_YEN[code][1],
+                },
             })
         return _jsonable({
             "areas": areas,
@@ -1564,11 +1663,19 @@ def list_wind_areas() -> dict:
                 "cf_pct": app.WIND_CF_DEFAULT_PCT,
                 "cf_source": "資源エネルギー庁 調達価格等算定委員会 第112回（2026年1月）。陸上風力（新設）の想定値",
                 "ppa_price_yen_per_kwh": app.WIND_PPA_PRICE_DEFAULT,
-                "ppa_price_source": "同 第112回。2025年度入札の平均落札価格（PPAの相対契約の単価そのものではない）",
+                "ppa_price_source": "同 第112回。2025年度入札の平均落札価格（PPAの相対契約の単価そのものではない。"
+                                    "発電側課金は含まない）",
                 "retail_fee_yen_per_kwh": {"high_voltage": app.WIND_RETAIL_FEE_YEN["高圧"],
                                            "extra_high_voltage": app.WIND_RETAIL_FEE_YEN["特別高圧"]},
-                "retail_fee_source": "自然エネルギー財団の推定（2023年度・全国平均）。公的な料金表はない",
-                "wheeling_source": "北海道電力ネットワーク／東北電力ネットワーク 託送料金（標準接続送電、2025年10月〜、税込表示）",
+                "retail_fee_source": "JPEA報告（2024-06-03。R4年度・高圧・太陽光の平均）の暫定値。"
+                                    "旧名は小売手数料（自然エネルギー財団の推定）。特高は高圧の値を暫定流用",
+                "balancing_yen_per_kwh": app.OFFSITE_BALANCING_YEN,
+                "balancing_source": "JPEA報告（2024-06-03）の暫定値（発電インバランス1.1円/kWh）。エリア・電圧に"
+                                    "よらず一律",
+                "wheeling_source": "北海道電力ネットワーク／東北電力ネットワーク 託送供給等約款"
+                                  "（2026-04-01実施、税込表示）",
+                "loss_rate_source": "同約款。到達可能量 = 発電量 × (1 − 損失率)",
+                "gen_side_charge_source": "同約款。系統連系受電課金（発電側課金）。課金対象kWは契約容量",
             },
             "notes": [
                 "monthly_shape は月ごとの平均（年平均=1.0）。冬に強く夏に弱い。diurnal_shape は0〜23時の平均でほぼ平坦",
@@ -2026,10 +2133,17 @@ def validate_dc_params(
 
         wind: 風力発電（オフサイトPPA。送配電網で届く電源）。省略で風力なし（従来と同じ結果）。辞書で指定:
               {"capacity_kw": 1000} または {"coverage_pct": 100}（どちらか1つ。coverage_pct は年間の風力発電量を
-              年間需要量の何%にするか）。任意: "cf_pct"（設備利用率[%]、既定29.1）、"ppa_price_yen_per_kwh"（PPA単価、既定11.96）、
-              "wheeling_yen_per_kwh"（託送の電力量料金、既定=エリア×契約種別の一次資料の値）、
-              "retail_fee_yen_per_kwh"（小売手数料、既定=推定値）。**観測地点（station_no）が北海道・東北のときだけ**使える
-              （風力の調達エリアは需要地と同じ。list_wind_areas 参照）。届いた風力にも託送・賦課金・手数料がかかり、契約電力は
+              年間需要量の何%にするか）。任意: "cf_pct"（設備利用率[%]、既定29.1）、"ppa_price_yen_per_kwh"（PPA発電単価、既定11.96。
+              発電側課金は含まない）、"wheeling_yen_per_kwh"（託送の電力量料金、既定=エリア×契約種別の一次資料の値）、
+              "retail_fee_yen_per_kwh"（小売グロスマージン。別名 "retail_gross_margin_yen_per_kwh"、既定=JPEA報告の暫定値）、
+              "payment_basis"（支払の対象。"generated"=全量払い[既定]／"used"=使用量払い）、
+              "gen_charge"（発電側課金の扱い。"auto"[既定。PPA単価が既定値なら加算・入力すれば含む]／"add"／"included"）、
+              "gen_charge_discount_yen_per_year"（系統設備効率化割引、既定0＝未算入）、
+              "balancing_yen_per_kwh"（発電バランシング単価、既定=JPEA報告の暫定値1.1）、
+              "loss_rate_pct"（損失率[%]、既定=エリア×契約種別の一次資料の値）。
+              **観測地点（station_no）が北海道・東北のときだけ**使える
+              （風力の調達エリアは需要地と同じ。list_wind_areas 参照）。届いた風力にも託送・賦課金・小売グロスマージンがかかり、
+              発電した電気には発電側課金・発電バランシングもかかり、送電ロス（損失率）で届く量が減る。契約電力は
               下がらず、売電できるのは敷地内の太陽光の余剰だけ。系統受電上限（DC）とも併用できる（上限は届く風力も含めた
               受電量に対する上限。風力は上限を守る助けにならず、太陽光と蓄電池（lp_optimized）で守る）
         pv_enabled: 太陽光を使うか（既定true）。falseなら faces を使わず風力のみで計算（wind の指定が必要）
@@ -2191,9 +2305,12 @@ def simulate_dc(
     風力（オフサイトPPA。送配電網で届く電源）を併用するには wind（辞書）を、風力のみにするには pv_enabled=false と
     wind を指定する（結果に wind 節と24/7の一致率が加わる）。wind の書式: {"capacity_kw": 1000}（契約容量）または
     {"coverage_pct": 100}（年間の風力発電量を年間需要量の何%にするか。どちらか1つ）。任意で "cf_pct"（設備利用率、既定29.1）、
-    "ppa_price_yen_per_kwh"（既定11.96）、"wheeling_yen_per_kwh"（託送の電力量料金、既定=エリア×契約種別）、
-    "retail_fee_yen_per_kwh"（小売手数料、既定=推定値）。**station_no が北海道・東北のときだけ**使える（list_wind_areas 参照）。
-    届いた風力にも託送・賦課金・手数料がかかり、契約電力は下がらず、売電できるのは敷地内の太陽光の余剰だけ。
+    "ppa_price_yen_per_kwh"（PPA発電単価、既定11.96）、"wheeling_yen_per_kwh"（託送の電力量料金、既定=エリア×契約種別）、
+    "retail_fee_yen_per_kwh"（小売グロスマージン、既定=JPEA報告の暫定値）、"payment_basis"（支払の対象。既定"generated"＝全量払い）、
+    "gen_charge"（発電側課金の扱い、既定"auto"）、"loss_rate_pct"（損失率、既定=エリア×契約種別）、"balancing_yen_per_kwh"（発電バランシング単価）。
+    **station_no が北海道・東北のときだけ**使える（list_wind_areas 参照）。
+    届いた風力にも託送・賦課金・小売グロスマージンがかかり、発電した電気には発電側課金・発電バランシングもかかり、
+    契約電力は下がらず、売電できるのは敷地内の太陽光の余剰だけ。
     詳細は validate_* の wind 引数。事前に estimate_wind_generation で風力単体の発電量を確認できる。
 
     Returns:
