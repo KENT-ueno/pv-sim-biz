@@ -803,7 +803,13 @@ def _wind_section(app, wind_info, gen_pv, demand_30min, sc_result, month_day, ra
             "note": "generation_side_cost（PPA発電単価・発電側課金・発電バランシング）は、支払の対象が全量払いなら"
                     "発電量、使用量払いなら届いた量で決まる。delivered_extra は届いた分にかかる託送・賦課金・"
                     "小売グロスマージン。price_sources は各項目の出典区分（A:公的データの代理値／B:出典あり／"
-                    "C:実績調査値・暫定／D:未算入／U:入力値）",
+                    "C:実績調査値・暫定／D:未算入／U:入力値。payment_basis 等の契約条件そのものは区分の対象外で "
+                    "'—' を返す）。"
+                    "gen_side_charge_yen_per_year は: 全量払い・gen_charge_mode='included' のときも0ではなく"
+                    "生の計算値を返す（PPA単価に含むため generation_side_cost には加算されない参考額）。"
+                    "使用量払い（payment_basis='used'）のときは、生の年額ではなく届いた量・損失率で配分した後の"
+                    "額になる（ppa_payment_yen_per_year・balancing_yen_per_year も同様。合計は "
+                    "generation_side_cost_yen_per_year と一致する）",
         },
         "matching_24_7": {
             "volume_pct": round(vol_all, 1) if vol_all is not None else None,

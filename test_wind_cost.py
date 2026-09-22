@@ -70,10 +70,15 @@ class TestOffsitePayment:
         assert r["total"] == pytest.approx(expect_ppa + expect_gc + expect_bal, rel=1e-12)
 
     def test_generated_basis_gen_charge_not_added_when_included(self):
+        """『含む』でも gen_charge は0ではなく生の計算値を返す（参考額。合計には入らない。2026-09-22 Codexの実機検証で発見）。"""
         s = self._source(gen_charge_mode="included")
         r = app.offsite_payment(s, delivered_kwh=0.0)
-        assert r["gen_charge"] == 0.0
+        assert r["gen_charge"] == pytest.approx(s["gen_charge_yen"], rel=1e-12)  # 参考額（生の計算値）
         assert r["total"] == pytest.approx(s["annual_kwh"] * (s["ppa_price"] + s["balancing_yen"]), rel=1e-12)
+        # 「加算」のときと参考額そのものは同じ値（合計に入るかどうかだけが違う）
+        r_add = app.offsite_payment(self._source(gen_charge_mode="add"), delivered_kwh=0.0)
+        assert r["gen_charge"] == pytest.approx(r_add["gen_charge"], rel=1e-12)
+        assert r["total"] == pytest.approx(r_add["total"] - r_add["gen_charge"], rel=1e-12)
 
     def test_used_basis_total_and_hand_calc(self):
         """§9-5 の手計算: 発電側単価 ≈ 14.48 円/kWh（届いた 115,281.6 kWh に対して）。"""

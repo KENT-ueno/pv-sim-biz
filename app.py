@@ -1225,7 +1225,11 @@ def offsite_payment(source, delivered_kwh):
              loss_rate・payment_basis を持つ）
     delivered_kwh: 期間内の PPA使用量の合計 [kWh]（全量払いでは使わない）
     returns: {"basis", "ppa", "gen_charge", "balancing", "loss_part", "total"}（円）。
-             loss_part は ppa・gen_charge に含まれる損失の割り戻し分の内訳表示用（total には二重計上しない）
+             loss_part は ppa・gen_charge に含まれる損失の割り戻し分の内訳表示用（total には二重計上しない）。
+             **全量払いのとき `gen_charge` は常に生の計算値**（発電側課金の扱いが「含む」で合計に加算しない場合も、
+             参考額としてこの値を返す。合計にいくら入っているかは `total` の方だけを見ればよい。2026-09-22、
+             Codexの実機検証で「含む」のとき0が返って参考額が分からないと指摘があり修正）。使用量払いのときの
+             `gen_charge` は届いた量・損失で調整した**配分後**の額（生の年額とは異なる。§9-6の設計どおり）
 
     後方互換: `payment_basis` を持たない簡易な source（W2f 以前の資産・テスト用の最小フィクスチャなど）は、
     既に持っている `payment_yen` をそのまま総額として使う（全量払い扱い。内訳は出さない）
@@ -1237,7 +1241,8 @@ def offsite_payment(source, delivered_kwh):
     G = float(source["annual_kwh"])
     basis = source["payment_basis"]
     gen_charge_active = source["gen_charge_mode"] == "add"
-    gen_charge_total = float(source["gen_charge_yen"]) if gen_charge_active else 0.0
+    gen_charge_raw = float(source["gen_charge_yen"])
+    gen_charge_total = gen_charge_raw if gen_charge_active else 0.0
     if basis == "used":
         loss = float(source["loss_rate"])
         keep = 1.0 - loss
@@ -1250,10 +1255,11 @@ def offsite_payment(source, delivered_kwh):
         total = ppa + gen_charge + balancing
     else:
         ppa = G * float(source["ppa_price"])
-        gen_charge = gen_charge_total
+        added = gen_charge_total  # 合計に加算する額（「含む」なら0）
+        gen_charge = gen_charge_raw  # 表示は常に生の計算値（「含む」でも合計には入らない参考額）
         balancing = G * float(source["balancing_yen"])
         loss_part = 0.0
-        total = ppa + gen_charge + balancing
+        total = ppa + added + balancing
     return {"basis": basis, "ppa": ppa, "gen_charge": gen_charge, "balancing": balancing,
             "loss_part": loss_part, "total": total}
 
@@ -3683,7 +3689,9 @@ def run_simulation(
                                     f"（割引 {wind_info['gen_charge_discount_yen']:,.0f} 円控除後）{src('gen_charge')}"
                                     "（PPA単価に含まれないため加算）\n")
                 else:
-                    result_text += "  発電側課金: PPA単価に含む（別に加算しない）\n"
+                    result_text += (f"  発電側課金: {pay['gen_charge']:,.0f} 円（割引 "
+                                    f"{wind_info['gen_charge_discount_yen']:,.0f} 円控除後）{src('gen_charge')}"
+                                    "（PPA単価に含むため参考額。合計には加算しない）\n")
                 result_text += (f"  発電バランシング: {wind_info['balancing_yen']:.2f} 円/kWh × {G:,.1f} kWh = "
                                 f"{pay['balancing']:,.0f} 円 {src('balancing')}\n")
             else:
