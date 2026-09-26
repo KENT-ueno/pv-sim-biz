@@ -103,7 +103,15 @@ class TestOffsitePayment:
         r = app.offsite_payment(s, delivered_kwh=delivered)
         gen_unit = s["ppa_price"] / (1 - s["loss_rate"]) + s["balancing_yen"]
         assert r["total"] == pytest.approx(delivered * gen_unit, rel=1e-9)
-        assert r["gen_charge"] == 0.0
+        # #2（2026-09-26）: 「含む」でも0ではなく、届いた量で配分した参考額を返す（合計には入らない）
+        expect_ref = delivered * (s["gen_charge_yen"] / s["annual_kwh"]) / (1 - s["loss_rate"])
+        assert r["gen_charge"] == pytest.approx(expect_ref, rel=1e-12)
+        assert r["gen_charge"] > 0
+        r_add = app.offsite_payment(dict(s, gen_charge_mode="add"), delivered_kwh=delivered)
+        assert r["gen_charge"] == pytest.approx(r_add["gen_charge"], rel=1e-12)   # 参考額 = 「加算」のときの額
+        assert r["total"] == pytest.approx(r_add["total"] - r_add["gen_charge"], rel=1e-12)
+        # 損失の割り戻し分は、実際に払う PPA 分だけ（参考額の発電側課金は含めない）
+        assert r["loss_part"] == pytest.approx(delivered * s["ppa_price"] * s["loss_rate"] / (1 - s["loss_rate"]), rel=1e-9)
 
 
 class TestResolveWindHandCalc:
@@ -210,7 +218,7 @@ class TestValidation:
 
 
 class TestOffsiteLpSpec:
-    """offsite_lp_spec の gen_30min が到達可能量の合計になること・payment_yen の None 伝播。"""
+    """offsite_lp_spec の gen_30min が到達可能量の合計になること。発電側の支払は持たない（offsite_payment_total で計算）。"""
 
     def test_gen_30min_uses_deliverable(self):
         w = app.resolve_wind(_wind_args(loss_rate_pct=10.0), STATION_SENDAI, 1_000_000.0, contract_type="高圧")
@@ -223,18 +231,42 @@ class TestOffsiteLpSpec:
         spec = app.offsite_lp_spec([src])
         assert np.allclose(spec["gen_30min"], gen)
 
-    def test_payment_yen_none_when_used_basis(self):
+    def test_spec_has_no_payment(self):
+        """以前の payment_yen は本番のコードが読まず、使用量払いで None になる罠だったので削除した（2026-09-26）。"""
         w = app.resolve_wind(_wind_args(payment_basis=app.WIND_PAYMENT_BASIS_USED), STATION_SENDAI,
                               1_000_000.0, contract_type="高圧")
         assert w["payment_yen"] is None
-        spec = app.offsite_lp_spec([w])
-        assert spec["payment_yen"] is None
+        assert "payment_yen" not in app.offsite_lp_spec([w])
 
-    def test_payment_yen_sums_when_all_generated(self):
+    def test_payment_total_sums_sources_by_their_own_delivered(self):
+        """offsite_payment_total: 電源ごとに、その電源の届いた量で支払を計算して合計する（全量払い・使用量払いの混在）。"""
         w1 = app.resolve_wind(_wind_args(capacity_kw=50.0), STATION_SENDAI, 1_000_000.0, contract_type="高圧")
-        w2 = app.resolve_wind(_wind_args(capacity_kw=30.0), STATION_SENDAI, 1_000_000.0, contract_type="高圧")
-        spec = app.offsite_lp_spec([w1, w2])
-        assert spec["payment_yen"] == pytest.approx(w1["payment_yen"] + w2["payment_yen"], rel=1e-9)
+        w2 = app.resolve_wind(_wind_args(capacity_kw=30.0, payment_basis=app.WIND_PAYMENT_BASIS_USED),
+                              STATION_SENDAI, 1_000_000.0, contract_type="高圧")
+        d1 = w1["deliverable_30min"] * 0.5
+        d2 = w2["deliverable_30min"] * 0.3
+        got = app.offsite_payment_total([w1, w2], [d1, d2])
+        # 別経路: 全量払いは発電量で、使用量払いは §9-2 の式で届いた量から
+        g2 = w2["annual_kwh"]
+        exp1 = w1["annual_kwh"] * (w1["ppa_price"] + w1["balancing_yen"]) + w1["gen_charge_yen"]
+        exp2 = float(d2.sum()) * ((w2["ppa_price"] + w2["gen_charge_yen"] / g2) / (1 - w2["loss_rate"]) + w2["balancing_yen"])
+        assert got == pytest.approx(exp1 + exp2, rel=1e-9)
+
+
+class TestOffsiteSourceCost:
+    """offsite_source_cost: UI・MCPが共有する費用の内訳（①発電側の支払＋②届いた分の費用）。"""
+
+    def test_breakdown(self):
+        w = app.resolve_wind(_wind_args(), STATION_SENDAI, 1_000_000.0, contract_type="高圧")
+        dl = 12_345.6
+        c = app.offsite_source_cost(w, dl, 4.18)
+        assert c["unit_extra"] == pytest.approx(w["wheeling_yen"] + 4.18 + w["retail_fee_yen"], rel=1e-12)
+        assert c["delivered_extra"] == pytest.approx(dl * c["unit_extra"], rel=1e-12)
+        assert c["total"] == pytest.approx(app.offsite_payment(w, dl)["total"] + c["delivered_extra"], rel=1e-12)
+
+    def test_used_basis_note_has_surplus_pct(self):
+        note = app.used_basis_surplus_note(250.0, 1000.0, 4.1)
+        assert "発電量の25.0%" in note and "4.1円" in note and "小売が負う" in note
 
 
 class TestOffsiteReceivingLossAccounting:
@@ -250,6 +282,23 @@ class TestOffsiteReceivingLossAccounting:
         assert np.allclose(gen_equiv + off["wasted_by_source"][0], w["gen_30min"], atol=1e-6)
         assert np.allclose(off["loss_by_source"][0], gen_equiv - off["delivered_by_source"][0], atol=1e-9)
         assert np.all(off["loss_by_source"][0] >= -1e-9)
+        # 各コマで届いた量は到達可能量を超えない（§9-8 item 4）
+        assert np.all(off["delivered_by_source"][0] <= w["deliverable_30min"] + 1e-9)
+
+    def test_delivered_capped_at_deliverable_not_generation(self):
+        """需要が十分大きく小売購入が0でも、届く量は到達可能量（発電量×(1−損失率)）で頭打ちになる。
+
+        上の恒等式は offsite_receiving の定義をなぞるだけなので、上限を gen_30min に戻す誤りを検出できない
+        （2026-09-26 のコードレビューで指摘）。小売購入を0にした別の状況で、上限そのものを直接確かめる。
+        """
+        w = app.resolve_wind(_wind_args(loss_rate_pct=5.2), STATION_SENDAI, 1_000_000.0, contract_type="高圧")
+        demand = np.full((365, 48), 1e6)
+        pv_gen = np.zeros((365, 48))
+        sc_result = {"import_": np.zeros((365, 48))}
+        off = app.offsite_receiving(pv_gen, [w], demand, sc_result)
+        assert np.allclose(off["delivered_by_source"][0], w["deliverable_30min"])
+        assert off["delivered"].sum() < w["gen_30min"].sum() * (1 - 0.052) + 1e-6
+        assert np.all(off["wasted_by_source"][0] >= -1e-9)
 
 
 if __name__ == "__main__":

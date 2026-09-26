@@ -78,15 +78,20 @@ def unit_prices():
         + RATE["fuel_adjustment"] + RATE["renewable_surcharge"]
 
 
-def reference_lp(pv, wind, dem, capacity, sell, no_export, cap_kw=None, cap_var=None, batt_cost=0.0, payback=1.0, rate=RATE):
+def reference_lp(pv, wind, dem, capacity, sell, no_export, cap_kw=None, cap_var=None, batt_cost=0.0, payback=1.0, rate=RATE,
+                 used_unit=0.0):
     """独立実装（scipy.linprog / HiGHS）。受電点を「買い（N+）と売り（N−）」の正味の流れで表す別の定式化。
 
     optimize_battery は受電量Rと売電Eを別変数にして収支で結ぶが、こちらは需要+充電−放電−PV = 正味受電 として
     N+（正味受電）・E（売電）・C（出力抑制）に分け、風力の配達分 w ≤ N+ ・ w ≤ 風力発電量 とする。
     cap_var=True なら容量も変数（optimize_battery_capacity に対応）。
     cap_kw を渡したときは、optimize_battery と同じく初期SOC＝年末SOC（変数）の周期条件にする。
+    used_unit > 0（使用量払い。#4）: 風力に余剰があるコマで、蓄電池なしでも受ける量 base を超える正味受電に
+    used_unit を課す（N+ − X ≤ base、X ≥ 0 の補助変数 X）。返り値からはこの上乗せを除く
     返り値: 最適値（電気代−売電収入。cap_var のときは＋蓄電池の年額換算）
     """
+    if used_unit > 0:
+        return _reference_lp_used(pv, wind, dem, capacity, sell, no_export, used_unit, rate)
     T = pv.size
     dt = 0.5
     eff = BAT["efficiency_pct"] / 100.0
@@ -187,6 +192,65 @@ def reference_lp(pv, wind, dem, capacity, sell, no_export, cap_kw=None, cap_var=
     res = linprog(c, A_ub=A_ub.tocsr(), b_ub=b_ub, A_eq=A_eq.tocsr(), b_eq=b_eq, bounds=bounds, method="highs")
     assert res.status == 0, res.message
     return res.fun
+
+
+def _reference_lp_used(pv, wind, dem, capacity, sell, no_export, used_unit, rate):
+    """reference_lp の使用量払い版（容量固定・上限なし）。変数に X（base を超える受電）を足した別の組み立て。"""
+    T = pv.size
+    dt = 0.5
+    eff = BAT["efficiency_pct"] / 100.0
+    up = unit_prices()
+    pvf, wf, df = pv.ravel(), wind.ravel(), dem.ravel()
+    base = np.minimum(wf, np.maximum(0.0, df - pvf))
+    sur = wf > base + 1e-9
+    names = ("ch", "dis", "soc", "N", "w", "E", "C", "X")
+    idx = {k: i * T for i, k in enumerate(names)}
+    n_var = len(names) * T + 1
+    ipeak = len(names) * T
+    c = np.zeros(n_var)
+    c[ipeak] = rate["basic_charge_per_kw"] * 12 * (185 - rate["power_factor_pct"]) / 100.0
+    c[idx["N"]:idx["N"] + T] = up
+    c[idx["w"]:idx["w"] + T] = -(up - W_UNIT)
+    c[idx["E"]:idx["E"] + T] = -sell
+    c[idx["X"]:idx["X"] + T] = used_unit
+    A_eq = lil_matrix((2 * T + 1, n_var))
+    b_eq = np.zeros(2 * T + 1)
+    s0 = capacity * BAT["soc_min_pct"] / 100.0
+    for t in range(T):
+        A_eq[t, idx["N"] + t], A_eq[t, idx["dis"] + t] = 1, 1
+        A_eq[t, idx["ch"] + t], A_eq[t, idx["E"] + t], A_eq[t, idx["C"] + t] = -1, -1, -1
+        b_eq[t] = df[t] - pvf[t]
+        A_eq[T + t, idx["soc"] + t], A_eq[T + t, idx["ch"] + t], A_eq[T + t, idx["dis"] + t] = 1, -eff, 1 / eff
+        if t > 0:
+            A_eq[T + t, idx["soc"] + t - 1] = -1
+        else:
+            b_eq[T + t] = s0
+    A_eq[2 * T, idx["soc"] + T - 1] = 1
+    b_eq[2 * T] = s0
+    A_ub = lil_matrix((5 * T, n_var))
+    b_ub = np.zeros(5 * T)
+    for t in range(T):
+        A_ub[t, idx["w"] + t], A_ub[t, idx["N"] + t] = 1, -1
+        A_ub[T + t, idx["E"] + t], A_ub[T + t, idx["C"] + t] = 1, 1
+        b_ub[T + t] = pvf[t]
+        A_ub[2 * T + t, idx["ch"] + t], A_ub[2 * T + t, idx["dis"] + t] = 1, 1
+        b_ub[2 * T + t] = max(BAT["max_charge_kw"], BAT["max_discharge_kw"]) * dt
+        A_ub[3 * T + t, idx["N"] + t], A_ub[3 * T + t, ipeak] = 1 / dt, -1
+        # N − X ≤ base（余剰のあるコマだけ。それ以外は X=0 に固定するので行は無害）
+        A_ub[4 * T + t, idx["N"] + t], A_ub[4 * T + t, idx["X"] + t] = (1, -1) if sur[t] else (0, 0)
+        b_ub[4 * T + t] = base[t] if sur[t] else 0.0
+    bounds = [(0, None)] * n_var
+    for t in range(T):
+        bounds[idx["ch"] + t] = (0, BAT["max_charge_kw"] * dt)
+        bounds[idx["dis"] + t] = (0, BAT["max_discharge_kw"] * dt)
+        bounds[idx["soc"] + t] = (s0, capacity * BAT["soc_max_pct"] / 100.0)
+        bounds[idx["w"] + t] = (0, float(wf[t]))
+        bounds[idx["E" if no_export else "C"] + t] = (0, 0)
+        if not sur[t]:
+            bounds[idx["X"] + t] = (0, 0)
+    res = linprog(c, A_ub=A_ub.tocsr(), b_ub=b_ub, A_eq=A_eq.tocsr(), b_eq=b_eq, bounds=bounds, method="highs")
+    assert res.status == 0, res.message
+    return res.fun - used_unit * float(np.sum(res.x[idx["X"]:idx["X"] + T]))
 
 
 def true_cost(sc, pv, sell, no_export=False, spec=SPEC, rate=RATE):
@@ -294,12 +358,113 @@ check("グリッドサーチは4点（容量0.1〜120kWh）を返す", len(gs) =
 for r in gs:
     sc_g = solve(r["capacity"], 8.5)
     tc_g, ca_g, _ = true_cost(sc_g, PV, 8.5)
-    merit_exp = before_total - tc_g - SPEC["payment_yen"]          # 電気代削減＋売電収入−風力PPA支払
+    merit_exp = before_total - tc_g - SRC["payment_yen"]          # 電気代削減＋売電収入−風力PPA支払
     check(f"容量{r['capacity']:.1f}kWh: 年間メリット = 電気代削減＋売電収入−風力PPA支払", abs(r["annual_merit"] - merit_exp) < 0.5,
           f"{r['annual_merit']:.2f} vs {merit_exp:.2f}")
     check(f"容量{r['capacity']:.1f}kWh: 契約電力は受電量の最大で決まる", abs(r["contract_power_kw"] - ca_g["contract_power_kw"]) < 1e-6,
           f"{r['contract_power_kw']:.2f}")
     check(f"容量{r['capacity']:.1f}kWh: CO2削減量 = (需要−小売購入)×係数", abs(r["co2_reduction"] - (sc_g["annual_demand"] - sc_g["annual_import"]) * 0.000431) < 1e-6)
+
+print("\n【2c. 使用量払い（W2f）: グリッドサーチの各容量で、発電側の支払を届いた量から計算し直す】")
+# §9-8 item 5 の穴（2026-09-26 のコードレビュー）: 使用量払いの支払は容量ごとの届いた量で決まるが、LP・グリッドサーチ・
+# 最適容量探索の経路を通すテストがなかった。支払の式は offsite_payment を使わず §9-2 の式で別に計算して照合する
+LOSS_U = 0.052
+G_W = float(WIND.sum())
+GC_U = 93.04 * 12 * 50.0 + 0.29 * G_W   # 契約容量50kW相当の発電側課金（合成データ用の値）
+SRC_USED = dict(gen_30min=WIND, deliverable_30min=WIND * (1 - LOSS_U), loss_rate=LOSS_U, annual_kwh=G_W,
+                ppa_price=11.96, gen_charge_yen=GC_U, gen_charge_mode="add", balancing_yen=1.1,
+                payment_basis="used", wheeling_yen=2.15, retail_fee_yen=3.0)
+SPEC_USED = app.offsite_lp_spec([SRC_USED])
+check("offsite_lp_spec は発電側の支払を持たない（容量ごとに届いた量から計算する）",
+      "payment_yen" not in SPEC_USED)
+gs_u = app.grid_search_battery_capacity(
+    PV, DEM, MONTH_DAY, efficiency_pct=95.0, max_charge_kw=60.0, max_discharge_kw=60.0, soc_min_pct=20.0, soc_max_pct=95.0,
+    sell_price=8.5, pv_cost=158000.0, battery_cost_per_kwh=200000.0, total_ppeak=150.0, co2_factor=0.000431,
+    cost_before_total=before_total, payback_years=15, no_export=False, optimal_capacity=20.0, n_steps=3,
+    offsite=SPEC_USED, **RATE)
+check("使用量払い: グリッドサーチが4点を返す（例外で点が落ちていない）", len(gs_u) == 4,
+      str([round(r["capacity"], 1) for r in gs_u]))
+pays_u = []
+for r in gs_u:
+    sc_u = solve(r["capacity"], 8.5, offsite=SPEC_USED)
+    tc_u, ca_u, off_u = true_cost(sc_u, PV, 8.5, spec=SPEC_USED)
+    dl_u = float(off_u["delivered"].sum())
+    check(f"使用量払い・容量{r['capacity']:.1f}kWh: 届いた量は到達可能量以下",
+          bool(np.all(off_u["delivered"] <= SRC_USED["deliverable_30min"] + 1e-6)))
+    pay_u = dl_u * ((11.96 + GC_U / G_W) / (1 - LOSS_U) + 1.1)     # §9-2 の使用量払いの式（別経路）
+    pays_u.append(pay_u)
+    merit_u = before_total - tc_u - pay_u
+    check(f"使用量払い・容量{r['capacity']:.1f}kWh: 年間メリット = 電気代削減＋売電収入−届いた量×発電側単価",
+          abs(r["annual_merit"] - merit_u) < 0.5, f"{r['annual_merit']:.2f} vs {merit_u:.2f}")
+check("使用量払い: 全量払いより発電側の支払が小さい（使った分だけ払う）",
+      max(pays_u) < G_W * 11.96 + GC_U + G_W * 1.1, f"{max(pays_u):.0f}")
+
+print("\n【2d. 使用量払い×LP（#4 案1）: 蓄電池なしでも受ける量を超える受電に発電側単価を上乗せする】")
+# 使用量払いでは、オフサイトの電気は消費に先に配分される（出なり）ので、風力に余剰があるコマで受電を増やす（蓄電池に
+# 充電する）と、増えた分は風力になり発電側単価も払う。LPがこれを見ずに「風力を貯める」運転を選ばないことを確かめる
+U_USED = (11.96 + GC_U / G_W) / (1 - LOSS_U) + 1.1
+check("offsite_used_unit_yen = §9-2 の使用量払いの発電側単価（別経路の式）", abs(app.offsite_used_unit_yen(SRC_USED) - U_USED) < 1e-9,
+      f"{app.offsite_used_unit_yen(SRC_USED):.4f} vs {U_USED:.4f}")
+check("offsite_used_unit_yen × 届いた量 = offsite_payment の使用量払いの合計",
+      abs(app.offsite_used_unit_yen(SRC_USED) * 1234.5 - app.offsite_payment(SRC_USED, 1234.5)["total"]) < 1e-6)
+check("全量払い・payment_basis の無い簡易な電源では 0（LPは従来どおり）",
+      app.offsite_used_unit_yen(dict(SRC_USED, payment_basis="generated")) == 0.0 and SPEC["used_unit_yen"] == 0.0)
+check("offsite_lp_spec の used_unit_yen が電源の発電側単価", abs(SPEC_USED["used_unit_yen"] - U_USED) < 1e-9)
+
+W_DL = SRC_USED["deliverable_30min"]
+BASE_U = np.minimum(W_DL, np.maximum(0.0, DEM - PV))
+SUR_U = W_DL > BASE_U + 1e-9
+
+
+def stored_wind(sc):
+    """風力に余剰があるコマで、蓄電池なしでも受ける量を超えて受けた風力 [kWh]（＝蓄電池に貯めた風力）"""
+    return float(np.sum(np.maximum(0.0, sc["offsite_delivered"] - BASE_U)[SUR_U]))
+
+
+sc_used = solve(200.0, 8.5, offsite=SPEC_USED)
+invariants("使用量払い", sc_used, PV, W_DL)
+tc_used, _, _ = true_cost(sc_used, PV, 8.5, spec=SPEC_USED)
+check("使用量払い: opt_annual_cost は上乗せを除いた実際の電気代−売電収入", abs(sc_used["opt_annual_cost"] - tc_used) < 0.5,
+      f"{sc_used['opt_annual_cost']:.2f} vs {tc_used:.2f}")
+if HAS_SCIPY:
+    ref_u = reference_lp(PV, W_DL, DEM, 200.0, 8.5, False, used_unit=U_USED)
+    check("使用量払い: 独立実装（scipy。上乗せ付き）の最適値と一致", abs(ref_u - sc_used["opt_annual_cost"]) < 1e-3 * abs(ref_u) + 0.5,
+          f"{sc_used['opt_annual_cost']:.3f} vs {ref_u:.3f}")
+# 上乗せなし（修正前の定式化）と比べる: 修正前は風力を貯め、修正後は貯めない。実際の単価で評価すると修正後の方が安い
+spec_nopen = dict(SPEC_USED, used_unit_yen=0.0)
+sc_nopen = solve(200.0, 8.5, offsite=spec_nopen)
+tc_nopen, _, off_nopen = true_cost(sc_nopen, PV, 8.5, spec=SPEC_USED)
+_, _, off_used = true_cost(sc_used, PV, 8.5, spec=SPEC_USED)
+real_used = tc_used + float(off_used["delivered"].sum()) * U_USED
+real_nopen = tc_nopen + float(off_nopen["delivered"].sum()) * U_USED
+check("前提: 上乗せなしのLPは風力を貯める（このテストが空振りでない）", stored_wind(sc_nopen) > 1.0, f"{stored_wind(sc_nopen):.1f} kWh")
+check("既定相当の単価（発電側単価＋届いた分の単価 > 小売単価）では、風力を貯めない", stored_wind(sc_used) < 0.1,
+      f"{stored_wind(sc_used):.3f} kWh")
+check("実際の単価で評価した総費用（電気代−売電＋発電側の支払）は、上乗せなしのLPより下がる（悪くならない）",
+      real_used <= real_nopen + 0.5, f"{real_used:.1f} ≤ {real_nopen:.1f}")
+# 案2（禁止）との違い: 発電側単価が安ければ、風力を貯める方が得なので貯める
+SRC_CHEAP = dict(SRC_USED, ppa_price=0.5, gen_charge_mode="included", balancing_yen=0.0)
+sc_cheap = solve(200.0, 8.5, offsite=app.offsite_lp_spec([SRC_CHEAP]))
+check("発電側単価が安い（0.5円）と、使用量払いでも風力を貯める（禁止ではなく損得で決まる）", stored_wind(sc_cheap) > 1.0,
+      f"{stored_wind(sc_cheap):.1f} kWh")
+# 全量払いの LP は上乗せが無く、修正前とビット同一
+sc_gen = solve(200.0, 8.5, offsite=app.offsite_lp_spec([dict(SRC_USED, payment_basis="generated")]))
+sc_gen0 = solve(200.0, 8.5, offsite=dict(app.offsite_lp_spec([dict(SRC_USED, payment_basis="generated")]), used_unit_yen=0.0))
+check("全量払いのLPは上乗せなしと同一の運転", np.array_equal(sc_gen["battery_charge"], sc_gen0["battery_charge"])
+      and sc_gen["opt_annual_cost"] == sc_gen0["opt_annual_cost"])
+if HAS_SCIPY:
+    r_uc = app.optimize_battery_capacity(PV, DEM, MONTH_DAY, sell_price=8.5, battery_cost_per_kwh=100.0,
+                                         payback_years=1.0, offsite=SPEC_USED, capacity_upper=2000, no_export=False,
+                                         **BAT, **RATE)
+    r_un = app.optimize_battery_capacity(PV, DEM, MONTH_DAY, sell_price=8.5, battery_cost_per_kwh=100.0,
+                                         payback_years=1.0, offsite=spec_nopen, capacity_upper=2000, no_export=False,
+                                         **BAT, **RATE)
+    check("最適容量探索（段階1）: 使用量払いでも解け、容量が有限で0以上", 0 <= r_uc["optimal_capacity_kwh"] <= 2000,
+          f"{r_uc['optimal_capacity_kwh']:.2f} kWh（上乗せなし {r_un['optimal_capacity_kwh']:.2f}）")
+    check("最適容量探索（段階1）: 上乗せで目的関数が変わる（使用量払いの経路が効いている）",
+          abs(r_uc["opt_annual_cost"] - r_un["opt_annual_cost"]) > 1e-6 or
+          abs(r_uc["optimal_capacity_kwh"] - r_un["optimal_capacity_kwh"]) > 1e-6,
+          f"{r_uc['opt_annual_cost']:.2f} / {r_un['opt_annual_cost']:.2f}")
 
 # ============================================================
 print("\n【3. 売電単価が風力の配達単価を上回るとき（FIT 19円）に、風力を受電して太陽光を売る裁定が生じない】")
@@ -552,6 +717,44 @@ if cs_ok:
     check("  段階1の年間コスト削減（風力PPA支払後）= 最適容量で通常LPを解いた年間経済メリット",
           merit1 is not None and merit2 is not None and abs(merit1 - merit2) <= 1.0 + 1e-6 * abs(merit2),
           f"{merit1} vs {merit2}")
+
+# 使用量払い（W2f）+ LP: 年間経済メリット = 電気代削減＋売電収入 − 届いた量×発電側単価（§9-2の式で別に計算）
+w_used = wind("coverage", payment_basis=app.WIND_PAYMENT_BASIS_USED)
+o_u = run(wind_args=w_used, bat_enabled=True, bat_mode="最適充放電（LP）", bat_capacity=200.0,
+          bat_max_charge=100.0, bat_max_discharge=100.0)
+ok_u = not o_u[4].startswith("エラー") and o_u[6] is not None
+check("run_simulation 使用量払い + LP: 計算できる", ok_u, o_u[4][:60].replace("\n", " "))
+if ok_u:
+    st_u = o_u[6]
+    wi_u, scr_u = st_u["wind_info"], st_u["sc_result"]
+    off_uu = app.offsite_receiving(st_u["gen_pv"], [wi_u], st_u["demand_30min"], scr_u)
+    ca_uu = app.offsite_cost_after(off_uu, [wi_u], st_u["month_day"], RATE)
+    before_u = app.calc_electricity_cost(st_u["demand_30min"], st_u["month_day"], **RATE)["annual_total"]
+    dl_uu = float(off_uu["delivered"].sum())
+    G_u = wi_u["annual_kwh"]
+    pay_uu = dl_uu * ((wi_u["ppa_price"] + wi_u["gen_charge_yen"] / G_u) / (1 - wi_u["loss_rate"]) + wi_u["balancing_yen"])
+    merit_uu = before_u - ca_uu["annual_total"] + 19.0 * scr_u["annual_export"] - pay_uu
+    got_u = num(o_u[4], "年間経済メリット:", after="風力込みの年間経済メリット")
+    check("  使用量払い + LP: 年間経済メリットが §9-2 の式で別に計算した値と一致",
+          got_u is not None and abs(got_u - merit_uu) < 1.5, f"{got_u} vs {merit_uu:,.1f}")
+
+# 使用量払い（W2f）+ 最適容量探索: 段階1の年間コスト削減 = 同じ容量で通常LP（使用量払い）を解いた年間経済メリット
+cs_u = run(bat_enabled=True, bat_mode="最適容量探索", bat_max_charge=100.0, bat_max_discharge=100.0, wind_args=w_used,
+           bat_cost_per_kwh=60000.0)
+cs_u_ok = not cs_u[4].startswith("エラー") and "最適蓄電池容量" in cs_u[4] and "最適容量探索エラー" not in cs_u[4]
+check("最適容量探索 + 使用量払い: 計算できる", cs_u_ok, cs_u[4][:80].replace("\n", " "))
+if cs_u_ok:
+    st_cu = cs_u[6]
+    cap_u = app.optimize_battery_capacity(
+        st_cu["gen_pv"], st_cu["demand_30min"], st_cu["month_day"], efficiency_pct=95, max_charge_kw=100.0,
+        max_discharge_kw=100.0, soc_min_pct=20, soc_max_pct=95, sell_price=19.0, battery_cost_per_kwh=60000.0,
+        payback_years=15, no_export=False, offsite=app.offsite_lp_spec([st_cu["wind_info"]]), **RATE)["optimal_capacity_kwh"]
+    lp_u = run(wind_args=w_used, bat_enabled=True, bat_mode="最適充放電（LP）", bat_capacity=float(cap_u),
+               bat_max_charge=100.0, bat_max_discharge=100.0)
+    m1u = num(cs_u[4], "年間コスト削減:", after="最適蓄電池容量探索")
+    m2u = num(lp_u[4], "年間経済メリット:", after="風力込みの年間経済メリット")
+    check("  使用量払い: 段階1の年間コスト削減 = 最適容量で通常LPを解いた年間経済メリット",
+          m1u is not None and m2u is not None and abs(m1u - m2u) <= 1.0 + 1e-6 * abs(m2u), f"{m1u} vs {m2u}")
 
 # ============================================================
 print("\n【7. 風力を使わないとき（従来経路）の LP は変わらない】")

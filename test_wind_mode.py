@@ -360,8 +360,14 @@ check("設備利用率0ならエラー", o[4].startswith("エラー") and "設�
 o = run(wind_args=wind("capacity", ppa_price=-1.0))
 check("PPA単価が負ならエラー", o[4].startswith("エラー") and "PPA単価" in o[4])
 o = run(wind_args=wind("capacity", ppa_price=0.0))
-check("PPA単価0円は許容（PPA発電単価の行が0円。発電側課金・バランシングは別に残る。W2f）",
+check("PPA単価0円は許容（PPA発電単価の行が0円。「自動」なので発電側課金は含む扱い、バランシングは残る。W2f）",
       not o[4].startswith("エラー") and "PPA発電単価: 0.00 円/kWh" in o[4], errdetail(o))
+check("「自動」でPPA単価を入力したら、含む扱いになったことの注記が出る（§9-3）",
+      app.GEN_CHARGE_AUTO_INCLUDED_NOTE in o[4] and o[6]["wind_info"]["gen_charge_auto_included"], errdetail(o))
+o = run(wind_args=wind("capacity"))
+check("PPA単価が既定値なら「自動」でも注記は出ない", app.GEN_CHARGE_AUTO_INCLUDED_NOTE not in o[4], errdetail(o))
+o = run(wind_args=wind("capacity", ppa_price=0.0, gen_charge_mode=app.WIND_GEN_CHARGE_ADD))
+check("「加算」を明示すれば、PPA単価を入力しても注記は出ない", app.GEN_CHARGE_AUTO_INCLUDED_NOTE not in o[4], errdetail(o))
 o = run(wind_args=wind("capacity", ppa_price=0.0, gen_charge_mode=app.WIND_GEN_CHARGE_INCLUDED, balancing_yen=0.0))
 check("PPA単価0円・発電側課金を含む扱い・バランシング0円なら発電側費用は0円（W2f）",
       not o[4].startswith("エラー") and abs(o[6]["wind_info"]["payment_yen"]) < 1e-6, errdetail(o))

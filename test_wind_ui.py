@@ -165,7 +165,7 @@ check("支払の対象を触らない（既定=全量払い）なら出典タグ
 o = click_with(enabled=True, capacity="500", pv=False)
 check("『太陽光を使う』OFF → 太陽光=使用しない（風力のみ）", "太陽光=使用しない" in o[5] and "太陽光発電: 使用しない" in o[4])
 o = click_with(enabled=True, sizing=app.WIND_SIZING_COVERAGE, coverage="100", capacity="99999")
-w_kwh = float(re.search(r"年間発電量（風力）: ([\d,.]+) kWh/年", o[4]).group(1).replace(",", ""))
+w_kwh = float(re.search(r"年間発電量（風力・発電端）: ([\d,.]+) kWh/年", o[4]).group(1).replace(",", ""))
 demand_kwh = float(re.search(r"年間需要量: ([\d,.]+) kWh/年", o[4]).group(1).replace(",", ""))
 check("需要カバー率で指定 → 契約容量の欄（99999）は使わず、風力の年間発電量 = 年間需要 × 100%",
       abs(w_kwh - demand_kwh) < 1.0, f"{w_kwh} vs {demand_kwh}")
@@ -207,16 +207,16 @@ print("\n【4. グラフ（風力あり: 内訳／風力なし: 従来）】")
 o_w = click_with(enabled=True, capacity="300")
 mon = o_w[0]
 names = [t.name for t in mon.data]
-check("月別: 太陽光・風力の積み上げ＋需要・自家消費の4系列", names == ["発電量（太陽光）", "発電量（風力）", "需要量", "自家消費（風力の配達分を含む）"], str(names))
+check("月別: 太陽光・風力の積み上げ＋需要・自家消費の4系列", names == ["発電量（太陽光）", "発電量（風力・到達分）", "需要量", "自家消費（風力の配達分を含む）"], str(names))
 pv_y, w_y = np.array(mon.data[0].y), np.array(mon.data[1].y)
 st = o_w[6]
 check("月別: 風力は太陽光の上に積む（base = 太陽光）", np.allclose(np.array(mon.data[1].base), pv_y))
 check("月別: 太陽光＋風力 = 発電量の合計", abs(float(pv_y.sum() + w_y.sum()) - float(st["total_gen_clipped"].sum())) < 1e-6)
 day = o_w[1]
 dn = [t.name for t in day.data]
-check("日別: 合計の『発電量』に、うち太陽光・うち風力の線が加わる", "発電量" in dn and "うち太陽光" in dn and "うち風力（発電量）" in dn, str(dn))
+check("日別: 合計の『発電量』に、うち太陽光・うち風力の線が加わる", "発電量" in dn and "うち太陽光" in dn and "うち風力（到達分）" in dn, str(dn))
 idx = [i for i, md_ in enumerate(st["month_day"]) if md_ == (7, 1)][0]
-wt = [t for t in day.data if t.name == "うち風力（発電量）"][0]
+wt = [t for t in day.data if t.name == "うち風力（到達分）"][0]
 check("日別: 風力の線 = その日の風力発電量", np.allclose(wt.y, st["gen_wind"][idx]))
 mon0 = base[0]
 check("風力なしの月別は従来の系列（発電量・需要量・自家消費）", [t.name for t in mon0.data] == ["発電量", "需要量", "自家消費"],
@@ -224,7 +224,7 @@ check("風力なしの月別は従来の系列（発電量・需要量・自家�
 check("風力なしの日別に風力の線はない", not any("風力" in (t.name or "") for t in base[1].data))
 # 日付変更の再描画（保存した結果から）も風力の内訳を持つ
 redraw = app.make_daily_chart(st, 1, 15, st["sc_result"], st["demand_30min"])
-check("日付を変えての再描画（保存した結果から）でも内訳が出る", any(t.name == "うち風力（発電量）" for t in redraw.data))
+check("日付を変えての再描画（保存した結果から）でも内訳が出る", any(t.name == "うち風力（到達分）" for t in redraw.data))
 
 print("\n" + "=" * 70)
 print(f"結果: PASS {n_pass} / FAIL {n_fail}")

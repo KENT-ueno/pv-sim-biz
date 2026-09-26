@@ -178,6 +178,36 @@ check("A2: 使用量払い: MCPが完了し、年間経済メリットがUIと�
 check("A2: 使用量払いは全量払いよりメリットが大きい（無駄になった分の支払を免れる）",
       ma2["electricity_cost"]["annual_economic_merit_yen"] > ma["electricity_cost"]["annual_economic_merit_yen"])
 check("A2: wind.cost.payment_basis が 'used'", ma2["wind"]["cost"]["payment_basis"] == "used")
+# §9-4: 使用量払いでは余剰の割合とリスクの注記を常に出す（UI・MCPで同じ文面。全量払いでは出さない）
+w2 = ma2["wind"]
+note2 = w2["cost"]["surplus_risk_note"]
+check("A2: 使用量払いの注記（余剰の割合・小売がリスクを負う）がMCPに出て、UIの結果テキストにも同じ文面で出る",
+      bool(note2) and f"発電量の{w2['surplus_pct_of_generation']:.1f}%" in note2 and note2 in ua2[4], str(note2)[:80])
+# #2（2026-09-26）: 使用量払い＋「含む」でも、発電側課金は0ではなく配分後の参考額（合計には入らない）
+ma3 = mcp_sim(wind={"coverage_pct": 100.0, "payment_basis": "used", "gen_charge": "included"})
+ua3 = ui_sim(uw(cov=100.0, payment_basis=app.WIND_PAYMENT_BASIS_USED, gen_charge_mode=app.WIND_GEN_CHARGE_INCLUDED))
+c3, c2 = ma3["wind"]["cost"], w2["cost"]
+check("A3: 使用量払い＋含む: gen_side_charge は参考額（>0、「加算」のときの配分後の額と同じ）",
+      c3["gen_side_charge_yen_per_year"] > 0 and abs(c3["gen_side_charge_yen_per_year"] - c2["gen_side_charge_yen_per_year"]) <= 1,
+      f"{c3['gen_side_charge_yen_per_year']} vs {c2['gen_side_charge_yen_per_year']}")
+check("A3: 使用量払い＋含む: 合計は参考額を除いた ppa＋balancing",
+      abs(c3["generation_side_cost_yen_per_year"] - c3["ppa_payment_yen_per_year"] - c3["balancing_yen_per_year"]) <= 1,
+      str(c3["generation_side_cost_yen_per_year"]))
+check("A3: UIの結果テキストにも同じ参考額が出る",
+      f"参考額 {c3['gen_side_charge_yen_per_year']:,} 円は届いた量で配分した額" in ua3[4])
+check("A2: 全量払い（ケースA）では注記を出さない", w["cost"]["surplus_risk_note"] is None and "小売が負う前提" not in ut)
+# 量の恒等式: 発電量（発電端）= 届いた量 + 送電ロス + 発電端の余剰（丸め差 ±2kWh）
+check("A: 発電量 = 届いた量 + 送電ロス + 発電端の余剰（surplus_kwh_sending_end）",
+      abs(w["generation_kwh"] - (w["delivered_kwh"] + w["loss_kwh"] + w["surplus_kwh_sending_end"])) <= 2,
+      f"{w['generation_kwh']} vs {w['delivered_kwh']}+{w['loss_kwh']}+{w['surplus_kwh_sending_end']}")
+# 量の基準（A5）: 到達可能量ベースの合計発電量 = 太陽光 + 風力の到達可能量。UIの表示とも一致
+check("A: total_generation_deliverable_kwh = 太陽光 + 風力の到達可能量（UIの『風力は到達可能量』の行と一致）",
+      abs(ma["annual"]["total_generation_deliverable_kwh"] - (ma["annual"]["pv_generation_kwh"] + w["deliverable_kwh"])) <= 1
+      and abs(ma["annual"]["total_generation_deliverable_kwh"] - num(ut, "太陽光＋風力の年間発電量（風力は到達可能量）:")) <= 1,
+      f"{ma['annual']['total_generation_deliverable_kwh']} vs {num(ut, '太陽光＋風力の年間発電量（風力は到達可能量）:')}")
+check("A: wind.monthly の風力の合計 ≒ 到達可能量（発電端ではない）",
+      abs(sum(r["wind_kwh"] for r in w["monthly"]) - w["deliverable_kwh"]) <= 12
+      and abs(sum(r["wind_kwh"] for r in w["monthly"]) - w["generation_kwh"]) > 100)
 
 # B. 蓄電池LP（受電点基準への組み替えがルールベース以外でも一致）
 mb = mcp_sim(wind={"capacity_kw": 200.0}, battery_enabled=True, battery_mode="lp_optimized", battery_capacity_kwh=200.0,
@@ -279,33 +309,45 @@ check("wind を省略すると normalized_params に wind / pv_enabled のキー
 # loss_rate_pct=100 が実は valid=true になっていたのに、この理由でテストが見逃していた）。
 # station_no="34392"（仙台。東北）を既定にし、各ケースの意図した項目だけが原因でエラーになることを keyword で確認する
 bad_cases = [
-    ("未知のキー", dict(wind={"capacity_kw": 500.0, "capacty": 1}), "未知のキー"),
+    # (ラベル, 引数, 期待するエラーの手がかり)。手がかりは項目名を含むエラーの**先頭側**で照合する（下の _head）
+    ("未知のキー", dict(wind={"capacity_kw": 500.0, "capacty": 1}), "未知のキー 'capacty'"),
     ("容量とカバー率の両方", dict(wind={"capacity_kw": 500.0, "coverage_pct": 50.0}), "capacity_kw か coverage_pct"),
     ("容量もカバー率もない", dict(wind={"cf_pct": 25.0}), "capacity_kw か coverage_pct"),
-    ("容量が0", dict(wind={"capacity_kw": 0}), "capacity_kw"),
-    ("容量が文字列", dict(wind={"capacity_kw": "abc"}), "capacity_kw"),
-    ("設備利用率が101", dict(wind={"capacity_kw": 500.0, "cf_pct": 101}), "cf_pct"),
-    ("PPA単価が負", dict(wind={"capacity_kw": 500.0, "ppa_price_yen_per_kwh": -1}), "ppa_price_yen_per_kwh"),
-    ("託送がNaN", dict(wind={"capacity_kw": 500.0, "wheeling_yen_per_kwh": float("nan")}), "wheeling_yen_per_kwh"),
+    ("容量が0", dict(wind={"capacity_kw": 0}), "wind.capacity_kw は"),
+    ("容量が文字列", dict(wind={"capacity_kw": "abc"}), "wind.capacity_kw は"),
+    ("設備利用率が101", dict(wind={"capacity_kw": 500.0, "cf_pct": 101}), "wind.cf_pct は"),
+    ("PPA単価が負", dict(wind={"capacity_kw": 500.0, "ppa_price_yen_per_kwh": -1}), "wind.ppa_price_yen_per_kwh は"),
+    ("託送がNaN", dict(wind={"capacity_kw": 500.0, "wheeling_yen_per_kwh": float("nan")}), "wind.wheeling_yen_per_kwh は"),
     ("wind が辞書でない", dict(wind=[1000]), "辞書で指定"),
     ("対象外の地点（東京）", dict(station_no="44132", wind={"capacity_kw": 500.0}), "北海道・東北"),
-    ("太陽光も風力もなし", dict(pv_enabled=False), "wind"),
-    ("支払の対象が不正", dict(wind={"capacity_kw": 500.0, "payment_basis": "half"}), "payment_basis"),
-    ("発電側課金の扱いが不正", dict(wind={"capacity_kw": 500.0, "gen_charge": "half"}), "gen_charge"),
-    ("損失率が100", dict(wind={"capacity_kw": 500.0, "loss_rate_pct": 100}), "loss_rate_pct"),
-    ("損失率が負", dict(wind={"capacity_kw": 500.0, "loss_rate_pct": -1}), "loss_rate_pct"),
-    ("発電バランシング単価が負", dict(wind={"capacity_kw": 500.0, "balancing_yen_per_kwh": -1}), "balancing_yen_per_kwh"),
+    ("太陽光も風力もなし", dict(pv_enabled=False), "pv_enabled=false のときは wind を指定"),
+    ("支払の対象が不正", dict(wind={"capacity_kw": 500.0, "payment_basis": "half"}), "wind.payment_basis は"),
+    ("発電側課金の扱いが不正", dict(wind={"capacity_kw": 500.0, "gen_charge": "half"}), "wind.gen_charge は"),
+    ("損失率が100", dict(wind={"capacity_kw": 500.0, "loss_rate_pct": 100}), "wind.loss_rate_pct は"),
+    ("損失率が負", dict(wind={"capacity_kw": 500.0, "loss_rate_pct": -1}), "wind.loss_rate_pct は"),
+    ("発電バランシング単価が負", dict(wind={"capacity_kw": 500.0, "balancing_yen_per_kwh": -1}), "wind.balancing_yen_per_kwh は"),
     ("系統設備効率化割引が負", dict(wind={"capacity_kw": 500.0, "gen_charge_discount_yen_per_year": -1}),
-     "gen_charge_discount_yen_per_year"),
+     "wind.gen_charge_discount_yen_per_year は"),
     ("グロスマージンの別名と本名を両方指定", dict(wind={"capacity_kw": 500.0, "retail_fee_yen_per_kwh": 4.1,
-                                          "retail_gross_margin_yen_per_kwh": 4.1}), "別名"),
+                                          "retail_gross_margin_yen_per_kwh": 4.1}), "同じ項目の別名"),
 ]
+
+
+def _head(e):
+    """未知キーのエラーの末尾「（使えるキー: [...]）」を除いた部分（全キー名が並ぶので、ここで手がかりを一致させない）。"""
+    return e.split("（使えるキー")[0]
+
+
 for label, kw, keyword in bad_cases:
     kw = dict(kw)
     kw.setdefault("station_no", "34392")
     r = m.validate_industrial_params(**kw)
+    errs = r.get("errors", [])
+    hit = any(keyword in _head(e) for e in errs)
+    # 未知キー以外のケースで「未知のキー」エラーが出ていたら、キーの一覧から項目が消えた等の別の理由で落ちている
+    stray_unknown = label != "未知のキー" and any("未知のキー" in e for e in errs)
     check(f"不正: {label} → valid=false・意図したエラーが出る（{keyword!r}）",
-          r["valid"] is False and any(keyword in e for e in r["errors"]), str(r.get("errors"))[:90])
+          r["valid"] is False and hit and not stray_unknown, str(errs)[:90])
 
 # W2f: retail_gross_margin_yen_per_kwh は別名として実際に受け付ける（誤りのヒントではなく有効な入力）
 vg = m.validate_industrial_params(station_no="34392", wind={"capacity_kw": 500.0, "retail_gross_margin_yen_per_kwh": 5.5})
@@ -317,6 +359,19 @@ vh = m.validate_industrial_params(station_no="34392", wind={"capacity_kw": 500.0
 check("未知キー gen_charge_mode のヒントに gen_charge が出る（誤りではありませんか）",
       vh["valid"] is False and any("gen_charge" in e and "gen_charge_mode" in e for e in vh["errors"]),
       str(vh["errors"]))
+# §9-3: gen_charge="auto" で PPA単価に既定値以外を指定すると「含む」扱いになる。その旨を警告する
+vp = m.validate_industrial_params(station_no="34392", wind={"capacity_kw": 500.0, "ppa_price_yen_per_kwh": 9.0})
+check("auto＋PPA単価の指定: valid のまま、含む扱いになる旨と gen_charge='add' の案内が warnings に出る",
+      vp["valid"] and any("'included'" in s and "gen_charge='add'" in s for s in vp["warnings"]), str(vp["warnings"]))
+vp2 = m.validate_industrial_params(station_no="34392", wind={"capacity_kw": 500.0, "ppa_price_yen_per_kwh": 9.0,
+                                                           "gen_charge": "add"})
+check("gen_charge='add' を明示すれば、その警告は出ない",
+      vp2["valid"] and not any("gen_charge='add'" in s for s in vp2["warnings"]), str(vp2["warnings"]))
+check("PPA単価を省略（既定値）なら、その警告は出ない",
+      not any("gen_charge='add'" in s for s in m.validate_industrial_params(
+          station_no="34392", wind={"capacity_kw": 500.0})["warnings"]))
+check("wind.cost.gen_charge_auto_included は既定（PPA単価を省略）で false",
+      w["cost"]["gen_charge_auto_included"] is False and w2["cost"]["gen_charge_auto_included"] is False)
 r = m.simulate_industrial_pv(station_no="44132", wind={"capacity_kw": 500.0})
 check("simulate: 対象外の地点は error（計算しない）", "error" in r and "北海道・東北" in str(r.get("errors")))
 r = m.validate_industrial_params(pv_enabled=False, faces=[], wind={"capacity_kw": 500.0}, station_no="34392")
