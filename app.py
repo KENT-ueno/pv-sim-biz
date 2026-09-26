@@ -3067,6 +3067,22 @@ def resolve_grid_cap(mode, manual_kw=None):
     raise ValueError(f"受電上限の指定が不正です: {mode}")
 
 
+def dc_zero_battery_reason(dc_info, rule_based, export_kwh, curtailed_kwh):
+    """DCで蓄電池の充放電がゼロのときの理由の分類（UI・MCPで共有。2026-09-26 Codexの探索的検証の指摘）。
+
+    "flat"          : 負荷形状が定常（平坦）。契約電力を下げられず、時間帯別の単価差もない（従来の文面。設計書 §11）
+    "no_pv_surplus" : 平坦でない・ルールベースで、太陽光の余剰（売電・出力抑制）がない。ルールベースは太陽光の余剰だけを充電する
+    "other"         : 上記以外（例: 最適充放電（LP）でも、蓄電池を動かして電気代が下がる解がない）
+    以前は、負荷形状にかかわらず「需要が平坦だと…日変動を選ぶと価値が出る」と出ていて、すでに日変動を選んでいる条件でも
+    同じ改善策を勧めていた
+    """
+    if dc_info.get("profile_mode") == PROFILE_FLAT:
+        return "flat"
+    if rule_based and float(export_kwh) <= 1e-6 and float(curtailed_kwh) <= 1e-6:
+        return "no_pv_surplus"
+    return "other"
+
+
 def resolve_dc_demand(dc_args, temp_30min=None):
     """DC入力（UIの値をそのまま詰めた辞書）からDC需要 (365, 48) を生成する。
 
@@ -3754,12 +3770,25 @@ def run_simulation(
                 result_text += f"充放電損失: {loss_kwh:.1f} kWh/年\n"
                 if dc_info is not None and ch_kwh == 0.0 and dc_kwh == 0.0:
                     # DC特有: 需要が平坦だと契約電力を下げられず、料金に日内差もないため蓄電池の価値は
-                    # 構造的にゼロになりうる（バグではない。設計書 §11）
-                    result_text += ("  ※ 充放電量ゼロ: この条件では蓄電池に裁定余地がありません。DCの需要が平坦\n"
-                                    "     （24時間一定）だと契約電力を下げられず、料金にも日内の差（時間帯別単価）が\n"
-                                    "     ないためです（LPは正しく充放電ゼロを返しています）。\n"
-                                    "     IT負荷を日変動／CEC実測形状にする・PV容量を増やして余剰を作る・\n"
-                                    "     受電上限制約（DCタブの「系統受電上限」）で価値が出ます。\n")
+                    # 構造的にゼロになりうる（バグではない。設計書 §11）。平坦でない条件では理由を書き分ける（dc_zero_battery_reason）
+                    zero_reason = dc_zero_battery_reason(
+                        dc_info, battery_mode_label == "ルールベース",
+                        sc_result.get("annual_export", 0.0), sc_result.get("annual_curtailment", 0.0))
+                    if zero_reason == "flat":
+                        result_text += ("  ※ 充放電量ゼロ: この条件では蓄電池に裁定余地がありません。DCの需要が平坦\n"
+                                        "     （24時間一定）だと契約電力を下げられず、料金にも日内の差（時間帯別単価）が\n"
+                                        "     ないためです（LPは正しく充放電ゼロを返しています）。\n"
+                                        "     IT負荷を日変動／CEC実測形状にする・PV容量を増やして余剰を作る・\n"
+                                        "     受電上限制約（DCタブの「系統受電上限」）で価値が出ます。\n")
+                    elif zero_reason == "no_pv_surplus":
+                        result_text += ("  ※ 充放電量ゼロ: ルールベースの蓄電池は、太陽光の余剰（売電・出力抑制になる分）だけを\n"
+                                        "     充電します。この条件では太陽光の余剰がなく、充電されないため、放電もありません。\n"
+                                        "     PV容量を増やして余剰を作る・最適充放電（LP）に変える・\n"
+                                        "     受電上限制約（DCタブの「系統受電上限」）で価値が出ることがあります。\n")
+                    else:
+                        result_text += ("  ※ 充放電量ゼロ: この条件では、蓄電池を動かしても電気代が下がらない解になっています\n"
+                                        "     （契約電力の削減も、時間帯別の単価差による裁定も見込めない）。蓄電池の容量・出力、\n"
+                                        "     PV容量、受電上限制約（DCタブの「系統受電上限」）を見直してください。\n")
                 if sc_result.get("optimized") and wind_info is None:
                     result_text += f"最適化ピークデマンド: {sc_result['opt_peak_kw']:.1f} kW\n"
                     result_text += f"最適化年間コスト: {sc_result['opt_annual_cost']:,.0f} 円\n"
@@ -3811,7 +3840,8 @@ def run_simulation(
             result_text += f"  合計: {cost_before['annual_total']:,.0f} 円/年\n"
 
             if cost_after is not None:
-                result_text += f"【導入後】\n"
+                result_text += ("【導入後】\n" if wind_info is None else
+                                "【導入後】（" + "風力発電（オフサイトPPA）" + "の支払は含まない。下の【年間の損得】を参照）\n")
                 result_text += f"  契約電力: {cost_after['contract_power_kw']:.1f} kW\n"
                 result_text += f"  基本料金: {cost_after['annual_basic']:,.0f} 円/年（{cost_after['monthly_basic']:,.0f} 円/月）\n"
                 result_text += f"  電力量料金: {cost_after['annual_energy_charge']:,.0f} 円/年\n"

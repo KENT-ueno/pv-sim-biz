@@ -174,6 +174,32 @@ m = re.search(r"年間充電量: ([\d.]+) kWh/年", t_dv)
 check("日変動需要: 蓄電池が動く（年間充電量>0）", m is not None and float(m.group(1)) > 0, m.group(1) if m else "")
 check("日変動需要: ゼロ注記は出ない", "充放電量ゼロ" not in t_dv)
 
+# 2026-09-26 Codexの探索的検証の指摘: 平坦でない条件でゼロになったとき、すでに選んだ日変動を勧めない。理由を書き分ける
+SMALL_PV = face_args([(1.0, "南", 180.0, 30, 0)])   # 太陽光がIT負荷に比べて極小 → 余剰（売電）が出ない
+_, _, _, _, t_nps, _, _ = run(demand_source="datacenter", dc_args=dict(MANUAL_FLAT, profile_mode=app.PROFILE_DIURNAL),
+                                face_args=SMALL_PV, bat_enabled=True, bat_mode="ルールベース", bat_capacity=600.0,
+                                bat_max_charge=300.0, bat_max_discharge=300.0)
+check("日変動＋ルールベース＋太陽光の余剰なし: 年間充電量 0.0", "年間充電量: 0.0 kWh/年" in t_nps and "余剰売電量: 0.0 kWh/年" in t_nps)
+check("  → 理由は『ルールベースは太陽光の余剰だけを充電する。余剰がない』で、日変動を勧めない",
+      "ルールベースの蓄電池は、太陽光の余剰" in t_nps and "この条件では太陽光の余剰がなく" in t_nps
+      and "IT負荷を日変動／CEC実測形状にする" not in t_nps and "需要が平坦" not in t_nps)
+_, _, _, _, t_fps, _, _ = run(demand_source="datacenter", dc_args=MANUAL_FLAT, face_args=SMALL_PV,
+                                bat_enabled=True, bat_mode="ルールベース", bat_capacity=600.0,
+                                bat_max_charge=300.0, bat_max_discharge=300.0)
+check("平坦需要＋ルールベース: 従来の文面（平坦だと裁定余地がない。日変動／CEC実測形状の案内）のまま",
+      "この条件では蓄電池に裁定余地がありません" in t_fps and "IT負荷を日変動／CEC実測形状にする" in t_fps)
+# 分類の関数（UI・MCPで共有）
+flat_info = {"profile_mode": app.PROFILE_FLAT}
+dv_info = {"profile_mode": app.PROFILE_DIURNAL}
+cec_info = {"profile_mode": app.PROFILE_CEC}
+check("dc_zero_battery_reason: 平坦は（LP・ルールベース・余剰の有無によらず）flat",
+      all(app.dc_zero_battery_reason(flat_info, rb, ex, 0.0) == "flat" for rb in (True, False) for ex in (0.0, 100.0)))
+check("dc_zero_battery_reason: 平坦でない＋ルールベース＋余剰なし → no_pv_surplus（日変動・CEC）",
+      app.dc_zero_battery_reason(dv_info, True, 0.0, 0.0) == "no_pv_surplus" and app.dc_zero_battery_reason(cec_info, True, 0.0, 0.0) == "no_pv_surplus")
+check("dc_zero_battery_reason: 余剰（売電または出力抑制）があれば other／LP なら other",
+      app.dc_zero_battery_reason(dv_info, True, 5.0, 0.0) == "other" and app.dc_zero_battery_reason(dv_info, True, 0.0, 5.0) == "other"
+      and app.dc_zero_battery_reason(dv_info, False, 0.0, 0.0) == "other")
+
 print("\n【7. マイクログリッド有効でもDCが落ちない（単一サイト扱い）】")
 _, _, _, _, t_mg, _, _ = run(demand_source="datacenter", dc_args=MANUAL_FLAT, mg_enabled=True)
 check("エラーなし", not t_mg.startswith("エラー"), t_mg[:80] if t_mg.startswith("エラー") else "")

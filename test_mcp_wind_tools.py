@@ -118,6 +118,10 @@ def uw(cap=None, cov=None, **kw):
     return d
 
 
+def near_(a, b, tol):
+    return abs(a - b) <= tol
+
+
 def num(text, label, after=None):
     start = text.find(after) if after else 0
     mm = re.search(re.escape(label) + r"\s*([+-]?[\d,]+(?:\.\d+)?)", text[start:])
@@ -169,6 +173,26 @@ check("A: wind.cost に W2fの新項目（payment_basis・gen_side_charge・bala
 # 出典タグ（price_sources）: 指定していない託送・小売グロスマージンが U（入力値）になる不具合の回帰
 # （2026-09-26、Codexの実機検証で発見。MCPが正規化で既定値を解決した後の値をそのまま渡していた）
 ps_ui = ua[6]["wind_info"]["price_sources"]
+# 2026-09-26 Codexの探索的検証の指摘（ID-2）: annual_cost_after_yen は風力発電（オフサイトPPA）の支払を含まない
+ec_a = ma["electricity_cost"]
+check("annual_cost_after_yen の説明（annual_cost_note_wind）が風力を使うときに出る",
+      "annual_cost_note_wind" in ec_a and "支払は含まない" in ec_a["annual_cost_note_wind"]
+      and "annual_balance.B_cost_with_installation_yen" in ec_a["annual_cost_note_wind"])
+check("  説明のとおり: B ＝ annual_cost_after_yen ＋ 風力発電（オフサイトPPA）の支払 − 売電収入（±3円）",
+      near_(ec_a["annual_balance"]["B_cost_with_installation_yen"],
+            ec_a["annual_cost_after_yen"] + ec_a["annual_wind_ppa_payment_yen"] - ec_a["annual_sell_revenue_yen"], 3))
+_r0 = mcp_sim()
+check("風力を使わないときは、この説明も annual_balance も出ない（従来と同じ出力）",
+      "annual_cost_note_wind" not in _r0["electricity_cost"] and "annual_balance" not in _r0["electricity_cost"])
+# 同（ID-1）: 月別は各月を四捨五入した整数で、合計が年間とずれることがある
+check("wind.monthly_note がある（月別は四捨五入・合計は年間とずれることがある）",
+      "四捨五入" in w["monthly_note"] and "ずれる" in w["monthly_note"])
+_tiny = m.simulate_industrial_pv(station_no="36126", faces=[{"ppeak_kw": 0.01, "tilt_deg": 0.0, "azimuth_deg": 180.0}],
+                                 facilities=[{"building_type": "office", "floor_area_m2": 100.0, "building_count": 1}],
+                                 wind={"capacity_kw": 0.1, "cf_pct": 0.1})
+check("  極小設備（年間の風力発電量 1kWh）でも計算でき、月別の合計と年間の差は数kWh以内（注記どおり）",
+      "wind" in _tiny and abs(sum(r["wind_kwh"] for r in _tiny["wind"]["monthly"]) - _tiny["wind"]["generation_kwh"]) <= 3
+      and "monthly_note" in _tiny["wind"])
 check("出典タグ: 託送・小売グロスマージンを指定しなければ、UIの空欄（既定）と同じタグ（B・C。U にならない）",
       w["cost"]["price_sources"] == ps_ui and w["cost"]["price_sources"]["wheeling"] == "B"
       and w["cost"]["price_sources"]["retail_fee"] == "C", str(w["cost"]["price_sources"]))

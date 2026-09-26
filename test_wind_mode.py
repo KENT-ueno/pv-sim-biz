@@ -124,6 +124,9 @@ for label, over in (("wind_args=None", dict(wind_args=None)),
     check(f"{label}: グラフが同一", all(a.to_json() == b.to_json() for a, b in zip(o[:2], base_out[:2])))
 check("風力OFFの result_state に風力のキーがない（従来と同じ中身）",
       not any(k in base_out[6] for k in ("gen_pv", "gen_wind", "wind_info")))
+check("風力あり: 【導入後】の見出しに『風力発電（オフサイトPPA）の支払は含まない。下の【年間の損得】を参照』が付く（Codexの指摘 ID-2）",
+      "【導入後】（風力発電（オフサイトPPA）の支払は含まない。下の【年間の損得】を参照）" in run(wind_args=wind("coverage"))[4])
+check("風力OFFの【導入後】の見出しは従来のまま（注記なし）", "【導入後】\n" in base_out[4] and "の支払は含まない" not in base_out[4])
 check("風力OFFの結果に風力の節がない", "風力" not in base_out[4] and "24/7" not in base_out[4]
       and "【年間の損得】" not in base_out[4] and "総合経済メリット" in base_out[4])
 
@@ -203,7 +206,7 @@ wf = [("A. 導入しない場合（需要をすべて小売から買う）:", be
       ("の使用電力量にかかる託送・再エネ賦課金・小売グロスマージン:", extra_d),
       ("（PPA発電単価＋発電側課金＋発電バランシング）:", payment),
       ("売電収入:", -sell_d)]
-bal_txt = txt[txt.find("【年間の損得】"):]
+bal_txt = txt[txt.find("【年間の損得】（導入しない場合"):]   # 節の見出し全体で探す（【導入後】・【削減効果】の説明文にも同じ語が出るため）
 for lab, exp in wf:
     g = num(bal_txt, lab)
     check(f"年間の損得: 『{lab[:18]}…』= 別の式の再計算", g is not None and abs(g - exp) < 1.5, f"{g} vs {exp:.0f}")

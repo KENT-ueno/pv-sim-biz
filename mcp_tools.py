@@ -855,6 +855,8 @@ def _wind_section(app, wind_info, gen_pv, demand_30min, sc_result, month_day, ra
                     "wind_only・pv_plus_wind・月別 wind_kwh は需要地に届く電力量で計算",
         },
         "monthly": monthly,
+        "monthly_note": "monthly は各月を四捨五入した整数。合計は年間の値（generation_kwh など）と1〜数kWhずれることがある"
+                        "（設備が極小のときに目立つ。例: 年間1kWhの風力発電（オフサイトPPA）の月別がすべて0になる）",
     }
 
 
@@ -1322,6 +1324,10 @@ def _run_industrial_simulation(p: dict, demand_override=None, grid_cap_kw=None):
                      "annual_economic_merit_yen＝A−B（上の annual_economic_merit_yen と同じ）。"
                      "merit_pv_battery_yen / merit_offsite_yen はその内訳（太陽光・蓄電池／風力発電（オフサイトPPA））"),
         }
+        out["electricity_cost"]["annual_cost_note_wind"] = (
+            "annual_cost_before_yen・annual_cost_after_yen は小売の電気料金（導入後は、使用電力量にかかる託送・再エネ賦課金・"
+            "小売グロスマージンを含む）で、風力発電（オフサイトPPA）の支払は含まない。導入後の総支払は annual_balance.B_cost_with_installation_yen"
+            "（＝ annual_cost_after_yen ＋ 風力発電（オフサイトPPA）の支払 − 売電収入）")
         out["electricity_cost"]["contract_power_note_wind"] = (
             "風力発電（オフサイトPPA）（送配電網で届く）では契約電力は下がらない。contract_power_after_kw は太陽光・蓄電池の効果のみ")
         out["caveats"] = list(out["caveats"]) + _WIND_CAVEATS
@@ -2468,10 +2474,24 @@ def simulate_dc(
             })
         ann = out["annual"]
         if p["battery_enabled"] and ann["battery_charge_kwh"] == 0 and ann["battery_discharge_kwh"] == 0:
-            caveats.append(
-                "蓄電池の充放電がゼロです。DCの需要が平坦（24時間一定）だと契約電力を下げられず、料金にも日内の差"
-                "（時間帯別単価）がないため、蓄電池の価値は構造的にゼロになりえます（バグではありません）。"
-                "CEC実測形状／日変動の選択、PV容量を増やして余剰を作る、受電上限（grid_cap）の指定で価値が出ます")
+            # 理由は条件に合わせて書き分ける（平坦は従来の文面。app.dc_zero_battery_reason。2026-09-26 Codexの指摘）
+            zero_reason = app.dc_zero_battery_reason(
+                dc_info, p["battery_mode"] == "rule_based", ann["export_kwh"], ann["curtailed_kwh"])
+            if zero_reason == "flat":
+                caveats.append(
+                    "蓄電池の充放電がゼロです。DCの需要が平坦（24時間一定）だと契約電力を下げられず、料金にも日内の差"
+                    "（時間帯別単価）がないため、蓄電池の価値は構造的にゼロになりえます（バグではありません）。"
+                    "CEC実測形状／日変動の選択、PV容量を増やして余剰を作る、受電上限（grid_cap）の指定で価値が出ます")
+            elif zero_reason == "no_pv_surplus":
+                caveats.append(
+                    "蓄電池の充放電がゼロです。ルールベースの蓄電池は、太陽光の余剰（売電・出力抑制になる分）だけを充電します。"
+                    "この条件では太陽光の余剰がなく、充電されないため、放電もありません（バグではありません）。"
+                    "PV容量を増やして余剰を作る、最適充放電（lp_optimized）に変える、受電上限（grid_cap）の指定で価値が出ることがあります")
+            else:
+                caveats.append(
+                    "蓄電池の充放電がゼロです。この条件では、蓄電池を動かしても電気代が下がらない解になっています"
+                    "（契約電力の削減も、時間帯別の単価差による裁定も見込めない）。蓄電池の容量・出力、PV容量、"
+                    "受電上限（grid_cap）を見直してください")
         result = {"assumptions": out.pop("assumptions"), "datacenter": _dc_summary(dc_info)}
         result.update(out)
         result["caveats"] = list(out["caveats"]) + caveats

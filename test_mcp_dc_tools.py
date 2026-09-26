@@ -293,6 +293,15 @@ check("上限がピーク以上: 蓄電池なしでも守れる（needs_battery=
 s8 = mcp_tools.simulate_dc(**dict(S, profile="flat"), **dict(LPB, battery_capacity_kwh=500.0, battery_max_charge_kw=250.0, battery_max_discharge_kw=250.0))
 check("平坦需要+LP: 充放電ゼロ・その理由の免責が付く",
       s8["annual"]["battery_charge_kwh"] == 0 and any("価値は構造的にゼロ" in c for c in s8["caveats"]))
+# 2026-09-26 Codexの探索的検証の指摘: 平坦でない条件では、すでに選んだ日変動を勧めず、実際の理由を書く
+s8b = mcp_tools.simulate_dc(station_no="14163", faces=[{"ppeak_kw": 1.0, "tilt_deg": 30.0, "azimuth_deg": 180.0}],
+                            workload="manual", capacity_mode="it_capacity", it_capacity_kw=400.0, it_load_factor_pct=65.0, pue=1.35,
+                            profile="diurnal", noise_level="none", battery_enabled=True, battery_mode="rule_based",
+                            battery_capacity_kwh=600.0, battery_max_charge_kw=300.0, battery_max_discharge_kw=300.0)
+zc = [c for c in s8b["caveats"] if "充放電がゼロ" in c]
+check("日変動+ルールベース+太陽光の余剰なし: 充放電ゼロの理由は『太陽光の余剰がない』で、需要が平坦とは言わない",
+      s8b["annual"]["battery_charge_kwh"] == 0 and s8b["annual"]["export_kwh"] == 0 and len(zc) == 1
+      and "太陽光の余剰がなく" in zc[0] and "構造的にゼロ" not in zc[0] and "需要が平坦" not in zc[0], zc[0][:80] if zc else "")
 
 # --- 事業モデル・入力不備 ---
 s9 = mcp_tools.simulate_dc(**S, business_model="lease", contract_years=15, target_irr_pct=10.0)
