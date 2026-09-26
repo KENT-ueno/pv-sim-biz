@@ -705,18 +705,32 @@ def _apply_wind(params, warnings, errors, wind, pv_enabled, station_no, contract
             warnings.append(_GEN_CHARGE_AUTO_INCLUDED_WARNING)
 
 
-def _wind_args_for_app(app, w):
+def _wind_args_for_app(app, w, station_no=None, contract_type_label=None):
     """正規化した wind（MCPのキー）を app.resolve_wind の wind_args にする。
 
     payment_basis/gen_charge は MCP側のasciiキーをUI側の日本語ラベルに変換する（resolve_wind は
     UIのコンポーネントが送るラベル文字列を受け取る。W2f）
+
+    託送・小売グロスマージンは、正規化のときに既定値が解決済みで、指定されたかどうかが残らない。そのまま渡すと
+    resolve_wind が「入力値（U）」と判定し、指定していないのに出典タグが U になる（2026-09-26、Codexの実機検証で
+    発見。金額には影響しない表示の不具合）。既定値と等しい値は None（＝既定値を使う）にして渡す。PPA単価・支払の対象と
+    同じ「既定値と等しいか」の判定で、UIの空欄（None）と同じ出典タグになる。既定値と同じ値を明示した場合も既定の区分になる。
+    station_no・contract_type_label（"高圧"／"特別高圧"）を渡さなければ従来どおり値をそのまま渡す
     """
+    wheeling, fee = w["wheeling_yen_per_kwh"], w["retail_fee_yen_per_kwh"]
+    if station_no is not None and contract_type_label is not None:
+        area = app.station_to_wind_area(str(station_no).strip())
+        ct = "特別高圧" if contract_type_label == "特別高圧" else "高圧"
+        if area is not None and wheeling == app.WIND_WHEELING_ENERGY_YEN.get((area, ct)):
+            wheeling = None
+        if fee == app.WIND_RETAIL_FEE_YEN[ct]:
+            fee = None
     return {
         "enabled": True,
         "sizing_mode": app.WIND_SIZING_CAPACITY if w.get("capacity_kw") is not None else app.WIND_SIZING_COVERAGE,
         "capacity_kw": w.get("capacity_kw"), "coverage_pct": w.get("coverage_pct"),
         "cf_pct": w["cf_pct"], "ppa_price": w["ppa_price_yen_per_kwh"],
-        "wheeling_yen": w["wheeling_yen_per_kwh"], "retail_fee_yen": w["retail_fee_yen_per_kwh"],
+        "wheeling_yen": wheeling, "retail_fee_yen": fee,
         "payment_basis": _PAYMENT_BASIS_FROM_MCP[w["payment_basis"]],
         "gen_charge_mode": _GEN_CHARGE_FROM_MCP[w["gen_charge"]],
         "gen_charge_discount_yen": w.get("gen_charge_discount_yen_per_year"),
@@ -943,7 +957,8 @@ def _run_industrial_simulation(p: dict, demand_override=None, grid_cap_kw=None):
     gen_pv = gen
     if wind_p:
         wind_info = app.resolve_wind(
-            _wind_args_for_app(app, wind_p), p["station_no"], float(np.sum(demand_30min)),
+            _wind_args_for_app(app, wind_p, p["station_no"], CONTRACT_TYPE_MAP[p["contract_type"]]),
+            p["station_no"], float(np.sum(demand_30min)),
             station_label=p["station_no"], contract_type=CONTRACT_TYPE_MAP[p["contract_type"]])
         # ルールベース・蓄電池なしは太陽光＋風力を合わせた発電で運転する。風力は到達可能量（届く分）を使う（W2f）
         gen = gen_pv + wind_info.get("deliverable_30min", wind_info["gen_30min"])

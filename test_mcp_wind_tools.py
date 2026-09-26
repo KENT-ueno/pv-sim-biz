@@ -166,6 +166,26 @@ check("A: wind.cost に W2fの新項目（payment_basis・gen_side_charge・bala
       w["cost"]["payment_basis"] == "generated" and w["cost"]["gen_charge_mode"] == "add"
       and w["cost"]["gen_side_charge_yen_per_year"] > 0 and w["cost"]["balancing_yen_per_year"] > 0
       and w["cost"]["price_sources"].get("ppa_price") == "A", str(w["cost"].get("price_sources")))
+# 出典タグ（price_sources）: 指定していない託送・小売グロスマージンが U（入力値）になる不具合の回帰
+# （2026-09-26、Codexの実機検証で発見。MCPが正規化で既定値を解決した後の値をそのまま渡していた）
+ps_ui = ua[6]["wind_info"]["price_sources"]
+check("出典タグ: 託送・小売グロスマージンを指定しなければ、UIの空欄（既定）と同じタグ（B・C。U にならない）",
+      w["cost"]["price_sources"] == ps_ui and w["cost"]["price_sources"]["wheeling"] == "B"
+      and w["cost"]["price_sources"]["retail_fee"] == "C", str(w["cost"]["price_sources"]))
+mx = mcp_sim(wind={"coverage_pct": 100.0, "wheeling_yen_per_kwh": 3.0, "retail_fee_yen_per_kwh": 5.5})
+check("出典タグ: 託送・小売グロスマージンを指定したときは U（入力値）で、指定した値が使われる",
+      mx["wind"]["cost"]["price_sources"]["wheeling"] == "U" and mx["wind"]["cost"]["price_sources"]["retail_fee"] == "U"
+      and mx["wind"]["cost"]["wheeling_yen_per_kwh"] == 3.0 and mx["wind"]["cost"]["retail_fee_yen_per_kwh"] == 5.5)
+mx1 = mcp_sim(wind={"coverage_pct": 100.0, "wheeling_yen_per_kwh": 3.0})
+check("出典タグ: 片方だけ指定したら、その項目だけ U",
+      mx1["wind"]["cost"]["price_sources"]["wheeling"] == "U" and mx1["wind"]["cost"]["price_sources"]["retail_fee"] == "C")
+md0 = mcp_sim(wind={"coverage_pct": 100.0, "wheeling_yen_per_kwh": 2.15, "retail_fee_yen_per_kwh": 4.1})
+check("出典タグ: 既定値と同じ値を明示しても既定の区分（PPA単価の既定値判定と同じ扱い）で、金額は変わらない",
+      md0["wind"]["cost"]["price_sources"]["wheeling"] == "B" and md0["wind"]["cost"]["price_sources"]["retail_fee"] == "C"
+      and md0["electricity_cost"]["annual_economic_merit_yen"] == ma["electricity_cost"]["annual_economic_merit_yen"])
+mev = mcp_sim(wind={"coverage_pct": 100.0}, contract_type="extra_high_voltage")
+check("出典タグ: 特別高圧の既定（託送0.97）でも B・C", mev["wind"]["cost"]["wheeling_yen_per_kwh"] == 0.97
+      and mev["wind"]["cost"]["price_sources"]["wheeling"] == "B" and mev["wind"]["cost"]["price_sources"]["retail_fee"] == "C")
 check("A: loss_rate_pct・loss_kwh が返る（東北・高圧の既定5.2%）", w["loss_rate_pct"] == 5.2 and w["loss_kwh"] > 0)
 
 # 【年間の損得】（2026-09-26）: A＋各項目＝B、A−B＝年間経済メリット。UIとMCPで同じ値。表記ゆれがない
