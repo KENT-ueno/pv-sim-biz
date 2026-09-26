@@ -103,13 +103,13 @@ def errdetail(out):
 def num(text, label, after=None):
     """テキストから label の直後の数値を取る（after があればその文字列より後ろで探す）。"""
     start = text.find(after) if after else 0
-    m = re.search(re.escape(label) + r"\s*(-?[\d,]+(?:\.\d+)?)", text[start:])
+    m = re.search(re.escape(label) + r"\s*([+-]?[\d,]+(?:\.\d+)?)", text[start:])
     return float(m.group(1).replace(",", "")) if m else None
 
 
 def row(text, label):
     """24/7の比較表の行（量ベース達成率, 時間一致率）を取る。"""
-    m = re.search(r"^\s+" + re.escape(label) + r"\s+([\d.]+)%\s+([\d.]+)%", text, re.M)
+    m = re.search(r"^\s+" + re.escape(label) + r": 量ベース達成率 ([\d.]+)% ／ 時間一致率 ([\d.]+)%", text, re.M)
     return (float(m.group(1)), float(m.group(2))) if m else (None, None)
 
 
@@ -124,7 +124,8 @@ for label, over in (("wind_args=None", dict(wind_args=None)),
     check(f"{label}: グラフが同一", all(a.to_json() == b.to_json() for a, b in zip(o[:2], base_out[:2])))
 check("風力OFFの result_state に風力のキーがない（従来と同じ中身）",
       not any(k in base_out[6] for k in ("gen_pv", "gen_wind", "wind_info")))
-check("風力OFFの結果に風力の節がない", "風力" not in base_out[4] and "24/7" not in base_out[4])
+check("風力OFFの結果に風力の節がない", "風力" not in base_out[4] and "24/7" not in base_out[4]
+      and "【年間の損得】" not in base_out[4] and "総合経済メリット" in base_out[4])
 
 # ============================================================
 print("\n【2. 発電の合成が下流に渡る（別経路で再計算）】")
@@ -183,10 +184,35 @@ gen_equiv = float(deliv.sum()) / (1 - info["loss_rate"])  # 配達量の発電�
 check("無駄になった風力(発電端) = 発電量(発電端) − 配達量の発電端換算（W2f）",
       abs(info["wasted_kwh"] - (G - gen_equiv)) < 1e-6, f"{info['wasted_kwh']:.1f} vs {G - gen_equiv:.1f}")
 txt = w_out[4]
-got = num(txt, "年間経済メリット:", after="【風力込みの年間経済メリット】")
+got = num(txt, "年間経済メリット（A − B）:")
 check("風力込みの年間経済メリット = 受電点基準で再計算した電気代削減＋売電 − 風力の発電側費用",
       got is not None and abs(got - (merit_pre - payment)) < 1.5, f"{got} vs {merit_pre - payment:.0f}")
-check("支払前のメリットも再計算と一致", abs(num(txt, "（風力の発電側費用の前）:") - merit_pre) < 1.5)
+check("支払前のメリットも再計算と一致", abs(num(txt, "電気代の削減＋売電収入:") - merit_pre) < 1.5)
+# 【年間の損得】の各行を、別の式（30分ごとの量 × その月の単価）で再計算して照合する（2026-09-26）
+unit_m = np.array([(RATE["energy_charge_summer"] if m in (7, 8, 9) else RATE["energy_charge_other"])
+                   + RATE["fuel_adjustment"] + sur for (m, _d) in md])[:, None]
+wind_retail = float((deliv * unit_m).sum())                      # 風力の使用電力量の分、小売で払わずに済む額
+pv_retail = float(((demand - R) * unit_m).sum())                  # 太陽光の自家消費の分（蓄電池なし: 需要 − R）
+basic_d = c_R["annual_basic"] - before["annual_basic"]
+extra_d = float(deliv.sum()) * (X + sur + Y)
+sell_d = float(pv_surplus.sum()) * 19.0
+wf = [("A. 導入しない場合（需要をすべて小売から買う）:", before["annual_total"]),
+      ("の自家消費で、小売から買う電力量料金が減る:", -pv_retail),
+      ("で基本料金が減る:", basic_d),
+      ("の分、小売から買う電力量料金が減る:", -wind_retail),
+      ("の使用電力量にかかる託送・再エネ賦課金・小売グロスマージン:", extra_d),
+      ("（PPA発電単価＋発電側課金＋発電バランシング）:", payment),
+      ("売電収入:", -sell_d)]
+bal_txt = txt[txt.find("【年間の損得】"):]
+for lab, exp in wf:
+    g = num(bal_txt, lab)
+    check(f"年間の損得: 『{lab[:18]}…』= 別の式の再計算", g is not None and abs(g - exp) < 1.5, f"{g} vs {exp:.0f}")
+B_exp = before["annual_total"] - pv_retail + basic_d - wind_retail + extra_d + payment - sell_d
+check("年間の損得: B = A ＋ 各行（再計算）", abs(num(bal_txt, "）:", after="B. 導入した場合") - B_exp) < 2,
+      f"{num(bal_txt, '）:', after='B. 導入した場合')} vs {B_exp:.0f}")
+check("年間の損得: 年間経済メリット（A − B）= A − B（再計算）", abs(got - (before["annual_total"] - B_exp)) < 2)
+check("年間の損得: うち 太陽光 ＋ 風力発電（オフサイトPPA）= 年間経済メリット",
+      abs(num(bal_txt, "うち 太陽光:") + num(bal_txt, "／ 風力発電（オフサイトPPA）:") - got) < 2)
 pb = num(txt, "単純投資回収年数:")
 net_inv = 150.0 * 158000
 check("投資回収年数 = 実質投資額（PVのみ。風力は含めない）÷ 風力込み年間メリット",
@@ -204,21 +230,21 @@ cp_pv, bs_pv = after_block(pv_only[4])
 cp_w, bs_w = after_block(txt)
 check("契約電力は風力で下がらない（太陽光のみの場合と同じ）", cp_pv is not None and cp_pv == cp_w, f"{cp_pv} vs {cp_w}")
 check("基本料金も風力で下がらない（太陽光のみの場合と同じ）", bs_pv is not None and bs_pv == bs_w, f"{bs_pv} vs {bs_w}")
-check("結果に『風力では下がりません』と明記", "風力では下がりません" in txt)
+check("結果に『風力では下がりません』と明記", "風力発電（オフサイトPPA）では下がりません" in txt)
 
 # 単価の感度: 託送・手数料を1円/kWh上げると、メリットは配達量×1円だけ減る（賦課金は届いた分に必ずかかる）
 d1 = float(deliv.sum())
 for key, label in (("wheeling_yen", "託送の電力量料金"), ("retail_fee_yen", "小売グロスマージン")):
     o = run(wind_args=wind("coverage", **{key: (2.15 if key == "wheeling_yen" else 4.1) + 1.0}))
-    g = num(o[4], "年間経済メリット:", after="【風力込みの年間経済メリット】")
+    g = num(o[4], "年間経済メリット（A − B）:")
     check(f"{label}を+1円/kWh → 年間メリットが 配達量×1円 だけ減る", abs((got - g) - d1) < 1.5, f"{got - g:.1f} vs {d1:.1f}")
 o0 = run(wind_args=wind("coverage", wheeling_yen=0.0, retail_fee_yen=0.0))
-g0 = num(o0[4], "年間経済メリット:", after="【風力込みの年間経済メリット】")
+g0 = num(o0[4], "年間経済メリット（A − B）:")
 check("託送と手数料を0円にすると、年間メリットは 配達量×(託送+手数料) だけ増える（賦課金は残る）",
       abs((g0 - got) - d1 * (X + Y)) < 1.5, f"{g0 - got:.1f} vs {d1 * (X + Y):.1f}")
-check("『合計 ／ 届いた1kWhあたり』の行 = （発電側費用＋届いた分の費用）÷ 届いた量",
-      abs(num(txt, "／ 届いた1kWhあたり") - (payment + d1 * (X + sur + Y)) / d1) < 0.01,
-      str(num(txt, "／ 届いた1kWhあたり")))
+check("『使用電力量1kWhあたり』の行 = （支払＋使用電力量にかかる託送等）÷ 使用電力量",
+      abs(num(txt, "使用電力量1kWhあたり") - (payment + d1 * (X + sur + Y)) / d1) < 0.01,
+      str(num(txt, "使用電力量1kWhあたり")))
 
 # 投資回収: 風力が大きすぎて年間メリットが負になる場合は回収不可
 neg = run(wind_args=wind("capacity", capacity_kw=3000.0, ppa_price=40.0))
@@ -233,7 +259,8 @@ check("売電量は太陽光の余剰だけ（風力が3倍あっても増えな
       f"{sb['annual_export']:.1f} vs {pv_sur_big:.1f}")
 check("運転の結果（プール）の余剰は別キーに残る（太陽光＋風力の余剰）", sb["annual_export_pooled"] > sb["annual_export"])
 check("FITの注記は出さない（風力の余剰は売電しない扱いに変えたため）", "FITは適用できない" not in big[4])
-check("『売電はできない』『売電できず、無駄になる』の記載", "売電はできない" in big[4] and "売電できず、無駄になる" in big[4])
+check("『売電できない』（余剰電力量）の記載", "余剰電力量（発電端）" in big[4] and "（売電できない。" in big[4]
+      and "風力発電（オフサイトPPA）の余剰電力量は売電できません" in big[4])
 nx = run(wind_args=wind("coverage", coverage_pct=300.0), sell_mode="逆潮流禁止（売電なし）")
 sn = nx[6]["sc_result"]
 check("逆潮流禁止: 売電0・出力抑制は太陽光の余剰だけ",
@@ -259,11 +286,11 @@ for label, over in (("ルールベース", dict(bat_enabled=True, bat_capacity=2
           and (off["delivered"] >= 0).all() and (off["delivered"] <= wb + 1e-9).all()))
     check(f"{label}: 太陽光の余剰 = 運転の売電＋抑制（風力は売電・抑制の対象外）",
           abs(float(off["pv_surplus"].sum()) - float((scb["export"] + scb["curtailment"]).sum())) < 1e-6)
-    check(f"{label}: 完了して受電点基準の料金が出る", "風力では下がりません" in ob[4] and not ob[4].startswith("エラー"))
+    check(f"{label}: 完了して受電点基準の料金が出る", "風力発電（オフサイトPPA）では下がりません" in ob[4] and not ob[4].startswith("エラー"))
 rbw = run(wind_args=wind("coverage"), bat_enabled=True, bat_mode="ルールベース", bat_capacity=100.0,
           bat_max_charge=50.0, bat_max_discharge=50.0)
 check("ルールベース+風力: 蓄電池は太陽光の余剰だけ貯め、不足は風力→蓄電池→小売の順である旨の注記を出す（W2e）",
-      "風力は貯めません" in rbw[4] and "風力（届いた分）→小売が埋めます" in rbw[4] and "受電点の基準で行います" not in rbw[4])
+      "風力発電（オフサイトPPA）は蓄電池に貯めません" in rbw[4] and "風力発電（オフサイトPPA）→小売の順に埋めます" in rbw[4] and "受電点の基準で行います" not in rbw[4])
 lpw = run(wind_args=wind("coverage"), bat_enabled=True, bat_mode="最適充放電（LP）", bat_capacity=100.0,
           bat_max_charge=50.0, bat_max_discharge=50.0)
 check("LP+風力: LPは受電点の基準で解く旨の注記と、最適化のピーク・コストを出す（W2d）",
@@ -284,8 +311,8 @@ def rates(g):
     return vol, hourly
 
 
-for label, row_label, g in (("太陽光のみ", "太陽光のみ", pv_g), ("風力のみ(到達分)", "風力(到達分)", w_g),
-                            ("太陽光＋風力", "太陽光＋風力", pv_g + w_g)):
+for label, row_label, g in (("太陽光のみ", "太陽光のみ", pv_g), ("風力のみ", "風力発電（オフサイトPPA）のみ", w_g),
+                            ("太陽光＋風力", "太陽光＋風力発電（オフサイトPPA）", pv_g + w_g)):
     vol, hr = rates(g)
     gv, gh = row(txt, row_label)
     check(f"{label}: 量ベース達成率・時間一致率が再計算と一致（蓄電池なし）",
@@ -318,10 +345,10 @@ print("\n【5. 太陽光OFF（風力のみ）】")
 wo = run(pv_enabled=False, wind_args=wind("coverage"))
 check("完了する", not wo[4].startswith("エラー"), errdetail(wo))
 check("太陽光は使用しないと表示し、面別発電量は出さない",
-      "太陽光発電: 使用しない（風力のみ）" in wo[4] and "面別年間発電量" not in wo[4])
+      "太陽光発電: 使用しない（風力発電（オフサイトPPA）のみ）" in wo[4] and "面別年間発電量" not in wo[4])
 check("太陽光の発電量はゼロ", float(np.abs(wo[6]["gen_pv"]).sum()) == 0.0)
 check("発電量 = 風力のみ", np.array_equal(wo[6]["total_gen_clipped"], wo[6]["gen_wind"]))
-check("比較表は『風力(到達分)』の1行", row(wo[4], "風力(到達分)")[0] is not None and row(wo[4], "太陽光のみ")[0] is None)
+check("比較表は風力発電（オフサイトPPA）のみの1行", row(wo[4], "風力発電（オフサイトPPA）のみ")[0] is not None and row(wo[4], "太陽光のみ")[0] is None)
 check("初期投資がないので回収年数は該当しない", "投資回収年数は該当しません" in wo[4])
 check("設備投資は0円", "設備投資合計: 0 円" in wo[4] or "PV: 0.0 kW" in wo[4])
 bad_faces = face_args([(150.0, "南", "abc", 30, 0)])
@@ -335,7 +362,7 @@ o = run(wind_args=wind("coverage"), face_args=face_args([(0.0, "南", 180.0, 30,
 check("太陽光ONでも面のPpeakが0なら風力のみとして動く", not o[4].startswith("エラー"))
 # 太陽光の容量を0にして風力だけを見る使い方（UIで最も自然な操作）。『太陽光を使わない』と同じ表示になること
 check("Ppeak=0: 『太陽光発電: 使用しない』と出し、空の面別見出し・K'・太陽光のみの行は出さない",
-      "太陽光発電: 使用しない（風力のみ）" in o[4] and "面別年間発電量" not in o[4] and "K' =" not in o[4]
+      "太陽光発電: 使用しない（風力発電（オフサイトPPA）のみ）" in o[4] and "面別年間発電量" not in o[4] and "K' =" not in o[4]
       and row(o[4], "太陽光のみ")[0] is None and "太陽光=使用しない" in o[5])
 o_small = run(face_args=face_args([(0.0, "南", 180.0, 30, 0)]), wind_args=wind("capacity", capacity_kw=5.0))
 check("24/7の『差』は負のゼロ（-0.0）にならない（風力が小さく、発電を全量使い切るとき）",
@@ -373,7 +400,7 @@ check("PPA単価0円・発電側課金を含む扱い・バランシング0円�
       not o[4].startswith("エラー") and abs(o[6]["wind_info"]["payment_yen"]) < 1e-6, errdetail(o))
 o = run(wind_args=wind("coverage"), mg_enabled=True)
 check("風力とMGの併用が動く（W2b。詳細は節9）",
-      not o[4].startswith("エラー") and "マイクログリッド事業" in o[4] and "風力の調達費用" in o[4], errdetail(o))
+      not o[4].startswith("エラー") and "マイクログリッド事業" in o[4] and "風力発電（オフサイトPPA）の費用:" in o[4], errdetail(o))
 try:
     app.resolve_wind(wind("coverage"), None, 1e6)
     check("CSVアップロード（地点なし）はエラー", False)
@@ -407,11 +434,11 @@ lease_w = run(business_model="リース", wind_args=wind("coverage"))
 l0 = num(lease_no[4], "必要リース料:")
 l1 = num(lease_w[4], "必要リース料:")
 check("リース料は風力の有無で変わらない（対象はPV設備のみ）", l0 == l1 and l0 > 0, f"{l0} vs {l1}")
-net_w = num(lease_w[4], "年間経済メリット:", after="【風力込みの年間経済メリット】")
+net_w = num(lease_w[4], "年間経済メリット（A − B）:")
 cust = num(lease_w[4], "需要家年間メリット:")
 check("需要家年間メリット = 風力込み年間経済メリット − リース料", abs(cust - (net_w - l1)) < 1.5, f"{cust} vs {net_w - l1:.0f}")
-check("需要家メリットの見出しは『電気代削減−風力の費用』（PPA支払と、届いた分の託送等を引いた値）",
-      "電気代削減−風力の費用:" in lease_w[4])
+check("需要家メリットの見出しは『年間経済メリット（A − B）』（【年間の損得】と同じ値）",
+      "年間経済メリット（A − B）:" in lease_w[4])
 check("風力なしのリースの見出しは従来どおり『電気代削減』", "  電気代削減: " in lease_no[4])
 ppa_w = run(business_model="PPA", wind_args=wind("coverage"))
 ppa_price = num(ppa_w[4], "必要PPA単価:")
@@ -423,7 +450,7 @@ pv_only_self = float(np.minimum(st["gen_pv"], demand).sum())
 check("太陽光分の自家消費量 = 全自家消費量 − 風力の配達量（= Σmin(太陽光, 需要)。蓄電池なし）",
       abs(self_pv - (sc["annual_self"] - info["delivered_kwh"])) < 0.1 and abs(self_pv - pv_only_self) < 0.1,
       f"{self_pv} vs {sc['annual_self'] - info['delivered_kwh']:.1f} / {pv_only_self:.1f}")
-check("風力の配達分を除いた旨の注記", "風力の配達分を除いた" in ppa_w[4])
+check("風力の配達分を除いた旨の注記", "風力発電（オフサイトPPA）の使用電力量を除いた" in ppa_w[4])
 
 # ============================================================
 print("\n【8. データセンター・蓄電池LP・受電上限・最適容量探索との組み合わせ】")
@@ -476,8 +503,8 @@ cf_expected = scm["annual_self"] * avg_price + basic_saving - MG_OPEX - wind_cos
 cf_got = num(mt, "年間キャッシュフロー:")
 check("年間キャッシュフロー = 網内売電 ＋ 束ね − 運営 − 風力の調達費用（独立に再計算）",
       cf_got is not None and abs(cf_got - cf_expected) < 1.5, f"{cf_got} vs {cf_expected:.0f}")
-check("風力の調達費用の表示 = PPA支払 ＋ 届いた分の託送・賦課金・手数料", abs(num(mt, "風力の調達費用:") - wind_cost) < 1.5,
-      f"{num(mt, '風力の調達費用:')} vs {wind_cost:.0f}")
+check("風力の調達費用の表示 = PPA支払 ＋ 届いた分の託送・賦課金・手数料", abs(num(mt, "風力発電（オフサイトPPA）の費用:") - wind_cost) < 1.5,
+      f"{num(mt, '風力発電（オフサイトPPA）の費用:')} vs {wind_cost:.0f}")
 irr_raw = app._calc_irr([-MG_TOTAL] + [cf_expected] * 20)
 if irr_raw is None:
     # 既定のMG（自営線6,000万円）に、需要の100%相当の風力（PPA支払・託送等が売電収入を上回る）を足すと赤字になる

@@ -713,7 +713,7 @@ if cs_ok:
     top2 = lp_same[4][lp_same[4].find("初期投資・投資回収"):lp_same[4].find("CO2削減量")]
     check("  最適充放電（LP）モードでは従来どおり蓄電池の費用を数える（最適容量探索の修正の副作用がない）",
           "蓄電池: " in top2 and "kWh × " in top2 and "蓄電池: 含めません" not in top2, top2[:160])
-    merit2 = num(lp_same[4], "年間経済メリット:", after="風力込みの年間経済メリット")
+    merit2 = num(lp_same[4], "年間経済メリット（A − B）:")
     check("  段階1の年間コスト削減（風力PPA支払後）= 最適容量で通常LPを解いた年間経済メリット",
           merit1 is not None and merit2 is not None and abs(merit1 - merit2) <= 1.0 + 1e-6 * abs(merit2),
           f"{merit1} vs {merit2}")
@@ -734,7 +734,7 @@ if ok_u:
     G_u = wi_u["annual_kwh"]
     pay_uu = dl_uu * ((wi_u["ppa_price"] + wi_u["gen_charge_yen"] / G_u) / (1 - wi_u["loss_rate"]) + wi_u["balancing_yen"])
     merit_uu = before_u - ca_uu["annual_total"] + 19.0 * scr_u["annual_export"] - pay_uu
-    got_u = num(o_u[4], "年間経済メリット:", after="風力込みの年間経済メリット")
+    got_u = num(o_u[4], "年間経済メリット（A − B）:")
     check("  使用量払い + LP: 年間経済メリットが §9-2 の式で別に計算した値と一致",
           got_u is not None and abs(got_u - merit_uu) < 1.5, f"{got_u} vs {merit_uu:,.1f}")
 
@@ -752,7 +752,7 @@ if cs_u_ok:
     lp_u = run(wind_args=w_used, bat_enabled=True, bat_mode="最適充放電（LP）", bat_capacity=float(cap_u),
                bat_max_charge=100.0, bat_max_discharge=100.0)
     m1u = num(cs_u[4], "年間コスト削減:", after="最適蓄電池容量探索")
-    m2u = num(lp_u[4], "年間経済メリット:", after="風力込みの年間経済メリット")
+    m2u = num(lp_u[4], "年間経済メリット（A − B）:")
     check("  使用量払い: 段階1の年間コスト削減 = 最適容量で通常LPを解いた年間経済メリット",
           m1u is not None and m2u is not None and abs(m1u - m2u) <= 1.0 + 1e-6 * abs(m2u), f"{m1u} vs {m2u}")
 

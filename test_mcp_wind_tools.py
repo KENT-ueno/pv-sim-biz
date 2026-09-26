@@ -16,6 +16,7 @@ test_mcp_wind_tools.py - 風力発電（オフサイトPPA）のMCPツール（W
   （12ケース。産業用・LP・MG・PPA・リース・両面・DC・受電上限）で確認済み。
   プロトコル層（tools/call）での型の確認は、サーバー起動後に別途行う（CLAUDE.md）。
 """
+import json
 import os
 import re
 import sys
@@ -119,7 +120,7 @@ def uw(cap=None, cov=None, **kw):
 
 def num(text, label, after=None):
     start = text.find(after) if after else 0
-    mm = re.search(re.escape(label) + r"\s*(-?[\d,]+(?:\.\d+)?)", text[start:])
+    mm = re.search(re.escape(label) + r"\s*([+-]?[\d,]+(?:\.\d+)?)", text[start:])
     return float(mm.group(1).replace(",", "")) if mm else None
 
 
@@ -135,10 +136,10 @@ check("A: 風力の年間発電量・配達量・無駄になった分がUIと�
       w["generation_kwh"] == round(ua[6]["wind_info"]["annual_kwh"]) and w["delivered_kwh"] == round(ua[6]["wind_info"]["delivered_kwh"])
       and w["wasted_kwh"] == round(ua[6]["wind_info"]["wasted_kwh"]))
 check("A: 年間経済メリット（風力込み）がUIと一致（±1.5円）",
-      abs(ma["electricity_cost"]["annual_economic_merit_yen"] - num(ut, "年間経済メリット:", after="【風力込みの年間経済メリット】")) < 1.5,
-      f"{ma['electricity_cost']['annual_economic_merit_yen']} vs {num(ut, '年間経済メリット:', after='【風力込みの年間経済メリット】')}")
-gen_cost_ui = -num(ut, "風力の発電側費用:", after="【風力込みの年間経済メリット】")
-total_ui = num(ut, "合計:", after="【風力にかかる費用】")
+      abs(ma["electricity_cost"]["annual_economic_merit_yen"] - num(ut, "年間経済メリット（A − B）:")) < 1.5,
+      f"{ma['electricity_cost']['annual_economic_merit_yen']} vs {num(ut, '年間経済メリット（A − B）:')}")
+gen_cost_ui = num(ut, "風力発電（オフサイトPPA）の支払 計:")
+total_ui = num(ut, "風力発電（オフサイトPPA）の費用（支払＋託送等）:")
 check("A: 風力の発電側費用・合計費用がUIと一致",
       abs(w["cost"]["generation_side_cost_yen_per_year"] - gen_cost_ui) < 1.5
       and abs(w["cost"]["total_yen_per_year"] - total_ui) < 1.5,
@@ -153,7 +154,7 @@ check("A: 24/7（設定どおり）の時間一致率・量ベース達成率が
       abs(w["matching_24_7"]["hourly_match_pct"] - float(re.search(r"時間一致率: ([\d.]+)%（系統購入", ut).group(1))) < 0.06
       and abs(w["matching_24_7"]["volume_pct"] - float(re.search(r"量ベース達成率: ([\d.]+)%（年間", ut).group(1))) < 0.06)
 ref = w["matching_24_7"]["reference_without_battery"]
-mt = re.search(r"太陽光のみ\s+([\d.]+)%\s+([\d.]+)%", ut)
+mt = re.search(r"太陽光のみ: 量ベース達成率 ([\d.]+)% ／ 時間一致率 ([\d.]+)%", ut)
 check("A: 蓄電池なしの参考値（太陽光のみ）がUIと一致",
       abs(ref["pv_only"]["volume_pct"] - float(mt.group(1))) < 0.06 and abs(ref["pv_only"]["hourly_match_pct"] - float(mt.group(2))) < 0.06)
 check("A: 月別は12行で、月別の系統購入の合計 ≒ 年間の系統購入",
@@ -167,14 +168,44 @@ check("A: wind.cost に W2fの新項目（payment_basis・gen_side_charge・bala
       and w["cost"]["price_sources"].get("ppa_price") == "A", str(w["cost"].get("price_sources")))
 check("A: loss_rate_pct・loss_kwh が返る（東北・高圧の既定5.2%）", w["loss_rate_pct"] == 5.2 and w["loss_kwh"] > 0)
 
+# 【年間の損得】（2026-09-26）: A＋各項目＝B、A−B＝年間経済メリット。UIとMCPで同じ値。表記ゆれがない
+bal = ma["electricity_cost"]["annual_balance"]
+ch = bal["changes_yen"]
+check("年間の損得: A ＋ 変化の和 ＝ B（MCP。丸め差±5円）",
+      abs(bal["A_cost_without_installation_yen"] + sum(ch.values()) - bal["B_cost_with_installation_yen"]) <= 5, str(bal))
+check("年間の損得: A − B ＝ annual_economic_merit_yen（MCP）",
+      abs(bal["A_cost_without_installation_yen"] - bal["B_cost_with_installation_yen"]
+          - ma["electricity_cost"]["annual_economic_merit_yen"]) <= 2)
+check("年間の損得: 内訳（太陽光・蓄電池＋風力発電（オフサイトPPA））の和 ＝ 年間経済メリット",
+      abs(bal["merit_pv_battery_yen"] + bal["merit_offsite_yen"] - bal["annual_economic_merit_yen"]) <= 2)
+check("年間の損得: 支払・託送等の行は wind.cost と同じ値",
+      ch["offsite_payment"] == w["cost"]["generation_side_cost_yen_per_year"]
+      and abs(ch["offsite_wheeling_surcharge_retail_margin"] - w["cost"]["delivered_extra_cost_yen_per_year"]) <= 1)
+check("年間の損得: 導入しない場合 A ＝ 導入前の電気代", bal["A_cost_without_installation_yen"] == ma["electricity_cost"]["annual_cost_before_yen"])
+check("年間の損得: UIの A・B・各行が MCP と一致",
+      abs(num(ut, "A. 導入しない場合（需要をすべて小売から買う）:") - bal["A_cost_without_installation_yen"]) <= 1
+      and abs(num(ut, "小売から買う電力量料金が減る:") - ch["pv_battery_retail_energy"]) <= 1
+      and abs(num(ut, "の分、小売から買う電力量料金が減る:") - ch["offsite_retail_energy_avoided"]) <= 1
+      and abs(num(ut, "（PPA発電単価＋発電側課金＋発電バランシング）:") - ch["offsite_payment"]) <= 1
+      and f"B. 導入した場合（太陽光 150.0kW ＋ 風力発電（オフサイトPPA）" in ut
+      and abs(num(ut, "年間経済メリット（A − B）:") - bal["annual_economic_merit_yen"]) <= 1, ut[ut.find("【年間の損得】"):][:400])
+_WORD = re.compile(r"(?<!陸上)風力(?!発電（オフサイトPPA）|発電実績|出力制御量)|到達|届いた|届いて|配達|小売GM|オフサイト電源|風力PPA|余った|使い切れ|無駄")
+_wsec = ut[ut.find("── 風力発電"):]
+check("表記ゆれがない: UIの風力の節以降に旧表記（風力の・到達・届いた・配達・小売GM 等）が出ない",
+      _WORD.search(_wsec) is None, (_WORD.search(_wsec).group(0) + " … " + _wsec[max(0, _WORD.search(_wsec).start() - 30):][:80])
+      if _WORD.search(_wsec) else "")
+_mj = json.dumps({k: ma[k] for k in ("wind", "caveats", "electricity_cost", "annual")}, ensure_ascii=False)
+check("表記ゆれがない: MCPの説明文（note・caveats）に旧表記が出ない",
+      _WORD.search(_mj) is None, (_mj[max(0, _WORD.search(_mj).start() - 40):][:100]) if _WORD.search(_mj) else "")
+
 # A2. 使用量払い（payment_basis="used"）: MCPの年間経済メリットがUIと一致
 ma2 = mcp_sim(wind={"coverage_pct": 100.0, "payment_basis": "used"})
 ua2 = ui_sim(uw(cov=100.0, payment_basis=app.WIND_PAYMENT_BASIS_USED))
 check("A2: 使用量払い: MCPが完了し、年間経済メリットがUIと一致",
       "error" not in ma2 and abs(ma2["electricity_cost"]["annual_economic_merit_yen"]
-                                 - num(ua2[4], "年間経済メリット:", after="【風力込みの年間経済メリット】")) < 1.5,
+                                 - num(ua2[4], "年間経済メリット（A − B）:")) < 1.5,
       f"{ma2.get('electricity_cost', {}).get('annual_economic_merit_yen')} vs "
-      f"{num(ua2[4], '年間経済メリット:', after='【風力込みの年間経済メリット】')}")
+      f"{num(ua2[4], '年間経済メリット（A − B）:')}")
 check("A2: 使用量払いは全量払いよりメリットが大きい（無駄になった分の支払を免れる）",
       ma2["electricity_cost"]["annual_economic_merit_yen"] > ma["electricity_cost"]["annual_economic_merit_yen"])
 check("A2: wind.cost.payment_basis が 'used'", ma2["wind"]["cost"]["payment_basis"] == "used")
@@ -194,7 +225,7 @@ check("A3: 使用量払い＋含む: 合計は参考額を除いた ppa＋balanc
       abs(c3["generation_side_cost_yen_per_year"] - c3["ppa_payment_yen_per_year"] - c3["balancing_yen_per_year"]) <= 1,
       str(c3["generation_side_cost_yen_per_year"]))
 check("A3: UIの結果テキストにも同じ参考額が出る",
-      f"参考額 {c3['gen_side_charge_yen_per_year']:,} 円は届いた量で配分した額" in ua3[4])
+      f"参考額 {c3['gen_side_charge_yen_per_year']:,} 円は使用電力量で配分した額" in ua3[4])
 check("A2: 全量払い（ケースA）では注記を出さない", w["cost"]["surplus_risk_note"] is None and "小売が負う前提" not in ut)
 # 量の恒等式: 発電量（発電端）= 届いた量 + 送電ロス + 発電端の余剰（丸め差 ±2kWh）
 check("A: 発電量 = 届いた量 + 送電ロス + 発電端の余剰（surplus_kwh_sending_end）",
@@ -203,8 +234,8 @@ check("A: 発電量 = 届いた量 + 送電ロス + 発電端の余剰（surplus
 # 量の基準（A5）: 到達可能量ベースの合計発電量 = 太陽光 + 風力の到達可能量。UIの表示とも一致
 check("A: total_generation_deliverable_kwh = 太陽光 + 風力の到達可能量（UIの『風力は到達可能量』の行と一致）",
       abs(ma["annual"]["total_generation_deliverable_kwh"] - (ma["annual"]["pv_generation_kwh"] + w["deliverable_kwh"])) <= 1
-      and abs(ma["annual"]["total_generation_deliverable_kwh"] - num(ut, "太陽光＋風力の年間発電量（風力は到達可能量）:")) <= 1,
-      f"{ma['annual']['total_generation_deliverable_kwh']} vs {num(ut, '太陽光＋風力の年間発電量（風力は到達可能量）:')}")
+      and abs(ma["annual"]["total_generation_deliverable_kwh"] - num(ut, "太陽光の年間発電量＋風力発電（オフサイトPPA）の需要地に届く電力量:")) <= 1,
+      f"{ma['annual']['total_generation_deliverable_kwh']} vs {num(ut, '太陽光の年間発電量＋風力発電（オフサイトPPA）の需要地に届く電力量:')}")
 check("A: wind.monthly の風力の合計 ≒ 到達可能量（発電端ではない）",
       abs(sum(r["wind_kwh"] for r in w["monthly"]) - w["deliverable_kwh"]) <= 12
       and abs(sum(r["wind_kwh"] for r in w["monthly"]) - w["generation_kwh"]) > 100)
@@ -215,7 +246,7 @@ mb = mcp_sim(wind={"capacity_kw": 200.0}, battery_enabled=True, battery_mode="lp
 ub = ui_sim(uw(cap=200.0), bat_enabled=True, bat_mode="最適充放電（LP）", bat_capacity=200.0, bat_max_charge=100.0, bat_max_discharge=100.0)
 check("B: LP+風力: メリット・配達量・契約電力がUIと一致",
       "error" not in mb and abs(mb["electricity_cost"]["annual_economic_merit_yen"]
-                                - num(ub[4], "年間経済メリット:", after="【風力込みの年間経済メリット】")) < 1.5
+                                - num(ub[4], "年間経済メリット（A − B）:")) < 1.5
       and mb["wind"]["delivered_kwh"] == round(ub[6]["wind_info"]["delivered_kwh"]),
       str(mb.get("error"))[:80])
 
@@ -226,7 +257,7 @@ check("C: 風力のみ: 完了し、太陽光の発電量は0・初期投資は0
       "error" not in mc and mc["annual"]["pv_generation_kwh"] == 0 and mc["investment"]["total_investment_yen"] == 0
       and mc["investment"]["simple_payback_years"] is None, str(mc.get("errors") or mc.get("error"))[:80])
 check("C: 風力のみ: メリットがUIと一致・24/7の参考値に太陽光のみの行はない",
-      abs(mc["electricity_cost"]["annual_economic_merit_yen"] - num(uc[4], "年間経済メリット:", after="【風力込みの年間経済メリット】")) < 1.5
+      abs(mc["electricity_cost"]["annual_economic_merit_yen"] - num(uc[4], "年間経済メリット（A − B）:")) < 1.5
       and "pv_only" not in mc["wind"]["matching_24_7"]["reference_without_battery"])
 # 年間メリットが正になる小さな風力のみ: 初期投資がないので、回収年数は 0 年ではなく『なし』（None）。
 # W2f既定（全量払い・発電側課金・バランシング）だと、この需要規模では小容量でも風力単体はメリットが負になるため、
@@ -253,7 +284,7 @@ irr_ui = re.search(r"P-IRR: ([\d.]+)%", ud[4][ud[4].find("【P-IRR（"):])
 check("D: MG+PPA+風力: P-IRRがUIと一致（算出不可なら双方None）",
       (irr_ui is None and mg["project_irr_pct"] is None) or (irr_ui is not None and abs(mg["project_irr_pct"] - float(irr_ui.group(1))) < 0.006))
 check("D: MG: 風力の調達費用が返る", mg.get("wind_procurement_cost_yen_per_year") is not None
-      and abs(mg["wind_procurement_cost_yen_per_year"] - num(ud[4], "風力の調達費用:")) < 1.5)
+      and abs(mg["wind_procurement_cost_yen_per_year"] - num(ud[4], "風力発電（オフサイトPPA）の費用:")) < 1.5)
 me = mcp_sim(wind={"coverage_pct": 60.0}, mg_enabled=True, business_model="lease")
 ue = ui_sim(uw(cov=60.0), mg_enabled=True, business_model="リース")
 check("D2: MG+リース+風力: 需要家年間メリットがUIと一致",
@@ -279,7 +310,7 @@ if p:
     check("E: DC+風力: 完了し、メリット・配達量がUIと一致（北海道エリア）",
           "error" not in me_dc and me_dc["wind"]["area"] == "北海道"
           and abs(me_dc["electricity_cost"]["annual_economic_merit_yen"]
-                  - num(ue_dc[4], "年間経済メリット:", after="【風力込みの年間経済メリット】")) < 1.5
+                  - num(ue_dc[4], "年間経済メリット（A − B）:")) < 1.5
           and me_dc["wind"]["delivered_kwh"] == round(ue_dc[6]["wind_info"]["delivered_kwh"]),
           str(me_dc.get("error") or me_dc.get("errors"))[:80])
 else:
@@ -401,10 +432,10 @@ if "grid_cap" in r:
                        wind_args=uw(cov=60.0))
     check("  UIと一致: 年間経済メリット・導入後ピーク・風力の配達量",
           ui[6] is not None
-          and abs(r["electricity_cost"]["annual_economic_merit_yen"] - num(ui[4], "年間経済メリット:", after="【風力込みの年間経済メリット】")) < 1.5
+          and abs(r["electricity_cost"]["annual_economic_merit_yen"] - num(ui[4], "年間経済メリット（A − B）:")) < 1.5
           and abs(gc["peak_after_kw"] - num(ui[4], "導入後ピーク:")) < 0.06
           and r["wind"]["delivered_kwh"] == round(ui[6]["wind_info"]["delivered_kwh"]),
-          f"{r['electricity_cost']['annual_economic_merit_yen']} vs {num(ui[4], '年間経済メリット:', after='【風力込みの年間経済メリット】')}")
+          f"{r['electricity_cost']['annual_economic_merit_yen']} vs {num(ui[4], '年間経済メリット（A − B）:')}")
     check("  出力はJSON標準の型だけ", not non_json(r), str(non_json(r)[:3]))
 # ルールベース + 風力 + 受電上限: 上限は強制せず、導入後ピークは受電量（風力の配達分＋小売購入）の最大で判定する。
 # 受電量のピークと小売購入のピークが分かれる条件にする: 太陽光なし（風力のみ）・CEC実測形状（ピークが1コマに立つ）。
@@ -426,10 +457,10 @@ if r_rb.get("grid_cap"):
           f"{r_rb['grid_cap']['peak_after_kw']} vs {num(ui_rb[4], '導入後ピーク:')}")
     check("  ルールベース: 年間経済メリット・風力の配達量・24/7の時間一致率がUIと一致（W2e: 風力は貯めず、風力→蓄電池→小売の順）",
           ui_rb[6] is not None
-          and abs(r_rb["electricity_cost"]["annual_economic_merit_yen"] - num(ui_rb[4], "年間経済メリット:", after="【風力込みの年間経済メリット】")) < 1.5
+          and abs(r_rb["electricity_cost"]["annual_economic_merit_yen"] - num(ui_rb[4], "年間経済メリット（A − B）:")) < 1.5
           and r_rb["wind"]["delivered_kwh"] == round(ui_rb[6]["wind_info"]["delivered_kwh"])
           and abs(r_rb["wind"]["matching_24_7"]["hourly_match_pct"] - float(re.search(r"時間一致率: ([\d.]+)%（系統購入", ui_rb[4]).group(1))) < 0.06,
-          f"{r_rb['electricity_cost']['annual_economic_merit_yen']} vs {num(ui_rb[4], '年間経済メリット:', after='【風力込みの年間経済メリット】')}")
+          f"{r_rb['electricity_cost']['annual_economic_merit_yen']} vs {num(ui_rb[4], '年間経済メリット（A − B）:')}")
     st_rb = ui_rb[6]
     retail_peak = float(st_rb["sc_result"]["import_"].max()) * 2.0
     check("  この条件では受電量のピークが小売購入のピークより大きい（確認の条件が有効）",

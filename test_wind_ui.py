@@ -64,7 +64,7 @@ for bad in ("abc", "1e999", "nan", "inf", "１２x"):
                             app.WIND_PAYMENT_BASIS_GENERATED, app.WIND_GEN_CHARGE_AUTO, "", "", "")
         check(f"不正な値 {bad!r} はエラー", False)
     except ValueError as e:
-        check(f"不正な値 {bad!r} はエラー", "風力の契約容量" in str(e))
+        check(f"不正な値 {bad!r} はエラー", "風力発電（オフサイトPPA）の契約容量" in str(e))
 
 n1 = app.wind_area_note("34392 (SENDAI)", False, "高圧")
 check("仙台・高圧: 東北・託送2.15・グロスマージン4.1（暫定）・損失率5.2%",
@@ -92,7 +92,7 @@ check("入力の末尾は『太陽光を使う』＋風力13欄（WIND_INPUT_KEY
 tl = [getattr(c, "label", "") or "" for c in tail]
 check("末尾の欄のラベルが 太陽光・風力・容量の指定方法・契約容量・カバー率・設備利用率・PPA発電単価・託送・"
       "小売グロスマージン・支払の対象・発電側課金・割引・バランシング・損失率 の順",
-      "太陽光発電を使う" in tl[0] and "風力発電を併用する" in tl[1] and "容量の指定方法" in tl[2] and "契約容量" in tl[3]
+      "太陽光発電を使う" in tl[0] and "風力発電（オフサイトPPA）を併用する" in tl[1] and "容量の指定方法" in tl[2] and "契約容量" in tl[3]
       and "需要カバー率" in tl[4] and "設備利用率" in tl[5] and "PPA発電単価" in tl[6] and "託送" in tl[7]
       and "小売グロスマージン" in tl[8] and "支払の対象" in tl[9] and "発電側課金" in tl[10]
       and "系統設備効率化割引" in tl[11] and "発電バランシング単価" in tl[12] and "損失率" in tl[13],
@@ -140,8 +140,8 @@ check("需要が未設定（施設なし）で風力ON → 需要の設定を促
 
 o = click_with(enabled=True, capacity="500", cf=25.0, ppa=10.0, wheeling="3.0", fee="1.0")
 dbg = o[5]
-check("風力ON: 完了し風力の節が出る", not o[4].startswith("エラー") and "風力オフサイトPPA" in o[4], o[4][:60])
-m = re.search(r"風力: (\S+)エリア ([\d,.]+)kW, 設備利用率 ([\d.]+)%, PPA ([\d.]+)円/kWh, 託送\(従量\) ([\d.]+)円/kWh, "
+check("風力ON: 完了し風力の節が出る", not o[4].startswith("エラー") and "風力発電（オフサイトPPA）の電力量と費用" in o[4], o[4][:60])
+m = re.search(r"風力発電（オフサイトPPA）: (\S+)エリア ([\d,.]+)kW, 設備利用率 ([\d.]+)%, PPA ([\d.]+)円/kWh, 託送\(従量\) ([\d.]+)円/kWh, "
               r"小売グロスマージン ([\d.]+)円/kWh, 損失率 ([\d.]+)%, 発電側課金\((\w+)\) ([\d,]+)円/年, "
               r"バランシング ([\d.]+)円/kWh, 支払の対象=(\S+), 太陽光=(\S+)", dbg)
 check("各欄の値が正しい欄に届く（容量500・利用率25・PPA10・託送3・グロスマージン1・損失率5.2・バランシング1.1既定・"
@@ -158,19 +158,19 @@ check("PPA欄を触らない（実際のUI既定値=11.96のまま）なら『�
       "発電側課金(add)" in o[5], o[5][o[5].find("風力:"):][:250])
 check("PPA発電単価の行に出典タグ[公的データの代理値]が出る（未上書き）", "[公的データの代理値]" in o[4])
 check("賦課金の出典タグが空にならない（renewable_surchargeがpsに無いフォールバックの不具合）",
-      "賦課金 [出典あり]" in o[4], o[4][max(0, o[4].find("届いた分の費用") - 5):][:200])
+      "賦課金 [出典あり]" in o[4], o[4][max(0, o[4].find("使用電力量にかかる託送") - 5):][:200])
 check("支払の対象を触らない（既定=全量払い）なら出典タグは既定区分（『入力値』にならない）",
-      "全量払い（発電した全量に払う） [—]" in o[4], o[4][o[4].find("支払の対象"):][:60])
+      "全量払い（発電量の全量に払う） [—]" in o[4], o[4][o[4].find("支払の対象"):][:60])
 
 o = click_with(enabled=True, capacity="500", pv=False)
 check("『太陽光を使う』OFF → 太陽光=使用しない（風力のみ）", "太陽光=使用しない" in o[5] and "太陽光発電: 使用しない" in o[4])
 o = click_with(enabled=True, sizing=app.WIND_SIZING_COVERAGE, coverage="100", capacity="99999")
-w_kwh = float(re.search(r"年間発電量（風力・発電端）: ([\d,.]+) kWh/年", o[4]).group(1).replace(",", ""))
+w_kwh = float(re.search(r"年間発電量（発電端）: ([\d,.]+) kWh/年", o[4]).group(1).replace(",", ""))
 demand_kwh = float(re.search(r"年間需要量: ([\d,.]+) kWh/年", o[4]).group(1).replace(",", ""))
 check("需要カバー率で指定 → 契約容量の欄（99999）は使わず、風力の年間発電量 = 年間需要 × 100%",
       abs(w_kwh - demand_kwh) < 1.0, f"{w_kwh} vs {demand_kwh}")
 o = click_with(enabled=True, capacity="abc")
-check("契約容量が数値でない → 日本語のエラー（計算しない）", o[4].startswith("エラー") and "風力の契約容量" in o[4] and o[0] is None, o[4][:60])
+check("契約容量が数値でない → 日本語のエラー（計算しない）", o[4].startswith("エラー") and "風力発電（オフサイトPPA）の契約容量" in o[4] and o[0] is None, o[4][:60])
 o = click_with(enabled=True, capacity="")
 check("契約容量が空欄 → エラー", o[4].startswith("エラー") and "契約容量" in o[4])
 o = click_with(station=tokyo, enabled=True, capacity="500")
@@ -207,16 +207,16 @@ print("\n【4. グラフ（風力あり: 内訳／風力なし: 従来）】")
 o_w = click_with(enabled=True, capacity="300")
 mon = o_w[0]
 names = [t.name for t in mon.data]
-check("月別: 太陽光・風力の積み上げ＋需要・自家消費の4系列", names == ["発電量（太陽光）", "発電量（風力・到達分）", "需要量", "自家消費（風力の配達分を含む）"], str(names))
+check("月別: 太陽光・風力の積み上げ＋需要・自家消費の4系列", names == ["発電量（太陽光）", "風力発電（オフサイトPPA）（需要地に届く電力量）", "需要量", "自家消費（風力発電（オフサイトPPA）の使用電力量を含む）"], str(names))
 pv_y, w_y = np.array(mon.data[0].y), np.array(mon.data[1].y)
 st = o_w[6]
 check("月別: 風力は太陽光の上に積む（base = 太陽光）", np.allclose(np.array(mon.data[1].base), pv_y))
 check("月別: 太陽光＋風力 = 発電量の合計", abs(float(pv_y.sum() + w_y.sum()) - float(st["total_gen_clipped"].sum())) < 1e-6)
 day = o_w[1]
 dn = [t.name for t in day.data]
-check("日別: 合計の『発電量』に、うち太陽光・うち風力の線が加わる", "発電量" in dn and "うち太陽光" in dn and "うち風力（到達分）" in dn, str(dn))
+check("日別: 合計の『発電量』に、うち太陽光・うち風力の線が加わる", "発電量" in dn and "うち太陽光" in dn and "うち風力発電（オフサイトPPA）（需要地に届く電力量）" in dn, str(dn))
 idx = [i for i, md_ in enumerate(st["month_day"]) if md_ == (7, 1)][0]
-wt = [t for t in day.data if t.name == "うち風力（到達分）"][0]
+wt = [t for t in day.data if t.name == "うち風力発電（オフサイトPPA）（需要地に届く電力量）"][0]
 check("日別: 風力の線 = その日の風力発電量", np.allclose(wt.y, st["gen_wind"][idx]))
 mon0 = base[0]
 check("風力なしの月別は従来の系列（発電量・需要量・自家消費）", [t.name for t in mon0.data] == ["発電量", "需要量", "自家消費"],
@@ -224,7 +224,7 @@ check("風力なしの月別は従来の系列（発電量・需要量・自家�
 check("風力なしの日別に風力の線はない", not any("風力" in (t.name or "") for t in base[1].data))
 # 日付変更の再描画（保存した結果から）も風力の内訳を持つ
 redraw = app.make_daily_chart(st, 1, 15, st["sc_result"], st["demand_30min"])
-check("日付を変えての再描画（保存した結果から）でも内訳が出る", any(t.name == "うち風力（到達分）" for t in redraw.data))
+check("日付を変えての再描画（保存した結果から）でも内訳が出る", any(t.name == "うち風力発電（オフサイトPPA）（需要地に届く電力量）" for t in redraw.data))
 
 print("\n" + "=" * 70)
 print(f"結果: PASS {n_pass} / FAIL {n_fail}")
