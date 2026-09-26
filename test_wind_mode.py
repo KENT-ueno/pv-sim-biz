@@ -351,6 +351,22 @@ check("発電量 = 風力のみ", np.array_equal(wo[6]["total_gen_clipped"], wo[
 check("比較表は風力発電（オフサイトPPA）のみの1行", row(wo[4], "風力発電（オフサイトPPA）のみ")[0] is not None and row(wo[4], "太陽光のみ")[0] is None)
 check("初期投資がないので回収年数は該当しない", "投資回収年数は該当しません" in wo[4])
 check("設備投資は0円", "設備投資合計: 0 円" in wo[4] or "PV: 0.0 kW" in wo[4])
+# 太陽光なしでは、使っていない太陽光・蓄電池の文言・列を出さない（2026-09-26 ユーザー指摘）
+check("太陽光なし: 「太陽光の年間発電量＋…」の行・24/7の太陽光の列・平年値の注記を出さない",
+      "太陽光の年間発電量＋" not in wo[4] and "太陽光[kWh]" not in wo[4] and "太陽光は平年値" not in wo[4]
+      and "（以降の需給・自家消費率・グラフは、需要地に届く電力量の基準）" in wo[4]
+      and "の需要地に届く電力量で行います" in wo[4] and "太陽光の発電量と" not in wo[4])
+check("太陽光なし: 契約電力の注記は『太陽光・蓄電池を使っていないため変わらない』",
+      "（太陽光・蓄電池を使っていないため変わらない）" in wo[4] and "の効果のみ）" not in wo[4])
+check("太陽光なし: 売電の注記に太陽光を書かない", "敷地内の太陽光の余剰だけです" not in wo[4]
+      and "※ 風力発電（オフサイトPPA）の余剰電力量は売電できません" in wo[4])
+check("太陽光なし: 24/7の月別表は12行とも 月・風力・需要・系統購入・一致率 の5列",
+      len(re.findall(r"^\s+\d+月\s+[\d,]+\s+[\d,]+\s+[\d,]+\s+[\d.]+%$", wo[4], re.M)) == 12)
+check("【年間の損得】に「-0 円」「+0 円」を出さない（0円は「0 円」）",
+      not re.search(r"[+-]0 円", wo[4]) and not re.search(r"[+-]0 円", w_out[4]) and ": 0 円" in wo[4])
+check("太陽光あり（蓄電池なし）: 契約電力の注記は『太陽光の効果のみ』・24/7に太陽光の列と平年値の注記がある",
+      "（太陽光の効果のみ）" in w_out[4] and "太陽光[kWh]" in w_out[4] and "太陽光は平年値" in w_out[4]
+      and "太陽光の年間発電量＋" in w_out[4])
 bad_faces = face_args([(150.0, "南", "abc", 30, 0)])
 o = run(pv_enabled=False, wind_args=wind("coverage"), face_args=bad_faces)
 check("太陽光OFFのときは面設定を読まない（不正な方位角でもエラーにならない）", not o[4].startswith("エラー"))
