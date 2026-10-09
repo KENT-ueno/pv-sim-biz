@@ -226,6 +226,32 @@ check("風力なしの日別に風力の線はない", not any("風力" in (t.na
 redraw = app.make_daily_chart(st, 1, 15, st["sc_result"], st["demand_30min"])
 check("日付を変えての再描画（保存した結果から）でも内訳が出る", any(t.name == "うち風力発電（オフサイトPPA）（需要地に届く電力量）" for t in redraw.data))
 
+# 2026-10-09: 風力発電（オフサイトPPA）のみ（太陽光なし）のとき、グラフに太陽光の系列（0の棒・「うち太陽光」の点線）を出さない
+WN = "風力発電（オフサイトPPA）（需要地に届く電力量）"
+o_np = click_with(enabled=True, capacity="300", pv=False)
+mon_np, day_np, st_np = o_np[0], o_np[1], o_np[6]
+check("太陽光なし: 月別に『発電量（太陽光）』の棒がない（風力・需要量・自家消費の3系列）",
+      [t.name for t in mon_np.data] == [WN, "需要量", "自家消費（風力発電（オフサイトPPA）の使用電力量を含む）"], str([t.name for t in mon_np.data]))
+check("太陽光なし: 月別の風力の棒は 0 から積む（base なし）", mon_np.data[0].base is None)
+check("太陽光なし: 月別の風力の値は変わらない（月別の風力発電量の合計）",
+      abs(float(np.sum(mon_np.data[0].y)) - float(st_np["gen_wind"].sum())) < 1e-6)
+check("太陽光なし: 月別のタイトルに『太陽光』を出さない", "太陽光" not in (mon_np.layout.title.text or ""))
+dn_np = [t.name for t in day_np.data]
+check("太陽光なし: 日別に『うち太陽光』がなく、『うち風力…』はある", "うち太陽光" not in dn_np and f"うち{WN}" in dn_np and "発電量" in dn_np, str(dn_np))
+redraw_np = app.make_daily_chart(st_np, 11, 1, st_np["sc_result"], st_np["demand_30min"])
+check("太陽光なし: 日付を変えての再描画（保存した結果から）でも『うち太陽光』が出ない・『うち風力…』は出る",
+      "うち太陽光" not in [t.name for t in redraw_np.data] and f"うち{WN}" in [t.name for t in redraw_np.data])
+check("太陽光なし: 月別の再描画（保存した結果から）でも同じ",
+      "発電量（太陽光）" not in [t.name for t in app.make_monthly_chart(st_np, st_np["sc_result"]).data])
+_i71 = [i for i, md_ in enumerate(st_np["month_day"]) if md_ == (7, 1)][0]
+check("太陽光なし: 日別の『発電量』の線は風力だけの値（計算の値は変わらない）",
+      np.allclose([t for t in day_np.data if t.name == "発電量"][0].y, st_np["gen_wind"][_i71]))
+# 太陽光あり（従来どおり）: 日付変更・月別の再描画でも太陽光の系列が残る
+redraw_pv = app.make_daily_chart(st, 1, 15, st["sc_result"], st["demand_30min"])
+check("太陽光あり: 日付変更の再描画でも『うち太陽光』が出る（従来どおり）", "うち太陽光" in [t.name for t in redraw_pv.data])
+check("太陽光あり: 月別の再描画でも『発電量（太陽光）』が出る（従来どおり）",
+      "発電量（太陽光）" in [t.name for t in app.make_monthly_chart(st, st["sc_result"]).data])
+
 print("\n" + "=" * 70)
 print(f"結果: PASS {n_pass} / FAIL {n_fail}")
 print("=" * 70)

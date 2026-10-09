@@ -2659,16 +2659,20 @@ def _make_monthly_chart_wind(result, sc_result=None):
     pv_v = [pv_m.get(m, 0.0) for m in months]
     w_v = [w_m.get(m, 0.0) for m in months]
     fig = go.Figure()
-    fig.add_trace(go.Bar(x=labels, y=pv_v, name="発電量（太陽光）", marker_color="orange", offsetgroup="gen"))
+    # 太陽光を使っていないとき（gen_pv の合計が0。風力のみ）は、0の棒と凡例を出さない（保存済みの result からの再描画でも判定できる）
+    pv_used = float(np.sum(result["gen_pv"])) > 0
+    if pv_used:
+        fig.add_trace(go.Bar(x=labels, y=pv_v, name="発電量（太陽光）", marker_color="orange", offsetgroup="gen"))
     # 風力は需要地点に届く分（到達可能量。W2f）。発電端の全量は result["gen_wind_sent"]
-    fig.add_trace(go.Bar(x=labels, y=w_v, base=pv_v, name="風力発電（オフサイトPPA）（需要地に届く電力量）", marker_color="teal", offsetgroup="gen"))
+    fig.add_trace(go.Bar(x=labels, y=w_v, base=pv_v if pv_used else None, name="風力発電（オフサイトPPA）（需要地に届く電力量）", marker_color="teal", offsetgroup="gen"))
     if sc_result is not None:
         fig.add_trace(go.Bar(x=labels, y=[sc_result["monthly_demand"].get(m, 0) for m in months],
                              name="需要量", marker_color="steelblue", offsetgroup="dem"))
         fig.add_trace(go.Bar(x=labels, y=[sc_result["monthly_self"].get(m, 0) for m in months],
                              name="自家消費（風力発電（オフサイトPPA）の使用電力量を含む）", marker_color="green", offsetgroup="self"))
     fig.update_layout(
-        title="月別 発電量（太陽光＋風力発電（オフサイトPPA）の積み上げ） vs 需要量 vs 自家消費", barmode="group",
+        title=("月別 発電量（太陽光＋風力発電（オフサイトPPA）の積み上げ） vs 需要量 vs 自家消費" if pv_used
+               else "月別 発電量（風力発電（オフサイトPPA）） vs 需要量 vs 自家消費"), barmode="group",
         xaxis_title="月", yaxis_title="電力量 [kWh]", template="plotly_white", height=600,
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     )
@@ -2780,8 +2784,9 @@ def make_daily_chart(result, month, day, sc_result=None, demand_30min=None):
 
     if "gen_wind" in result:
         # 「発電量」は太陽光＋風力の合計。内訳を細い線で足す（風力は需要地点に届く分＝到達可能量。W2f）
-        fig.add_trace(go.Scatter(x=times, y=result["gen_pv"][target_idx], mode="lines",
-                                 line=dict(color="gold", width=1, dash="dot"), name="うち太陽光"))
+        if float(np.sum(result["gen_pv"])) > 0:   # 太陽光を使っていないとき（風力のみ）は「うち太陽光」を出さない
+            fig.add_trace(go.Scatter(x=times, y=result["gen_pv"][target_idx], mode="lines",
+                                     line=dict(color="gold", width=1, dash="dot"), name="うち太陽光"))
         fig.add_trace(go.Scatter(x=times, y=result["gen_wind"][target_idx], mode="lines",
                                  line=dict(color="teal", width=1, dash="dot"), name="うち風力発電（オフサイトPPA）（需要地に届く電力量）"))
     layout_kwargs = dict(
